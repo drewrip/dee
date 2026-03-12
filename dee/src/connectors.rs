@@ -1,6 +1,9 @@
 /// All pre-implemented connectors
 pub mod duckdb;
 
+use async_trait::async_trait;
+use std::sync::Arc;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -11,10 +14,11 @@ pub enum ConnectorError {
     Execute(String),
 }
 
+#[async_trait]
 pub trait Connector {
     type Profile;
     type Connection;
 
-    fn new(profile: Self::Profile) -> Result<Self::Connection, ConnectorError>;
-    fn execute(&mut self, query_text: String) -> Result<usize, ConnectorError>;
+    fn new(profile: Self::Profile) -> Result<Arc<Self::Connection>, ConnectorError>;
+    async fn execute(&self, query_text: String) -> Result<usize, ConnectorError>;
 }
