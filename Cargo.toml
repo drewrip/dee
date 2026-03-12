@@ -1,0 +1,8 @@
+[workspace]
+members = ["dee", "dee-cli"]
+resolver = "3"
+
+[workspace.package]
+authors = ["Drew Ripberger <aripberg@cs.cmu.edu>"]
+version = "0.1.0"
+edition = "2024"
