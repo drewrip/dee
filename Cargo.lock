@@ -819,6 +819,7 @@ dependencies = [
  "async-trait",
  "duckdb",
  "futures",
+ "log",
  "petgraph",
  "r2d2",
  "serde",
@@ -836,6 +837,7 @@ dependencies = [
  "dee",
  "env_logger",
  "log",
+ "serde_json",
  "tokio",
 ]
 

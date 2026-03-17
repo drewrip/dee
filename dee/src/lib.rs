@@ -171,7 +171,7 @@ mod tests {
             Ok(c) => c,
         };
 
-        let mut engine = SimpleEngine::new(conn).unwrap();
+        let engine = SimpleEngine::new(conn).unwrap();
         let res = engine.run(dag).await.unwrap();
         println!("res = {}", res);
     }

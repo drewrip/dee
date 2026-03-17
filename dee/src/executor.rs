@@ -2,6 +2,7 @@ use crate::{connectors::Connector, dag::Dag};
 
 use async_trait::async_trait;
 use futures::{StreamExt, stream::FuturesUnordered};
+use log::debug;
 use petgraph::Direction::{self};
 use std::sync::Arc;
 
@@ -21,7 +22,7 @@ where
     type ExecutionEngine;
 
     fn new(conn: Arc<C>) -> Result<Self::ExecutionEngine, ExecutorError>;
-    async fn run(&mut self, dag: Dag) -> Result<usize, ExecutorError>;
+    async fn run(&self, dag: Dag) -> Result<usize, ExecutorError>;
 }
 
 #[derive(Debug)]
@@ -43,7 +44,7 @@ where
         Ok(SimpleEngine { conn })
     }
 
-    async fn run(&mut self, dag: Dag) -> Result<usize, ExecutorError> {
+    async fn run(&self, dag: Dag) -> Result<usize, ExecutorError> {
         let mut work_graph = dag.graph.clone();
         let mut work_queue = FuturesUnordered::new();
 
@@ -61,13 +62,14 @@ where
             for tidx in &transform_idx {
                 let tn = dag.nodes.get(*tidx as usize).unwrap().clone();
                 let conn = Arc::clone(&self.conn);
+                debug!("running node tidx={}", tidx);
+                debug!("work_queue.len()={}", work_queue.len());
                 work_queue.push(tokio::spawn(async move {
                     conn.execute(tn.query_text)
                         .await
                         .map_err(|e| ExecutorError::Exec(format!("exec error - {}", e)))
                 }));
             }
-
             // Remove queued nodes from the Graph
             for node in next_nodes {
                 work_graph.remove_node(node);
@@ -79,11 +81,14 @@ where
                     res.map_err(|j| ExecutorError::Exec(format!("join error - {}", j)))??;
             }
         }
+        debug!("finished adding new work to the queue");
+        debug!("work_queue.len()={}", work_queue.len());
         // wait for work_queue to empty
         while let Some(item) = work_queue.next().await {
             total_size +=
                 item.map_err(|j| ExecutorError::Exec(format!("join error - {}", j)))??;
         }
+        debug!("work_queue cleared");
         Ok(total_size)
     }
 }
