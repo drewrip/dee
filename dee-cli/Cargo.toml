@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+dee = { path = "../dee" }
 clap = { version = "4.5.60", features = ["derive"] }
 env_logger = "0.11.9"
 log = "0.4.29"

@@ -15,6 +15,8 @@ pub enum CliCommand {
 
 #[derive(Args)]
 pub struct RunCommand {
+    #[arg(short, long)]
+    db_file: String,
     dag_file: String,
 }
 

@@ -11,19 +11,11 @@ pub struct DagFileMetadata {
     pub sql_dialect: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DagFileNode {
     pub id: String,
-    #[serde(flatten)]
-    pub query: SQLText,
+    pub query_text: String,
     pub depends_on: Vec<String>,
+    pub materialize: Option<bool>,
     pub no_mangle: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum SQLText {
-    #[serde(rename = "query_path")]
-    QueryPath(String),
-    #[serde(rename = "query_text")]
-    QueryText(String),
 }
