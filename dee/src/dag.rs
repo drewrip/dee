@@ -6,7 +6,7 @@ use crate::file::{DagFile, DagFileNode};
 
 /// Interal DAG representation
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum MaterializeMode {
     View,
     Table,

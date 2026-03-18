@@ -1,8 +1,12 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use crate::connectors::{Connector, ConnectorError};
+use crate::{
+    connectors::{Connector, ConnectorError},
+    dag::MaterializeMode,
+};
 use async_trait::async_trait;
 use duckdb::{Config, DuckdbConnectionManager, params};
+use log::debug;
 use r2d2::Pool;
 
 pub struct DuckDBProfile {
@@ -63,6 +67,17 @@ pub struct DuckDBConnection {
     pub pool: Pool<DuckdbConnectionManager>,
 }
 
+fn materialize_mode_in_duckdb(mode: MaterializeMode) -> String {
+    match mode {
+        MaterializeMode::Table => "TABLE".to_string(),
+        MaterializeMode::View => "VIEW".to_string(),
+        MaterializeMode::Incremental => {
+            debug!("not sure how to handle Incremental mode in DuckDB... defaulting to VIEW");
+            "VIEW".to_string()
+        }
+    }
+}
+
 #[async_trait]
 impl Connector for DuckDBConnection {
     type Profile = DuckDBProfile;
@@ -80,6 +95,10 @@ impl Connector for DuckDBConnection {
                 .threads(threads)
                 .map_err(|_| ConnectorError::Create("set threads problem".to_string()))?;
         }
+
+        conf = conf
+            .access_mode(duckdb::AccessMode::ReadWrite)
+            .map_err(|_| ConnectorError::Create("set access_mode".to_string()))?;
 
         let manager = match profile.db {
             DuckDBType::File(path) => DuckdbConnectionManager::file_with_flags(path, conf),
@@ -101,5 +120,28 @@ impl Connector for DuckDBConnection {
             .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
         conn.execute(&query_text, params![])
             .map_err(|e| ConnectorError::Execute(format!("{}", e.to_string())))
+    }
+
+    async fn new_relation(
+        &self,
+        relation_type: MaterializeMode,
+        name: String,
+        query_text: String,
+    ) -> Result<usize, ConnectorError> {
+        let rel_type = materialize_mode_in_duckdb(relation_type);
+        debug!("new_relation ({}, {})", rel_type, name);
+        let tmpl_query = format!("CREATE {} {} AS ({})", rel_type, name, query_text);
+        self.execute(tmpl_query).await
+    }
+
+    async fn drop_relation(
+        &self,
+        relation_type: MaterializeMode,
+        name: String,
+    ) -> Result<usize, ConnectorError> {
+        let rel_type = materialize_mode_in_duckdb(relation_type);
+        debug!("attempt drop_relation ({}, {})", rel_type, name);
+        let tmpl_query = format!("DROP {} IF EXISTS {}", rel_type, name);
+        self.execute(tmpl_query).await
     }
 }
