@@ -7,12 +7,14 @@ use dee::{
     dag::Dag,
     executor::{Executor, SimpleEngine},
     file::DagFile,
+    opt::Optimizer,
 };
 use log::info;
 use petgraph::dot::Dot;
-use std::fs;
-use std::{error::Error, path::PathBuf};
+use serde::Serialize;
 
+use std::{error::Error, path::PathBuf};
+use std::{fs, sync::Arc};
 #[derive(Parser)]
 pub struct CliArgs {
     #[command(subcommand)]
@@ -22,7 +24,7 @@ pub struct CliArgs {
 #[derive(Subcommand)]
 pub enum CliCommand {
     Run(RunCommand),
-    Opt,
+    Opt(OptCommand),
     Draw(DrawCommand),
 }
 
@@ -35,6 +37,13 @@ pub struct RunCommand {
 
 #[derive(Args)]
 pub struct DrawCommand {
+    dag_file: String,
+}
+
+#[derive(Args)]
+pub struct OptCommand {
+    #[arg(short, long)]
+    db_file: String,
     dag_file: String,
 }
 
@@ -58,8 +67,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let res = engine.run(dag).await?;
             info!("res = {}", res);
         }
-        CliCommand::Opt => {
-            info!("Optimizing DAG");
+        CliCommand::Opt(opt_cmd) => {
+            info!("Optimizing DAG: {}", opt_cmd.dag_file);
+
+            let prof = DuckDBProfile::new_with_path(PathBuf::from(opt_cmd.db_file))
+                .with_num_connections(8)
+                .with_threads(16);
+            let conn = DuckDBConnection::new(prof)?;
+            let engine = SimpleEngine::new(conn.clone())?;
+
+            let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(opt_cmd.dag_file)?)?;
+            let mut dag = Dag::from(dag_file);
+
+            let mut optimizer = Optimizer::new(conn, Arc::new(engine));
+            optimizer.run(&mut dag)?;
+            let new_dag_file: DagFile = DagFile::from(dag);
+            let mut buf = Vec::new();
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+            new_dag_file.serialize(&mut ser).unwrap();
+            println!("{}", String::from_utf8(buf).unwrap());
         }
         CliCommand::Draw(draw_cmd) => {
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(draw_cmd.dag_file)?)?;

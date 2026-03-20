@@ -2,6 +2,7 @@ pub mod connectors;
 pub mod dag;
 pub mod executor;
 pub mod file;
+pub mod opt;
 
 #[cfg(test)]
 mod tests {

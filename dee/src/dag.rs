@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use petgraph::prelude::StableDiGraph;
+use petgraph::{Direction::Incoming, data::DataMap, graph::NodeIndex, prelude::StableDiGraph};
 
-use crate::file::{DagFile, DagFileNode};
+use crate::file::{DagFile, DagFileMetadata, DagFileNode};
 
 /// Interal DAG representation
 
@@ -89,6 +89,62 @@ impl From<DagFile> for Dag {
             db: dialect,
             graph,
             nodes,
+        }
+    }
+}
+
+fn transform_to_file_node(
+    idx: u32,
+    dag: &Dag,
+    nidx_map: &HashMap<u32, NodeIndex>,
+    value: &TransformNode,
+) -> DagFileNode {
+    let parents: Vec<NodeIndex> = dag
+        .graph
+        .neighbors_directed(*nidx_map.get(&idx).unwrap(), Incoming)
+        .collect();
+    let p: Vec<u32> = parents
+        .iter()
+        .map(|ancestor| *dag.graph.node_weight(*ancestor).unwrap())
+        .collect();
+
+    let depends: Vec<String> = p
+        .iter()
+        .map(|tidx| dag.nodes.get(*tidx as usize).unwrap().id.clone())
+        .collect();
+
+    let materialize = match value.materialize {
+        MaterializeMode::View => false,
+        MaterializeMode::Table => true,
+        MaterializeMode::Incremental => true,
+    };
+    DagFileNode {
+        id: value.id.clone(),
+        query_text: value.query_text.clone(),
+        depends_on: depends,
+        materialize: Some(materialize),
+        no_mangle: Some(false),
+    }
+}
+
+impl From<Dag> for DagFile {
+    fn from(value: Dag) -> DagFile {
+        let map: HashMap<u32, NodeIndex> = value
+            .graph
+            .node_indices()
+            .map(|nidx| (*value.graph.node_weight(nidx).unwrap(), nidx))
+            .collect();
+
+        DagFile {
+            metadata: Some(DagFileMetadata {
+                sql_dialect: Some(value.db.clone()),
+            }),
+            nodes: value
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| transform_to_file_node(i as u32, &value, &map, n))
+                .collect(),
         }
     }
 }
