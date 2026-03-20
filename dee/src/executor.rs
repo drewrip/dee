@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream::FuturesUnordered};
 use log::debug;
 use petgraph::Direction::{self};
+use petgraph::prelude::StableDiGraph;
 use std::{collections::HashSet, sync::Arc};
 
 use thiserror::Error;
@@ -45,12 +46,14 @@ where
     }
 
     async fn run(&self, dag: Dag) -> Result<usize, ExecutorError> {
-        let mut work_graph = dag.graph.clone();
+        let mut work_graph = StableDiGraph::from(dag.graph.clone());
         let mut work_queue = FuturesUnordered::new();
 
+        let initial_size = work_graph.node_count();
+        let mut finished = 0;
         let mut total_size = 0;
         let mut in_progress = HashSet::new();
-        while (work_graph.node_count() + work_queue.len()) > 0 {
+        while work_graph.node_count() > 0 {
             let next_nodes: Vec<_> = work_graph
                 .externals(Direction::Incoming)
                 .filter(|n| !in_progress.contains(n))
@@ -71,31 +74,25 @@ where
                 in_progress.insert(nidx);
                 work_queue.push(tokio::spawn(async move {
                     let res = conn
-                        .new_relation(tn.materialize, tn.id, tn.query_text)
+                        .new_relation(tn.materialize, tn.id.clone(), tn.query_text)
                         .await
                         .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                    debug!("new_relation ({}, {:?})", tn.id, tn.materialize);
                     Ok((res, nidx))
                 }));
             }
 
-            // wait for at least one of the nodes to finish;
-            if let Some(res) = work_queue.next().await {
+            // wait for work_queue to empty
+            while let Some(item) = work_queue.next().await {
                 let (rs_size, nidx) =
-                    res.map_err(|j| ExecutorError::Exec(format!("join error - {}", j)))??;
+                    item.map_err(|j| ExecutorError::Exec(format!("join error - {}", j)))??;
+                debug!("recv result for nidx={:?}", nidx);
                 total_size += rs_size;
-                work_graph.remove_node(nidx);
                 in_progress.remove(&nidx);
+                work_graph.remove_node(nidx);
+                finished += 1;
+                debug!("finished {}/{} nodes", finished, initial_size);
             }
-        }
-        debug!("finished adding new work to the queue");
-        debug!("work_queue.len()={}", work_queue.len());
-        // wait for work_queue to empty
-        while let Some(item) = work_queue.next().await {
-            let (rs_size, nidx) =
-                item.map_err(|j| ExecutorError::Exec(format!("join error - {}", j)))??;
-            total_size += rs_size;
-            work_graph.remove_node(nidx);
-            in_progress.remove(&nidx);
         }
         debug!("work_queue cleared");
         Ok(total_size)

@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use petgraph::graph::DiGraph;
+use petgraph::prelude::StableDiGraph;
 
 use crate::file::{DagFile, DagFileNode};
 
 /// Interal DAG representation
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum MaterializeMode {
     View,
     Table,
@@ -51,7 +51,7 @@ impl From<DagFileNode> for TransformNode {
 
 pub struct Dag {
     pub db: String,
-    pub graph: DiGraph<u32, ()>,
+    pub graph: StableDiGraph<u32, ()>,
     pub nodes: Vec<TransformNode>,
 }
 
@@ -64,7 +64,7 @@ impl From<DagFile> for Dag {
         let nodes: Vec<TransformNode> = value.nodes.iter().cloned().map(From::from).collect();
         let mut node_index: HashMap<String, u32> = HashMap::with_capacity(nodes.len());
         let mut n = 0;
-        let mut graph = DiGraph::new();
+        let mut graph = StableDiGraph::new();
         for node in &nodes {
             node_index.insert(node.id.clone(), n);
             graph.add_node(n);

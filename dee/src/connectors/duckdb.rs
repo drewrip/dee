@@ -118,8 +118,9 @@ impl Connector for DuckDBConnection {
             .pool
             .get()
             .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
-        conn.execute(&query_text, params![])
-            .map_err(|e| ConnectorError::Execute(format!("{}", e.to_string())))
+        conn.execute(&query_text.clone(), params![]).map_err(|e| {
+            ConnectorError::Execute(format!("{} - query_text:\n{}", e.to_string(), query_text))
+        })
     }
 
     async fn new_relation(
@@ -129,8 +130,8 @@ impl Connector for DuckDBConnection {
         query_text: String,
     ) -> Result<usize, ConnectorError> {
         let rel_type = materialize_mode_in_duckdb(relation_type);
-        debug!("new_relation ({}, {})", rel_type, name);
-        let tmpl_query = format!("CREATE {} {} AS ({})", rel_type, name, query_text);
+        //debug!("creating new_relation ({}, {})", rel_type, name);
+        let tmpl_query = format!("CREATE {} '{}' AS ({})", rel_type, name, query_text);
         self.execute(tmpl_query).await
     }
 
