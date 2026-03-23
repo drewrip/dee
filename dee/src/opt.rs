@@ -2,12 +2,12 @@ pub mod cse;
 
 use std::sync::Arc;
 
-use crate::{connectors::Connector, dag::Dag, executor::Executor, opt::cse::CSEPass};
-
 use async_trait::async_trait;
 use log::debug;
 
 use thiserror::Error;
+
+use crate::{connectors::Connector, dag::Dag, executor::Executor, opt::cse::CSEPass};
 
 #[derive(Error, Debug)]
 pub enum OptimizerError {
@@ -17,12 +17,13 @@ pub enum OptimizerError {
     NotImplemented(String),
 }
 
+#[async_trait]
 pub trait OptimizerPass<C, E>
 where
-    C: Connector + Send,
-    E: Executor<C>,
+    C: Connector + Send + 'static,
+    E: Executor<C> + Send,
 {
-    fn run(&mut self, dag: &mut Dag) -> Result<usize, OptimizerError>;
+    async fn run(&mut self, dag: &mut Dag) -> Result<usize, OptimizerError>;
 }
 
 #[derive(Debug, Clone)]
@@ -43,8 +44,8 @@ where
 
 impl<C, E> Optimizer<C, E>
 where
-    C: Connector + Send,
-    E: Executor<C>,
+    C: Connector + Send + 'static,
+    E: Executor<C> + Send,
 {
     pub fn new(conn: Arc<C>, engine: Arc<E>) -> Self {
         let config = OptimizerConfig::default();
@@ -61,10 +62,10 @@ where
         }
     }
 
-    pub fn run(&mut self, dag: &mut Dag) -> Result<usize, OptimizerError> {
+    pub async fn run(&mut self, dag: &mut Dag) -> Result<usize, OptimizerError> {
         if self.run_cse_pass {
             let mut pass: CSEPass<C, E> = CSEPass::new();
-            let res = pass.run(dag)?;
+            let res = pass.run(dag).await?;
         } else {
             debug!("skipping CSE pass");
         }

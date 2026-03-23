@@ -1,5 +1,3 @@
-use crate::{connectors::Connector, dag::Dag};
-
 use async_trait::async_trait;
 use futures::{StreamExt, stream::FuturesUnordered};
 use log::debug;
@@ -8,6 +6,8 @@ use petgraph::prelude::StableDiGraph;
 use std::{collections::HashSet, sync::Arc};
 
 use thiserror::Error;
+
+use crate::{connectors::Connector, dag::Dag};
 
 #[derive(Error, Debug)]
 pub enum ExecutorError {

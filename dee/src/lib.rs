@@ -1,3 +1,5 @@
+use datafusion::arrow::datatypes::SchemaRef;
+
 pub mod connectors;
 pub mod dag;
 pub mod executor;
@@ -121,7 +123,7 @@ mod tests {
         assert!(df.is_ok());
         let dag = df.unwrap();
         assert!(dag.nodes.len() == 5);
-        let mem_dag = Dag::from(dag);
+        let mem_dag = Dag::try_from(dag).unwrap();
         assert!(mem_dag.graph.node_count() == 5);
         assert!(mem_dag.graph.edge_count() == 6);
     }
@@ -160,7 +162,7 @@ mod tests {
             }"#;
 
         let df: DagFile = serde_json::from_str(data).unwrap();
-        let dag = Dag::from(df);
+        let dag = Dag::try_from(df).unwrap();
         let prof = connectors::duckdb::DuckDBProfile::new_in_memory();
         let raw_conn = connectors::duckdb::DuckDBConnection::new(prof);
         let conn = match raw_conn {

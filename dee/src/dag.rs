@@ -1,8 +1,16 @@
-use std::collections::HashMap;
+use petgraph::{Direction::Incoming, graph::NodeIndex, prelude::StableDiGraph};
+use std::{collections::HashMap, sync::Arc};
 
-use petgraph::{Direction::Incoming, data::DataMap, graph::NodeIndex, prelude::StableDiGraph};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use thiserror::Error;
 
-use crate::file::{DagFile, DagFileMetadata, DagFileNode};
+use crate::file::{DagColumn, DagFile, DagFileMetadata, DagFileNode, DagFileSource};
+
+#[derive(Error, Debug)]
+pub enum FormatError {
+    #[error("problem with parsing Dag file - {0}")]
+    Parser(String),
+}
 
 /// Interal DAG representation
 
@@ -11,6 +19,36 @@ pub enum MaterializeMode {
     View,
     Table,
     Incremental,
+}
+
+#[derive(Clone)]
+pub struct SourceNode {
+    pub name: String,
+    pub schema: SchemaRef,
+}
+
+impl TryFrom<DagFileSource> for SourceNode {
+    type Error = FormatError;
+    fn try_from(value: DagFileSource) -> Result<Self, Self::Error> {
+        let name = value.name;
+        let fields: Result<Vec<Field>, FormatError> = value
+            .columns
+            .iter()
+            .map(|c| {
+                c.data_type
+                    .parse::<DataType>()
+                    .map_err(|_| {
+                        FormatError::Parser(format!(
+                            "can't parse data type {}",
+                            c.data_type.clone()
+                        ))
+                    })
+                    .and_then(|dt| Ok(Field::new(c.name.clone(), dt, false)))
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(fields?));
+        Ok(Self { name, schema })
+    }
 }
 
 #[derive(Clone)]
@@ -53,14 +91,23 @@ pub struct Dag {
     pub db: String,
     pub graph: StableDiGraph<u32, ()>,
     pub nodes: Vec<TransformNode>,
+    pub sources: Vec<SourceNode>,
 }
 
-impl From<DagFile> for Dag {
-    fn from(value: DagFile) -> Self {
+impl TryFrom<DagFile> for Dag {
+    type Error = FormatError;
+    fn try_from(value: DagFile) -> Result<Self, Self::Error> {
         let dialect = match value.metadata {
             Some(meta) => meta.sql_dialect.unwrap_or("Unknown".into()),
             None => "Unknown".into(),
         };
+        let sources: Vec<SourceNode> = value
+            .sources
+            .iter()
+            .cloned()
+            .map(TryFrom::try_from)
+            .collect::<Result<Vec<SourceNode>, FormatError>>()?;
+
         let nodes: Vec<TransformNode> = value.nodes.iter().cloned().map(From::from).collect();
         let mut node_index: HashMap<String, u32> = HashMap::with_capacity(nodes.len());
         let mut n = 0;
@@ -85,11 +132,12 @@ impl From<DagFile> for Dag {
                 None => (),
             }
         }
-        Self {
+        Ok(Self {
             db: dialect,
             graph,
             nodes,
-        }
+            sources,
+        })
     }
 }
 
@@ -134,17 +182,34 @@ impl From<Dag> for DagFile {
             .node_indices()
             .map(|nidx| (*value.graph.node_weight(nidx).unwrap(), nidx))
             .collect();
-
+        let nodes = value
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| transform_to_file_node(i as u32, &value, &map, n))
+            .collect();
+        let sources = value
+            .sources
+            .iter()
+            .map(|s| DagFileSource {
+                name: s.name.clone(),
+                columns: s
+                    .schema
+                    .flattened_fields()
+                    .iter()
+                    .map(|f| DagColumn {
+                        name: f.name().clone(),
+                        data_type: f.data_type().to_string(),
+                    })
+                    .collect(),
+            })
+            .collect();
         DagFile {
             metadata: Some(DagFileMetadata {
                 sql_dialect: Some(value.db.clone()),
             }),
-            nodes: value
-                .nodes
-                .iter()
-                .enumerate()
-                .map(|(i, n)| transform_to_file_node(i as u32, &value, &map, n))
-                .collect(),
+            sources,
+            nodes,
         }
     }
 }

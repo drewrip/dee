@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct DagFile {
     pub metadata: Option<DagFileMetadata>,
     pub nodes: Vec<DagFileNode>,
+    pub sources: Vec<DagFileSource>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -18,4 +19,16 @@ pub struct DagFileNode {
     pub depends_on: Vec<String>,
     pub materialize: Option<bool>,
     pub no_mangle: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct DagFileSource {
+    pub name: String,
+    pub columns: Vec<DagColumn>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct DagColumn {
+    pub name: String,
+    pub data_type: String,
 }

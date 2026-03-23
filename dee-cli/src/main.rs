@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use std::{error::Error, path::PathBuf};
 use std::{fs, sync::Arc};
+
 #[derive(Parser)]
 pub struct CliArgs {
     #[command(subcommand)]
@@ -62,7 +63,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let engine = SimpleEngine::new(conn)?;
 
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(run_cmd.dag_file)?)?;
-            let dag = Dag::from(dag_file);
+            let dag = Dag::try_from(dag_file)?;
 
             let res = engine.run(dag).await?;
             info!("res = {}", res);
@@ -77,10 +78,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let engine = SimpleEngine::new(conn.clone())?;
 
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(opt_cmd.dag_file)?)?;
-            let mut dag = Dag::from(dag_file);
+            let mut dag = Dag::try_from(dag_file)?;
 
             let mut optimizer = Optimizer::new(conn, Arc::new(engine));
-            optimizer.run(&mut dag)?;
+            optimizer.run(&mut dag).await?;
             let new_dag_file: DagFile = DagFile::from(dag);
             let mut buf = Vec::new();
             let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
@@ -90,7 +91,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         CliCommand::Draw(draw_cmd) => {
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(draw_cmd.dag_file)?)?;
-            let dag = Dag::from(dag_file);
+            let dag = Dag::try_from(dag_file)?;
             let dot_out = Dot::new(&dag.graph);
             println!("{:?}", dot_out);
         }
