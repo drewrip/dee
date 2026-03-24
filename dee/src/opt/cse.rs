@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 use datafusion::{
-    arrow::datatypes::{Schema, SchemaRef},
-    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
+    common::{
+        Column,
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    },
     datasource::empty::EmptyTable,
-    logical_expr::{LogicalPlan, LogicalPlanBuilder, table_scan},
-    prelude::SessionContext,
-    sql::unparser::plan_to_sql,
+    logical_expr::{LogicalPlan, table_scan},
+    prelude::{Expr, SessionContext},
+    sql::{TableReference, unparser::plan_to_sql},
 };
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
@@ -99,6 +101,8 @@ where
             }
         }
         let cs = &subtrees[0][common[0]];
+        let out_refs = cs.expressions();
+        println!("exprs = {:?}", out_refs);
         let common_schema = cs.schema().as_arrow();
         let common_table = Arc::new(EmptyTable::new(Arc::new(common_schema.clone())));
         ctx.register_table("cse_1".to_string(), common_table)
@@ -109,11 +113,10 @@ where
             id: "cse_1".to_string(),
             query_text: sql.to_string(),
             materialize: MaterializeMode::View,
-            no_mangle: false,
         });
-
         let new_graph_idx = dag.graph.add_node(new_idx as u32);
         let new_table_scan = table_scan(Some("cse_1"), common_schema, None).unwrap();
+
         let new_scan_plan = new_table_scan.plan();
         for (i, (node, lp)) in dag.nodes.iter_mut().zip(lps).enumerate() {
             let new_lp = lp
@@ -131,7 +134,7 @@ where
                 .graph
                 .node_indices()
                 .map(|idx| (idx, dag.graph.node_weight(idx).unwrap()))
-                .find(|(idx, weight)| **weight == i as u32)
+                .find(|(_idx, weight)| **weight == i as u32)
                 .unwrap();
             dag.graph.add_edge(new_graph_idx, this_node_idx.0, ());
         }

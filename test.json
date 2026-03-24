@@ -1,0 +1,59 @@
+{
+  "sources": [
+    {"name": "lineitem",
+      "columns": [
+        {"name": "l_orderkey", "data_type": "Int64"},
+        {"name": "l_partkey", "data_type": "Int64"},
+        {"name": "l_suppkey", "data_type": "Int64"},
+        {"name": "l_linenumber", "data_type": "Int32"},
+        {"name": "l_quantity", "data_type": "Decimal128(15, 2)"},
+        {"name": "l_extendedprice", "data_type": "Decimal128(15, 2)"},
+        {"name": "l_discount", "data_type": "Decimal128(15, 2)"},
+        {"name": "l_tax", "data_type": "Decimal128(15, 2)"},
+        {"name": "l_returnflag", "data_type": "Utf8View"},
+        {"name": "l_linestatus", "data_type": "Utf8View"},
+        {"name": "l_shipdate", "data_type": "Date32"},
+        {"name": "l_commitdate", "data_type": "Date32"},
+        {"name": "l_receiptdate", "data_type": "Date32"},
+        {"name": "l_shipinstruct", "data_type": "Utf8View"},
+        {"name": "l_shipmode", "data_type": "Utf8View"},
+        {"name": "l_comment", "data_type": "Utf8View"}
+      ]
+    },
+    {
+      "name": "orders",
+      "columns": [
+        {"name": "o_orderkey", "data_type": "Int64"},
+        {"name": "o_custkey", "data_type": "Int64"},
+        {"name": "o_orderstatus", "data_type": "Utf8View"},
+        {"name": "o_totalprice", "data_type": "Decimal128(15, 2)"},
+        {"name": "o_orderdate", "data_type": "Date32"},
+        {"name": "o_orderpriority", "data_type": "Utf8View"},
+        {"name": "o_clerk", "data_type": "Utf8View"},
+        {"name": "o_shippriority", "data_type": "Int32"},
+        {"name": "o_comment", "data_type": "Utf8View"}
+      ]
+    }
+  ],
+  "nodes":
+  [
+    {
+      "id": "t1",
+      "query_text": "SELECT MAX(l_extendedprice * o_totalprice) FROM (SELECT * FROM lineitem JOIN orders ON l_orderkey = o_orderkey)",
+      "depends_on": [],
+      "materialize": true
+    },
+    {
+      "id": "t2",
+      "query_text": "SELECT MIN(l_extendedprice * o_totalprice) FROM (SELECT * FROM lineitem JOIN orders ON l_orderkey = o_orderkey)",
+      "depends_on": [],
+      "materialize": true
+    },
+    {
+      "id": "t3",
+      "query_text": "SELECT AVG(l_extendedprice * o_totalprice) FROM (SELECT * FROM lineitem JOIN orders ON l_orderkey = o_orderkey)",
+      "depends_on": [],
+      "materialize": true
+    }
+  ]
+}

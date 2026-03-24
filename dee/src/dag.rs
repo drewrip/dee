@@ -56,7 +56,6 @@ pub struct TransformNode {
     pub id: String,
     pub query_text: String,
     pub materialize: MaterializeMode,
-    pub no_mangle: bool,
 }
 
 impl From<DagFileNode> for TransformNode {
@@ -72,17 +71,11 @@ impl From<DagFileNode> for TransformNode {
             }
             None => MaterializeMode::View,
         };
-        // If no_mangle isn't specified then allow mangling
-        let no_mangle = match value.no_mangle {
-            Some(mangle) => mangle,
-            None => false,
-        };
 
         Self {
             id: value.id,
             query_text: value.query_text,
             materialize,
-            no_mangle,
         }
     }
 }
@@ -171,7 +164,6 @@ fn transform_to_file_node(
         query_text: value.query_text.clone(),
         depends_on: depends,
         materialize: Some(materialize),
-        no_mangle: Some(false),
     }
 }
 

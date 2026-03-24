@@ -18,7 +18,6 @@ pub struct DagFileNode {
     pub query_text: String,
     pub depends_on: Vec<String>,
     pub materialize: Option<bool>,
-    pub no_mangle: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
