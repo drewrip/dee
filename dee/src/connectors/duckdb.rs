@@ -1,13 +1,13 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
-
 use crate::{
     connectors::{Connector, ConnectorError},
     dag::MaterializeMode,
 };
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::SchemaRef;
 use duckdb::{Config, DuckdbConnectionManager, params};
 use log::debug;
 use r2d2::Pool;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub struct DuckDBProfile {
     pub db: DuckDBType,
@@ -147,5 +147,18 @@ impl Connector for DuckDBConnection {
         debug!("attempt drop_relation ({}, {})", rel_type, name);
         let tmpl_query = format!("DROP {} IF EXISTS {}", rel_type, name);
         self.execute(tmpl_query).await
+    }
+
+    async fn get_schema(&self, name: String) -> Option<Result<SchemaRef, ConnectorError>> {
+        debug!("attempt to fetch arrow schema for {}", name);
+        let conn = self
+            .pool
+            .get()
+            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))
+            .unwrap();
+        let tmpl_query = format!("SELECT * FROM {}", name);
+        let stmt = conn.prepare(&tmpl_query).unwrap();
+        let schema = stmt.schema().clone();
+        Some(Ok(schema))
     }
 }

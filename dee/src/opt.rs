@@ -1,4 +1,5 @@
 pub mod cse;
+pub mod omp;
 
 use std::sync::Arc;
 
@@ -7,7 +8,9 @@ use log::debug;
 
 use thiserror::Error;
 
-use crate::{connectors::Connector, dag::Dag, executor::Executor, opt::cse::CSEPass};
+use crate::{
+    connectors::Connector, dag::Dag, executor::Executor, opt::cse::CSEPass, opt::omp::OMPPass,
+};
 
 #[derive(Error, Debug)]
 pub enum OptimizerError {
@@ -36,7 +39,7 @@ where
     engine: Arc<E>,
     /// Common Subexpression elimination
     run_cse_pass: bool,
-    /// Optimizal materialization plan
+    /// Optimal materialization plan
     run_omp_pass: bool,
     /// Logical rewriting
     run_lr_pass: bool,
@@ -69,11 +72,14 @@ where
         } else {
             debug!("skipping CSE pass");
         }
+
         if self.run_omp_pass {
-            return Err(OptimizerError::NotImplemented("OMP".to_string()));
+            let mut pass: OMPPass<C, E> = OMPPass::new();
+            let res = pass.run(dag).await?;
         } else {
             debug!("skipping OMP pass");
         }
+
         if self.run_lr_pass {
             return Err(OptimizerError::NotImplemented("LR".to_string()));
         } else {

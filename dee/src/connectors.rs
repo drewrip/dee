@@ -2,8 +2,8 @@
 pub mod duckdb;
 
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::SchemaRef;
 use std::sync::Arc;
-
 use thiserror::Error;
 
 use crate::dag::MaterializeMode;
@@ -37,4 +37,6 @@ pub trait Connector {
         relation_type: MaterializeMode,
         name: String,
     ) -> Result<usize, ConnectorError>;
+
+    async fn get_schema(&self, name: String) -> Option<Result<SchemaRef, ConnectorError>>;
 }

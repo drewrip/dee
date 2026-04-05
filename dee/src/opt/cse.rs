@@ -1,13 +1,10 @@
 use async_trait::async_trait;
 use datafusion::{
-    common::{
-        Column,
-        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
-    },
+    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     datasource::empty::EmptyTable,
     logical_expr::{LogicalPlan, table_scan},
-    prelude::{Expr, SessionContext},
-    sql::{TableReference, unparser::plan_to_sql},
+    prelude::SessionContext,
+    sql::unparser::plan_to_sql,
 };
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
