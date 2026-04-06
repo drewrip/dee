@@ -111,6 +111,16 @@ impl Graph {
         self.g.iter().map(|n| n.1.depends_on.len()).sum()
     }
 
+    pub fn in_degree(&self, node: &String) -> Option<usize> {
+        self.g.get(node).map(|n| n.depends_on.len())
+    }
+
+    pub fn out_degree(&self, node: &String) -> usize {
+        self.nodes()
+            .map(|n| n.depends_on.contains(node) as usize)
+            .sum()
+    }
+
     ///
     /// Nodes that have no dependencies
     ///

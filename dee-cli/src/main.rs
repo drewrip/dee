@@ -10,7 +10,6 @@ use dee::{
     opt::Optimizer,
 };
 use log::info;
-use petgraph::dot::Dot;
 use serde::Serialize;
 
 use std::{error::Error, path::PathBuf};
@@ -65,8 +64,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(run_cmd.dag_file)?)?;
             let dag = Dag::try_from(dag_file)?;
 
-            let res = engine.run(dag).await?;
-            info!("res = {}", res);
+            let res = engine.run(&dag).await?;
+            info!("stats = {:?}", res);
         }
         CliCommand::Opt(opt_cmd) => {
             info!("Optimizing DAG: {}", opt_cmd.dag_file);

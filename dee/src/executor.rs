@@ -1,12 +1,19 @@
 use async_trait::async_trait;
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::{StreamExt, stream::FuturesUnordered};
 use log::debug;
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use thiserror::Error;
 
-use crate::{connectors::Connector, dag::Dag};
+use crate::{
+    connectors::Connector,
+    dag::{Dag, MaterializeMode},
+};
 
 #[derive(Error, Debug)]
 pub enum ExecutorError {
@@ -22,7 +29,8 @@ where
     type ExecutionEngine;
 
     fn new(conn: Arc<C>) -> Result<Self::ExecutionEngine, ExecutorError>;
-    async fn run(&self, dag: Dag) -> Result<usize, ExecutorError>;
+    async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError>;
+    async fn cleanup(&self, dag: &Dag) -> Result<usize, ExecutorError>;
 }
 
 #[derive(Debug)]
@@ -44,14 +52,15 @@ where
         Ok(SimpleEngine { conn })
     }
 
-    async fn run(&self, dag: Dag) -> Result<usize, ExecutorError> {
+    async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError> {
         let mut work_graph = dag.nodes.clone();
         let mut work_queue = FuturesUnordered::new();
-
         let initial_size = work_graph.num_nodes();
         let mut finished = 0;
-        let mut total_size = 0;
         let mut in_progress = HashSet::new();
+
+        let node_stats = HashMap::new();
+        let start = Utc::now();
         while work_graph.num_nodes() > 0 {
             let next_nodes: Vec<_> = work_graph
                 .sources()
@@ -77,10 +86,9 @@ where
 
             // wait for work_queue to empty
             while let Some(item) = work_queue.next().await {
-                let (rs_size, node_id) =
+                let (_, node_id) =
                     item.map_err(|j| ExecutorError::Exec(format!("join error - {}", j)))??;
                 debug!("recv result for nidx={:?}", node_id);
-                total_size += rs_size;
                 in_progress.remove(&node_id);
                 work_graph.remove(node_id.clone());
                 finished += 1;
@@ -88,6 +96,42 @@ where
             }
         }
         debug!("work_queue cleared");
-        Ok(total_size)
+        let finish = Utc::now();
+
+        let exec_stats = ExecStats {
+            start,
+            finish,
+            duration: finish - start,
+            node_stats,
+        };
+        Ok(exec_stats)
+    }
+
+    async fn cleanup(&self, dag: &Dag) -> Result<usize, ExecutorError> {
+        let mut num_deleted = 0;
+        for node in dag.nodes.nodes() {
+            num_deleted += self
+                .conn
+                .drop_relation(MaterializeMode::View, node.id.clone())
+                .await
+                .unwrap_or(0);
+            num_deleted += self
+                .conn
+                .drop_relation(MaterializeMode::Table, node.id.clone())
+                .await
+                .unwrap_or(0);
+        }
+        Ok(num_deleted)
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct ExecStats {
+    pub start: DateTime<Utc>,
+    pub finish: DateTime<Utc>,
+    pub duration: TimeDelta,
+    pub node_stats: HashMap<String, NodeStats>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeStats {}

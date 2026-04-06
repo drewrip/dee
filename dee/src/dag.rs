@@ -25,7 +25,7 @@ pub enum MaterializeMode {
     Incremental,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SourceNode {
     pub name: String,
     pub schema: SchemaRef,
@@ -86,6 +86,7 @@ impl From<DagFileNode> for TransformNode {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct Dag {
     pub db: String,
     pub nodes: Graph,

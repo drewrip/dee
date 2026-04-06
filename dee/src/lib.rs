@@ -179,7 +179,7 @@ mod tests {
         };
 
         let engine = SimpleEngine::new(conn).unwrap();
-        let res = engine.run(dag).await.unwrap();
-        println!("res = {}", res);
+        let res = engine.run(&dag).await.unwrap();
+        println!("stats = {:?}", res);
     }
 }

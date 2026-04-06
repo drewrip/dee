@@ -47,8 +47,8 @@ where
 
 impl<C, E> Optimizer<C, E>
 where
-    C: Connector + Send + 'static,
-    E: Executor<C> + Send,
+    C: Connector + Send + 'static + Sync,
+    E: Executor<C> + Send + Sync,
 {
     pub fn new(conn: Arc<C>, engine: Arc<E>) -> Self {
         let config = OptimizerConfig::default();
@@ -74,7 +74,7 @@ where
         }
 
         if self.run_omp_pass {
-            let mut pass: OMPPass<C, E> = OMPPass::new();
+            let mut pass: OMPPass<C, E> = OMPPass::new(self.conn.clone(), self.engine.clone());
             let res = pass.run(dag).await?;
         } else {
             debug!("skipping OMP pass");
@@ -99,8 +99,8 @@ pub struct OptimizerConfig {
 impl Default for OptimizerConfig {
     fn default() -> Self {
         OptimizerConfig {
-            run_cse_pass: true,
-            run_omp_pass: false,
+            run_cse_pass: false,
+            run_omp_pass: true,
             run_lr_pass: false,
         }
     }
