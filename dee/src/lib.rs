@@ -2,6 +2,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 pub mod connectors;
 pub mod dag;
+pub mod dbt;
 pub mod executor;
 pub mod file;
 pub mod graph;

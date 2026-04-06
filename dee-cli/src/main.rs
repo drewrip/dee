@@ -26,6 +26,7 @@ pub enum CliCommand {
     Run(RunCommand),
     Opt(OptCommand),
     Draw(DrawCommand),
+    Convert(ConvertCommand),
 }
 
 #[derive(Args)]
@@ -45,6 +46,11 @@ pub struct OptCommand {
     #[arg(short, long)]
     db_file: String,
     dag_file: String,
+}
+
+#[derive(Args)]
+pub struct ConvertCommand {
+    manifest_file: String,
 }
 
 #[tokio::main]
@@ -93,6 +99,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let dag = Dag::try_from(dag_file)?;
             let dotfile = dag.nodes.draw();
             println!("{}", dotfile);
+        }
+        CliCommand::Convert(convert_cmd) => {
+            let manifest: dee::dbt::DbtManifest = serde_json::from_str(&fs::read_to_string(convert_cmd.manifest_file)?)?;
+            let dag_file = DagFile::from(manifest);
+            let mut buf = Vec::new();
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+            dag_file.serialize(&mut ser).unwrap();
+            println!("{}", String::from_utf8(buf).unwrap());
         }
     }
 
