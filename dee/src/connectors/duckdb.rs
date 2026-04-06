@@ -132,7 +132,7 @@ impl Connector for DuckDBConnection {
         let rel_type = materialize_mode_in_duckdb(relation_type);
         //debug!("creating new_relation ({}, {})", rel_type, name);
         let tmpl_query = format!(
-            "CREATE OR REPLACE {} '{}' AS ({})",
+            "CREATE OR REPLACE {} {} AS ({})",
             rel_type, name, query_text
         );
         self.execute(tmpl_query).await

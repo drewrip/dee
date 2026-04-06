@@ -150,13 +150,17 @@ impl Graph {
         let mut lines: Vec<String> = Vec::new();
 
         for id in self.g.keys() {
-            lines.push(format!("\"{}\"", id.clone()));
+            lines.push(format!("\"{}\"", id.clone().replace("\"", "")));
         }
 
         for (id, node) in self.g.iter() {
             lines.push(format!("// node={}", id));
             for parent in node.depends_on.iter() {
-                lines.push(format!("\"{}\" -> \"{}\"", parent, id));
+                lines.push(format!(
+                    "\"{}\" -> \"{}\"",
+                    parent.replace("\"", ""),
+                    id.replace("\"", "")
+                ));
             }
         }
         let line_section = lines
