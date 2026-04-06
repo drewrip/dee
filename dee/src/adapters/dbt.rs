@@ -52,16 +52,20 @@ impl From<DbtManifest> for DagFile {
     fn from(manifest: DbtManifest) -> Self {
         let mut nodes = Vec::new();
         
-        // Map to keep track of relation_name to unique_id mapping for replacement
-        let mut rel_to_id = HashMap::new();
+        // Map to keep track of unique_id to relation_name mapping for dependency resolution
+        let mut id_to_rel = HashMap::new();
         for (id, node) in &manifest.nodes {
             if let Some(rel) = &node.relation_name {
-                rel_to_id.insert(rel.clone(), id.clone());
+                id_to_rel.insert(id.clone(), rel.clone());
+            } else {
+                id_to_rel.insert(id.clone(), id.clone());
             }
         }
         for (id, source) in &manifest.sources {
             if let Some(rel) = &source.relation_name {
-                rel_to_id.insert(rel.clone(), id.clone());
+                id_to_rel.insert(id.clone(), rel.clone());
+            } else {
+                id_to_rel.insert(id.clone(), id.clone());
             }
         }
 
@@ -71,22 +75,24 @@ impl From<DbtManifest> for DagFile {
                 .cloned()
                 .unwrap_or_default();
             
-            // Replace relation_names with unique_ids to link them in our DAG
-            let mut final_query = query_text;
-            for (rel, target_id) in &rel_to_id {
-                final_query = final_query.replace(rel, target_id);
-            }
+            // Per user request, DO NOT change the query_text.
+            // dbt compiled queries already use relation_names.
+            let final_query = query_text;
             
-            // Filter depends_on to only include nodes that exist in our nodes list
+            // Filter depends_on to only include nodes that exist in our nodes list,
+            // and use their relation_name as the ID.
             let depends_on: Vec<String> = node.depends_on.nodes.iter()
                 .filter(|dep_id| manifest.nodes.contains_key(*dep_id))
-                .cloned()
+                .map(|dep_id| id_to_rel.get(dep_id).cloned().unwrap_or_else(|| dep_id.clone()))
                 .collect();
                 
             let materialize = node.config.materialized.as_deref().map(|m| m == "table" || m == "incremental");
             
+            // Use relation_name as the ID so it matches what's used in queries
+            let node_id = node.relation_name.clone().unwrap_or_else(|| id.clone());
+            
             nodes.push(DagFileNode {
-                id: id.clone(),
+                id: node_id,
                 query_text: final_query,
                 depends_on,
                 materialize,
@@ -104,8 +110,10 @@ impl From<DbtManifest> for DagFile {
                     });
                 }
             }
+            // Use relation_name for source as well if available
+            let source_name = source.relation_name.unwrap_or(id);
             sources.push(DagFileSource {
-                name: id,
+                name: source_name,
                 columns,
             });
         }
