@@ -48,8 +48,15 @@ pub struct OptCommand {
     dag_file: String,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum ConvertFormat {
+    Dbt,
+}
+
 #[derive(Args)]
 pub struct ConvertCommand {
+    #[arg(short, long)]
+    format: ConvertFormat,
     manifest_file: String,
     #[arg(short, long)]
     output: Option<String>,
@@ -103,17 +110,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("{}", dotfile);
         }
         CliCommand::Convert(convert_cmd) => {
-            let manifest: dee::adapters::dbt::DbtManifest = serde_json::from_str(&fs::read_to_string(convert_cmd.manifest_file)?)?;
-            let dag_file = DagFile::from(manifest);
-            let mut buf = Vec::new();
-            let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
-            let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-            dag_file.serialize(&mut ser).unwrap();
-            let out_str = String::from_utf8(buf).unwrap();
-            if let Some(output) = convert_cmd.output {
-                fs::write(output, out_str)?;
-            } else {
-                println!("{}", out_str);
+            match convert_cmd.format {
+                ConvertFormat::Dbt => {
+                    let manifest: dee::adapters::dbt::DbtManifest = serde_json::from_str(&fs::read_to_string(convert_cmd.manifest_file)?)?;
+                    let dag_file = DagFile::from(manifest);
+                    let mut buf = Vec::new();
+                    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+                    let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+                    dag_file.serialize(&mut ser).unwrap();
+                    let out_str = String::from_utf8(buf).unwrap();
+                    if let Some(output) = convert_cmd.output {
+                        fs::write(output, out_str)?;
+                    } else {
+                        println!("{}", out_str);
+                    }
+                }
             }
         }
     }
