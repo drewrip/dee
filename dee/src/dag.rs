@@ -1,10 +1,14 @@
-use petgraph::{Direction::Incoming, graph::NodeIndex, prelude::StableDiGraph};
 use std::{collections::HashMap, sync::Arc};
+
+use std::collections::HashSet;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use thiserror::Error;
 
-use crate::file::{DagColumn, DagFile, DagFileMetadata, DagFileNode, DagFileSource};
+use crate::{
+    file::{DagColumn, DagFile, DagFileMetadata, DagFileNode, DagFileSource},
+    graph::Graph,
+};
 
 #[derive(Error, Debug)]
 pub enum FormatError {
@@ -51,11 +55,12 @@ impl TryFrom<DagFileSource> for SourceNode {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TransformNode {
     pub id: String,
     pub query_text: String,
     pub materialize: MaterializeMode,
+    pub depends_on: HashSet<String>,
 }
 
 impl From<DagFileNode> for TransformNode {
@@ -76,14 +81,14 @@ impl From<DagFileNode> for TransformNode {
             id: value.id,
             query_text: value.query_text,
             materialize,
+            depends_on: HashSet::from_iter(value.depends_on),
         }
     }
 }
 
 pub struct Dag {
     pub db: String,
-    pub graph: StableDiGraph<u32, ()>,
-    pub nodes: Vec<TransformNode>,
+    pub nodes: Graph,
     pub sources: Vec<SourceNode>,
 }
 
@@ -102,58 +107,23 @@ impl TryFrom<DagFile> for Dag {
             .collect::<Result<Vec<SourceNode>, FormatError>>()?;
 
         let nodes: Vec<TransformNode> = value.nodes.iter().cloned().map(From::from).collect();
-        let mut node_index: HashMap<String, u32> = HashMap::with_capacity(nodes.len());
-        let mut n = 0;
-        let mut graph = StableDiGraph::new();
-        for node in &nodes {
-            node_index.insert(node.id.clone(), n);
-            graph.add_node(n);
-            n += 1;
+        let mut node_map = HashMap::new();
+        for node in nodes {
+            node_map.insert(node.id.clone(), node);
         }
-        for node in &value.nodes {
-            match node_index.get(&node.id) {
-                Some(dst) => {
-                    for src_node in &node.depends_on {
-                        match node_index.get(src_node) {
-                            Some(src) => {
-                                graph.add_edge((*src).into(), (*dst).into(), ());
-                            }
-                            None => (),
-                        }
-                    }
-                }
-                None => (),
-            }
-        }
+        let graph = Graph::new(node_map);
+        graph
+            .check()
+            .map_err(|e| FormatError::Parser(format!("bad graph - {}", e)))?;
         Ok(Self {
             db: dialect,
-            graph,
-            nodes,
+            nodes: graph,
             sources,
         })
     }
 }
 
-fn transform_to_file_node(
-    idx: u32,
-    dag: &Dag,
-    nidx_map: &HashMap<u32, NodeIndex>,
-    value: &TransformNode,
-) -> DagFileNode {
-    let parents: Vec<NodeIndex> = dag
-        .graph
-        .neighbors_directed(*nidx_map.get(&idx).unwrap(), Incoming)
-        .collect();
-    let p: Vec<u32> = parents
-        .iter()
-        .map(|ancestor| *dag.graph.node_weight(*ancestor).unwrap())
-        .collect();
-
-    let depends: Vec<String> = p
-        .iter()
-        .map(|tidx| dag.nodes.get(*tidx as usize).unwrap().id.clone())
-        .collect();
-
+fn transform_to_file_node(value: &TransformNode) -> DagFileNode {
     let materialize = match value.materialize {
         MaterializeMode::View => false,
         MaterializeMode::Table => true,
@@ -162,24 +132,19 @@ fn transform_to_file_node(
     DagFileNode {
         id: value.id.clone(),
         query_text: value.query_text.clone(),
-        depends_on: depends,
+        depends_on: value.depends_on.clone().into_iter().collect(),
         materialize: Some(materialize),
     }
 }
 
 impl From<Dag> for DagFile {
     fn from(value: Dag) -> DagFile {
-        let map: HashMap<u32, NodeIndex> = value
-            .graph
-            .node_indices()
-            .map(|nidx| (*value.graph.node_weight(nidx).unwrap(), nidx))
-            .collect();
         let nodes = value
             .nodes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| transform_to_file_node(i as u32, &value, &map, n))
+            .nodes()
+            .map(|n| transform_to_file_node(n))
             .collect();
+
         let sources = value
             .sources
             .iter()

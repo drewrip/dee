@@ -14,6 +14,6 @@ tokio = { version = "1.50.0", features = ["full"] }
 tempfile = "3.27.0"
 r2d2 = "0.8.10"
 futures = "0.3.32"
-petgraph = "0.8.3"
 log = "0.4.29"
 datafusion = { version = "52.3.0", features = ["sql"] }
+slotmap = "1.1.1"

@@ -4,6 +4,7 @@ pub mod connectors;
 pub mod dag;
 pub mod executor;
 pub mod file;
+pub mod graph;
 pub mod opt;
 
 #[cfg(test)]
@@ -35,7 +36,8 @@ mod tests {
                         "query_text": "SELECT 2",
                         "depends_on": ["source"]
                     }
-                ]
+                ],
+                "sources": []
             }"#;
 
         let df: Result<DagFile> = serde_json::from_str(data);
@@ -116,7 +118,8 @@ mod tests {
                         "query_text": "SELECT 5",
                         "depends_on": ["t1", "t2", "t3"]
                     }
-                ]
+                ],
+                "sources": []
             }"#;
 
         let df: Result<DagFile> = serde_json::from_str(data);
@@ -124,8 +127,8 @@ mod tests {
         let dag = df.unwrap();
         assert!(dag.nodes.len() == 5);
         let mem_dag = Dag::try_from(dag).unwrap();
-        assert!(mem_dag.graph.node_count() == 5);
-        assert!(mem_dag.graph.edge_count() == 6);
+        assert!(mem_dag.nodes.num_nodes() == 5);
+        assert!(mem_dag.nodes.num_edges() == 6);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -158,7 +161,8 @@ mod tests {
                         "query_text": "SELECT 5",
                         "depends_on": ["t1", "t2", "t3"]
                     }
-                ]
+                ],
+                "sources": []
             }"#;
 
         let df: DagFile = serde_json::from_str(data).unwrap();

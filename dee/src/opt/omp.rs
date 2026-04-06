@@ -40,6 +40,7 @@ where
 {
     async fn run(&mut self, dag: &mut Dag) -> Result<usize, OptimizerError> {
         debug!("Running OMPPass");
+
         Ok(0)
     }
 }

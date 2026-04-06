@@ -92,8 +92,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Draw(draw_cmd) => {
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(draw_cmd.dag_file)?)?;
             let dag = Dag::try_from(dag_file)?;
-            let dot_out = Dot::new(&dag.graph);
-            println!("{:?}", dot_out);
+            let dotfile = dag.nodes.draw();
+            println!("{}", dotfile);
         }
     }
 

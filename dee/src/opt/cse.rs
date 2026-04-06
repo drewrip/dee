@@ -6,7 +6,11 @@ use datafusion::{
     prelude::SessionContext,
     sql::unparser::plan_to_sql,
 };
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use log::debug;
 
@@ -59,10 +63,10 @@ where
             })?;
         }
         let mut lps = Vec::new();
-        let mut subtrees: Vec<Vec<LogicalPlan>> = vec![vec![]; dag.nodes.len()];
+        let mut subtrees: Vec<Vec<LogicalPlan>> = vec![vec![]; dag.nodes.num_nodes()];
         let df_optimizer = datafusion::optimizer::Optimizer::new();
         let config = datafusion::optimizer::OptimizerContext::new().with_max_passes(16);
-        for (i, node) in dag.nodes.iter().enumerate() {
+        for (i, node) in dag.nodes.nodes().enumerate() {
             let df = ctx.sql(&node.query_text.clone()).await.unwrap();
             let mut lp = df.logical_plan().clone();
             lp = df_optimizer.optimize(lp, &config, |_, _| ()).unwrap();
@@ -105,17 +109,18 @@ where
         ctx.register_table("cse_1".to_string(), common_table)
             .unwrap();
         let sql = plan_to_sql(cs).unwrap();
-        let new_idx = dag.nodes.len();
-        dag.nodes.push(TransformNode {
+        dag.nodes.add_node_unchecked(TransformNode {
             id: "cse_1".to_string(),
             query_text: sql.to_string(),
             materialize: MaterializeMode::View,
+            depends_on: HashSet::new(),
         });
-        let new_graph_idx = dag.graph.add_node(new_idx as u32);
         let new_table_scan = table_scan(Some("cse_1"), common_schema, None).unwrap();
 
         let new_scan_plan = new_table_scan.plan();
-        for (i, (node, lp)) in dag.nodes.iter_mut().zip(lps).enumerate() {
+
+        let mut new_edges = Vec::new();
+        for (node, lp) in dag.nodes.nodes_mut().zip(lps) {
             let new_lp = lp
                 .transform_down(|expr| {
                     if expr == *cs {
@@ -127,13 +132,11 @@ where
                 .unwrap();
             let new_sql = plan_to_sql(&new_lp.data).unwrap().to_string();
             node.query_text = new_sql;
-            let this_node_idx = dag
-                .graph
-                .node_indices()
-                .map(|idx| (idx, dag.graph.node_weight(idx).unwrap()))
-                .find(|(_idx, weight)| **weight == i as u32)
-                .unwrap();
-            dag.graph.add_edge(new_graph_idx, this_node_idx.0, ());
+            new_edges.push(("cse_1", node.id.clone()));
+        }
+
+        for (src, dst) in new_edges {
+            dag.nodes.add_edge(&src.to_string(), &dst).unwrap();
         }
 
         Ok(0)
