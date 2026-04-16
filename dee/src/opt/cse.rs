@@ -50,7 +50,7 @@ where
     C: Connector + Send + 'static,
     E: Executor<C> + Send,
 {
-    async fn run(&mut self, dag: &mut Dag) -> Result<usize, OptimizerError> {
+    async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError> {
         debug!("Running CSEPass");
         let ctx = SessionContext::new();
         for s in &dag.sources {
@@ -139,6 +139,6 @@ where
             dag.nodes.add_edge(&src.to_string(), &dst).unwrap();
         }
 
-        Ok(0)
+        Ok(HashMap::new())
     }
 }

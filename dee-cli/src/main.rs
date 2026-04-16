@@ -12,7 +12,7 @@ use dee::{
 use log::info;
 use serde::Serialize;
 
-use std::{error::Error, path::PathBuf};
+use std::{collections::HashSet, error::Error, path::PathBuf};
 use std::{fs, sync::Arc};
 
 #[derive(Parser)]
@@ -48,6 +48,8 @@ pub struct OptCommand {
     dag_file: String,
     #[arg(short, long)]
     output: Option<String>,
+    #[arg(short, long, action)]
+    stats: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -96,8 +98,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(opt_cmd.dag_file)?)?;
             let mut dag = Dag::try_from(dag_file)?;
 
-            let mut optimizer = Optimizer::new(conn, Arc::new(engine));
-            optimizer.run(&mut dag).await?;
+            let mut optimizer = Optimizer::new(conn, Arc::new(engine)).stats_on_passes(true);
+
+            let stats = optimizer.run(&mut dag).await?;
+            if opt_cmd.stats {
+                let mut buf = Vec::new();
+                let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+                let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+                stats.serialize(&mut ser).unwrap();
+                let stats_str = String::from_utf8(buf).unwrap();
+                println!("{}", stats_str);
+            }
             let new_dag_file: DagFile = DagFile::from(dag);
             let mut buf = Vec::new();
             let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");

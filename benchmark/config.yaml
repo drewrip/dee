@@ -1,0 +1,4 @@
+projects:
+  - synth/p01_ecommerce
+  - synth/p02_fraud
+  - synth/p03_iot
