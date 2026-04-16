@@ -1,7 +1,7 @@
 pub mod cse;
 pub mod omp;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use log::debug;
@@ -9,7 +9,10 @@ use log::debug;
 use thiserror::Error;
 
 use crate::{
-    connectors::Connector, dag::Dag, executor::Executor, opt::cse::CSEPass, opt::omp::OMPPass,
+    connectors::Connector,
+    dag::Dag,
+    executor::Executor,
+    opt::{cse::CSEPass, omp::OMPPass},
 };
 
 #[derive(Error, Debug)]
@@ -26,7 +29,7 @@ where
     C: Connector + Send + 'static,
     E: Executor<C> + Send,
 {
-    async fn run(&mut self, dag: &mut Dag) -> Result<usize, OptimizerError>;
+    async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError>;
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +46,8 @@ where
     run_omp_pass: bool,
     /// Logical rewriting
     run_lr_pass: bool,
+    /// Result stats
+    stats_on_passes: bool,
 }
 
 impl<C, E> Optimizer<C, E>
@@ -62,13 +67,26 @@ where
             run_cse_pass: config.run_cse_pass,
             run_omp_pass: config.run_omp_pass,
             run_lr_pass: config.run_lr_pass,
+            stats_on_passes: false,
         }
     }
 
-    pub async fn run(&mut self, dag: &mut Dag) -> Result<usize, OptimizerError> {
+    pub fn stats_on_passes(mut self, collect_stats: bool) -> Self {
+        self.stats_on_passes = collect_stats;
+        self
+    }
+
+    pub async fn run(
+        &mut self,
+        dag: &mut Dag,
+    ) -> Result<HashMap<String, Arc<HashMap<String, String>>>, OptimizerError> {
+        let mut stats = HashMap::new();
         if self.run_cse_pass {
             let mut pass: CSEPass<C, E> = CSEPass::new();
             let res = pass.run(dag).await?;
+            if self.stats_on_passes {
+                stats.insert("CSEPass".to_string(), Arc::new(res));
+            }
         } else {
             debug!("skipping CSE pass");
         }
@@ -76,6 +94,9 @@ where
         if self.run_omp_pass {
             let mut pass: OMPPass<C, E> = OMPPass::new(self.conn.clone(), self.engine.clone());
             let res = pass.run(dag).await?;
+            if self.stats_on_passes {
+                stats.insert("OMPPass".to_string(), Arc::new(res));
+            }
         } else {
             debug!("skipping OMP pass");
         }
@@ -85,7 +106,7 @@ where
         } else {
             debug!("skipping LR pass");
         }
-        Ok(0)
+        Ok(stats)
     }
 }
 

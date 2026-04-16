@@ -1722,6 +1722,7 @@ dependencies = [
  "datafusion",
  "duckdb",
  "futures",
+ "itertools",
  "log",
  "r2d2",
  "serde",
