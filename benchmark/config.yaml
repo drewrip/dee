@@ -1,4 +1,21 @@
 projects:
-  - synth/p01_ecommerce
-  - synth/p02_fraud
-  - synth/p03_iot
+  - synth/one-sink/p01_ecommerce
+  - synth/one-sink/p02_fraud
+  - synth/one-sink/p03_iot
+  - synth/one-sink/p04_hr
+  - synth/one-sink/p05_logistics
+  - synth/one-sink/p06_saas
+  - synth/one-sink/p07_healthcare
+  - synth/one-sink/p08_adtech
+  - synth/one-sink/p09_gaming
+  - synth/one-sink/p10_energy
+  - synth/multi-sink/p01_ecommerce
+  - synth/multi-sink/p02_fraud
+  - synth/multi-sink/p03_iot
+  - synth/multi-sink/p04_hr
+  - synth/multi-sink/p05_logistics
+  - synth/multi-sink/p06_saas
+  - synth/multi-sink/p07_healthcare
+  - synth/multi-sink/p08_adtech
+  - synth/multi-sink/p09_gaming
+  - synth/multi-sink/p10_energy

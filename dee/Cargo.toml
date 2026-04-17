@@ -7,7 +7,7 @@ edition.workspace = true
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-duckdb = { version = "1.10500.0", features = ["bundled", "modern-full"] }
+duckdb = { version = "1.10502.0", features = ["modern-full"] }
 thiserror = "2.0.18"
 async-trait = "0.1.89"
 tokio = { version = "1.50.0", features = ["full"] }
@@ -15,7 +15,6 @@ tempfile = "3.27.0"
 r2d2 = "0.8.10"
 futures = "0.3.32"
 log = "0.4.29"
-datafusion = { version = "52.3.0", features = ["sql"] }
-slotmap = "1.1.1"
+datafusion = { version = "53.0.0", features = ["sql"] }
 chrono = "0.4.44"
 itertools = "0.14.0"
