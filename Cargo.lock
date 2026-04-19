@@ -1737,7 +1737,6 @@ dependencies = [
  "r2d2",
  "serde",
  "serde_json",
- "slotmap",
  "tempfile",
  "thiserror",
  "tokio",
