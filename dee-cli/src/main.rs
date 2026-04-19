@@ -12,7 +12,7 @@ use dee::{
 use log::info;
 use serde::Serialize;
 
-use std::{collections::HashSet, error::Error, path::PathBuf};
+use std::{error::Error, path::PathBuf};
 use std::{fs, sync::Arc};
 
 #[derive(Parser)]
