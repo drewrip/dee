@@ -52,10 +52,6 @@ fn materialize_mode_in_duckdb(mode: MaterializeMode) -> String {
     match mode {
         MaterializeMode::Table => "TABLE".to_string(),
         MaterializeMode::View => "VIEW".to_string(),
-        MaterializeMode::Incremental => {
-            debug!("not sure how to handle Incremental mode in DuckDB... defaulting to VIEW");
-            "VIEW".to_string()
-        }
     }
 }
 
@@ -64,7 +60,7 @@ impl Connector for DuckDBConnection {
     type Profile = DuckDBProfile;
     type Connection = DuckDBConnection;
 
-    fn new(profile: Self::Profile) -> Result<Arc<Self::Connection>, ConnectorError> {
+    async fn new(profile: Self::Profile) -> Result<Arc<Self::Connection>, ConnectorError> {
         let mut conf = Config::default();
         if let Some(max_mem) = profile.max_memory {
             conf = conf
@@ -109,10 +105,7 @@ impl Connector for DuckDBConnection {
     ) -> Result<usize, ConnectorError> {
         let rel_type = materialize_mode_in_duckdb(relation_type);
         //debug!("creating new_relation ({}, {})", rel_type, name);
-        let tmpl_query = format!(
-            "CREATE OR REPLACE {} {} AS ({})",
-            rel_type, name, query_text
-        );
+        let tmpl_query = format!("CREATE {} {} AS ({})", rel_type, name, query_text);
         self.execute(tmpl_query).await
     }
 

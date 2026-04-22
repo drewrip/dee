@@ -22,7 +22,6 @@ pub enum FormatError {
 pub enum MaterializeMode {
     View,
     Table,
-    Incremental,
 }
 
 #[derive(Clone, Debug)]
@@ -128,7 +127,6 @@ fn transform_to_file_node(value: &TransformNode) -> DagFileNode {
     let materialize = match value.materialize {
         MaterializeMode::View => false,
         MaterializeMode::Table => true,
-        MaterializeMode::Incremental => true,
     };
     DagFileNode {
         id: value.id.clone(),

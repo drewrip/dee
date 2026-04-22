@@ -1,12 +1,13 @@
-/// All pre-implemented connectors
-pub mod duckdb;
-
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use std::sync::Arc;
 use thiserror::Error;
 
 use crate::dag::MaterializeMode;
+
+/// All pre-implemented connectors
+pub mod duckdb;
+pub mod postgres;
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -21,7 +22,7 @@ pub trait Connector {
     type Profile;
     type Connection;
 
-    fn new(profile: Self::Profile) -> Result<Arc<Self::Connection>, ConnectorError>;
+    async fn new(profile: Self::Profile) -> Result<Arc<Self::Connection>, ConnectorError>;
 
     async fn execute(&self, query_text: String) -> Result<usize, ConnectorError>;
 

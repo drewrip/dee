@@ -18,3 +18,4 @@ log = "0.4.29"
 datafusion = { version = "53.0.0", features = ["sql"] }
 chrono = "0.4.44"
 itertools = "0.14.0"
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio"] }
