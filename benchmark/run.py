@@ -25,26 +25,23 @@ def run_cmd(cmd, cwd=None, env=None, capture=True):
 def get_db_file_from_profiles(project_dir):
     profiles_path = project_dir / "profiles.yml"
     if not profiles_path.exists():
-        # Check ~/.dbt/profiles.yml as fallback if needed,
-        # but the prompt says local profiles.yml
         return None
 
     with open(profiles_path, "r") as f:
         profiles = yaml.safe_load(f)
 
-    # Heuristic to find the db path in duckdb profile
     for profile_name, profile_cfg in profiles.items():
         if profile_name == "config":
             continue
         outputs = profile_cfg.get("outputs", {})
-        target = profile_cfg.get("target", "dev")
-        if target in outputs:
-            path = outputs[target].get("path")
-            if path:
-                p = Path(path)
-                if not p.is_absolute():
-                    return str(project_dir / p)
-                return path
+        for output_cfg in outputs.values():
+            if output_cfg.get("type") == "duckdb":
+                path = output_cfg.get("path")
+                if path:
+                    p = Path(path)
+                    if not p.is_absolute():
+                        return str(project_dir / p)
+                    return path
     return None
 
 
