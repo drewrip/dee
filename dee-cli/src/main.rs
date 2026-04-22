@@ -1,18 +1,16 @@
 use clap::{Args, Parser, Subcommand};
 use dee::{
-    connectors::{
-        Connector,
-        duckdb::{DuckDBConnection, DuckDBProfile},
-    },
+    connectors::{Connector, duckdb::DuckDBConnection},
     dag::Dag,
     executor::{Executor, SimpleEngine},
     file::DagFile,
     opt::Optimizer,
+    profiles::{Profile, ProfileType},
 };
 use log::info;
 use serde::Serialize;
 
-use std::{error::Error, path::PathBuf};
+use std::error::Error;
 use std::{fs, sync::Arc};
 
 #[derive(Parser)]
@@ -32,7 +30,10 @@ pub enum CliCommand {
 #[derive(Args)]
 pub struct RunCommand {
     #[arg(short, long)]
-    db_file: String,
+    profiles_file: String,
+    #[arg(short, long)]
+    target_profile: String,
+
     dag_file: String,
 }
 
@@ -44,12 +45,15 @@ pub struct DrawCommand {
 #[derive(Args)]
 pub struct OptCommand {
     #[arg(short, long)]
-    db_file: String,
-    dag_file: String,
+    profiles_file: String,
+    #[arg(short, long)]
+    target_profile: String,
     #[arg(short, long)]
     output: Option<String>,
     #[arg(short, long, action)]
     stats: bool,
+
+    dag_file: String,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -73,11 +77,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match args.command {
         CliCommand::Run(run_cmd) => {
             info!("Running DAG: {}", run_cmd.dag_file);
+            let profiles_files: Vec<Profile> =
+                serde_json::from_str(&fs::read_to_string(run_cmd.profiles_file)?)?;
+            let target_profile = profiles_files
+                .iter()
+                .find(|p| p.name == run_cmd.target_profile)
+                .expect("target profile not found");
 
-            let prof = DuckDBProfile::new_with_path(PathBuf::from(run_cmd.db_file))
-                .with_num_connections(8)
-                .with_threads(16);
-            let conn = DuckDBConnection::new(prof)?;
+            let conn = match &target_profile.profile {
+                ProfileType::DuckDB(profile) => DuckDBConnection::new(profile.clone()),
+            }?;
             let engine = SimpleEngine::new(conn)?;
 
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(run_cmd.dag_file)?)?;
@@ -89,10 +98,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Opt(opt_cmd) => {
             info!("Optimizing DAG: {}", opt_cmd.dag_file);
 
-            let prof = DuckDBProfile::new_with_path(PathBuf::from(opt_cmd.db_file))
-                .with_num_connections(8)
-                .with_threads(16);
-            let conn = DuckDBConnection::new(prof)?;
+            let profiles_files: Vec<Profile> =
+                serde_json::from_str(&fs::read_to_string(opt_cmd.profiles_file)?)?;
+            let target_profile = profiles_files
+                .iter()
+                .find(|p| p.name == opt_cmd.target_profile)
+                .expect("target profile not found");
+
+            let conn = match &target_profile.profile {
+                ProfileType::DuckDB(profile) => DuckDBConnection::new(profile.clone()),
+            }?;
             let engine = SimpleEngine::new(conn.clone())?;
 
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(opt_cmd.dag_file)?)?;

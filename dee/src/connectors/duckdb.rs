@@ -7,27 +7,24 @@ use datafusion::arrow::datatypes::SchemaRef;
 use duckdb::{Config, DuckdbConnectionManager, params};
 use log::debug;
 use r2d2::Pool;
+use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DuckDBProfile {
-    pub db: DuckDBType,
+    pub database: PathBuf,
     pub num_connections: u32,
     pub threads: Option<i64>,
     pub max_memory: Option<String>,
 }
 
 impl DuckDBProfile {
-    pub fn new_with_path(path: PathBuf) -> Self {
+    pub fn new_from_path(path: String) -> Self {
         Self {
-            db: DuckDBType::File(path),
-            ..Default::default()
-        }
-    }
-
-    pub fn new_in_memory() -> Self {
-        Self {
-            db: DuckDBType::Ephemeral,
-            ..Default::default()
+            database: PathBuf::from(path),
+            num_connections: 1,
+            threads: None,
+            max_memory: None,
         }
     }
 
@@ -45,22 +42,6 @@ impl DuckDBProfile {
         self.max_memory = Some(mem_str);
         self
     }
-}
-
-impl Default for DuckDBProfile {
-    fn default() -> Self {
-        Self {
-            db: DuckDBType::Ephemeral,
-            num_connections: 4,
-            threads: None,
-            max_memory: None,
-        }
-    }
-}
-
-pub enum DuckDBType {
-    File(PathBuf),
-    Ephemeral,
 }
 
 pub struct DuckDBConnection {
@@ -100,11 +81,8 @@ impl Connector for DuckDBConnection {
             .access_mode(duckdb::AccessMode::ReadWrite)
             .map_err(|_| ConnectorError::Create("set access_mode".to_string()))?;
 
-        let manager = match profile.db {
-            DuckDBType::File(path) => DuckdbConnectionManager::file_with_flags(path, conf),
-            DuckDBType::Ephemeral => DuckdbConnectionManager::memory_with_flags(conf),
-        }
-        .map_err(|e| ConnectorError::Create(format!("connection manager - {}", e)))?;
+        let manager = DuckdbConnectionManager::file_with_flags(profile.database, conf)
+            .map_err(|e| ConnectorError::Create(format!("connection manager - {}", e)))?;
         let pool = Pool::builder()
             .connection_timeout(Duration::from_hours(2))
             .max_size(profile.num_connections)
