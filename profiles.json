@@ -1,0 +1,16 @@
+{
+  "duckdb_test": {
+    "type": "duckdb",
+    "database": "warehouse.duckdb",
+    "num_connections": 4
+  },
+  "pg_test": {
+    "type": "postgres",
+    "host": "0.0.0.0",
+    "port": 5432,
+    "user": "runner",
+    "password": "password",
+    "database": "benchmark",
+    "num_connections": 4
+  }
+}

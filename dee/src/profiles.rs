@@ -1,16 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::connectors::duckdb::DuckDBProfile;
+use crate::connectors::{duckdb::DuckDBProfile, postgres::PostgresProfile};
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum ProfileType {
+pub enum Profile {
     #[serde(rename = "duckdb")]
     DuckDB(DuckDBProfile),
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Profile {
-    pub name: String,
-    pub profile: ProfileType,
+    #[serde(rename = "postgres")]
+    Postgres(PostgresProfile),
 }
