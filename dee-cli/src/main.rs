@@ -25,9 +25,9 @@ pub enum CliCommand {
 #[derive(Args)]
 pub struct RunCommand {
     #[arg(short, long)]
-    profiles_file: String,
+    profiles: String,
     #[arg(short, long)]
-    target_profile: String,
+    target: String,
 
     dag_file: String,
 }
@@ -40,9 +40,9 @@ pub struct DrawCommand {
 #[derive(Args)]
 pub struct OptCommand {
     #[arg(short, long)]
-    profiles_file: String,
+    profiles: String,
     #[arg(short, long)]
-    target_profile: String,
+    target: String,
     #[arg(short, long)]
     output: Option<String>,
     #[arg(short, long, action)]

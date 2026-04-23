@@ -18,9 +18,9 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
     info!("Optimizing DAG: {}", opt_cmd.dag_file);
 
     let profiles_files: HashMap<String, Profile> =
-        serde_json::from_str(&fs::read_to_string(opt_cmd.profiles_file)?)?;
+        serde_json::from_str(&fs::read_to_string(opt_cmd.profiles)?)?;
     let target_profile = profiles_files
-        .get(&opt_cmd.target_profile)
+        .get(&opt_cmd.target)
         .expect("target profile not found");
     let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(opt_cmd.dag_file)?)?;
     let mut dag = Dag::try_from(dag_file)?;
@@ -28,12 +28,14 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
         Profile::DuckDB(profile) => {
             let conn = DuckDBConnection::new(profile.clone()).await?;
             let engine = SimpleEngine::new(conn.clone())?;
+            engine.cleanup(&dag).await?;
             let mut optimizer = Optimizer::new(conn, Arc::new(engine)).stats_on_passes(true);
             optimizer.run(&mut dag).await?
         }
         Profile::Postgres(profile) => {
             let conn = PostgresConnection::new(profile.clone()).await?;
             let engine = SimpleEngine::new(conn.clone())?;
+            engine.cleanup(&dag).await?;
             let mut optimizer = Optimizer::new(conn, Arc::new(engine)).stats_on_passes(true);
             optimizer.run(&mut dag).await?
         }

@@ -121,6 +121,7 @@ where
                 .await
                 .unwrap_or(0);
         }
+        debug!("cleanup, {} relations dropped", num_deleted);
         Ok(num_deleted)
     }
 }
