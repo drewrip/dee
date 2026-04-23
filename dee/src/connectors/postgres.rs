@@ -90,7 +90,7 @@ impl Connector for PostgresConnection {
         name: String,
     ) -> Result<usize, ConnectorError> {
         let text_rel_type = materialize_mode_in_pg(relation_type);
-        let ddl_text = format!("DROP {} IF EXISTS {}", text_rel_type, name);
+        let ddl_text = format!("DROP {} IF EXISTS {} CASCADE", text_rel_type, name);
         self.execute(ddl_text).await
     }
 

@@ -1,0 +1,25 @@
+[project]
+name = "dee-benchmark"
+version = "0.1.0"
+description = "Benchmarking suite for dee"
+requires-python = "==3.13"
+dependencies = [
+    "pandas",
+    "matplotlib",
+    "numpy",
+    "PyYAML",
+    "dbt-core",
+    "dbt-duckdb",
+    "dbt-postgres",
+]
+
+[project.scripts]
+dee-benchmark = "dee_benchmark.run:main"
+dee-plot = "dee_benchmark.plot:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dee_benchmark"]

@@ -5,19 +5,12 @@ import numpy as np
 from pathlib import Path
 
 
-def plot_results(results_path, output_path):
-    if not Path(results_path).exists():
-        print(f"Error: {results_path} not found.")
-        return
-
-    with open(results_path, "r") as f:
-        results = json.load(f)
-
+def plot_data(results, output_path):
     if not results:
         print("No results to plot.")
         return
 
-    plot_data = []
+    plot_data_points = []
     project_names = []
 
     for res in results:
@@ -38,19 +31,19 @@ def plot_results(results_path, output_path):
                 attempts.append(reduction)
 
         if attempts:
-            plot_data.append(attempts)
+            plot_data_points.append(attempts)
             project_names.append(project_name)
 
-    if not plot_data:
+    if not plot_data_points:
         print("No optimization attempt data found to plot.")
         return
 
     # Plotting
     fig, ax = plt.subplots(figsize=(12, 7))
-    ax.boxplot(plot_data, labels=project_names)
+    ax.boxplot(plot_data_points, labels=project_names)
 
     # Overlay raw points without jitter
-    for i, attempts in enumerate(plot_data):
+    for i, attempts in enumerate(plot_data_points):
         # x-position is 1-indexed for boxplot, set to center axis
         x_pos = i + 1
         x = [x_pos] * len(attempts)
@@ -82,7 +75,22 @@ def plot_results(results_path, output_path):
     print(f"\nVisualization saved to {output_path}")
 
 
-if __name__ == "__main__":
+def plot_results(results_path, output_path):
+    if not Path(results_path).exists():
+        print(f"Error: {results_path} not found.")
+        return
+
+    with open(results_path, "r") as f:
+        results = json.load(f)
+
+    plot_data(results, output_path)
+
+
+def main():
     results_json = "results.json"
     output_png = "results_plot.png"
     plot_results(results_json, output_png)
+
+
+if __name__ == "__main__":
+    main()

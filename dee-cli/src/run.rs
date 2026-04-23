@@ -16,9 +16,9 @@ pub async fn run(run_cmd: RunCommand) -> Result<(), Box<dyn Error>> {
     info!("Running DAG: {}", run_cmd.dag_file);
 
     let profiles_files: HashMap<String, Profile> =
-        serde_json::from_str(&fs::read_to_string(run_cmd.profiles_file)?)?;
+        serde_json::from_str(&fs::read_to_string(run_cmd.profiles)?)?;
     let target_profile = profiles_files
-        .get(&run_cmd.target_profile)
+        .get(&run_cmd.target)
         .expect("target profile not found");
     let exec_stats = match &target_profile {
         Profile::DuckDB(profile) => {

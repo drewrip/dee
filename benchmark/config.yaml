@@ -6,7 +6,6 @@ projects:
   - synth/one-sink/p05_logistics
   - synth/one-sink/p06_saas
   - synth/one-sink/p07_healthcare
-  - synth/one-sink/p08_adtech
   - synth/one-sink/p09_gaming
   - synth/one-sink/p10_energy
   - synth/multi-sink/p01_ecommerce
@@ -16,6 +15,5 @@ projects:
   - synth/multi-sink/p05_logistics
   - synth/multi-sink/p06_saas
   - synth/multi-sink/p07_healthcare
-  - synth/multi-sink/p08_adtech
   - synth/multi-sink/p09_gaming
   - synth/multi-sink/p10_energy
