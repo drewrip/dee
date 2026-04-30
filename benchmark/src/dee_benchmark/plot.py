@@ -86,6 +86,63 @@ def plot_results(results_path, output_path):
     plot_data(results, output_path)
 
 
+def plot_deep_dive(results, output_path):
+    if not results:
+        print("No results to plot.")
+        return
+
+    deep_dive_results = [r for r in results if "original_distribution" in r]
+    if not deep_dive_results:
+        print("No deep dive results found to plot.")
+        return
+
+    projects = [r["project"] for r in deep_dive_results]
+    
+    all_normalized_dists = []
+    positions = []
+    
+    for i, r in enumerate(deep_dive_results):
+        orig_dist = np.array(r["original_distribution"])
+        opt_dist = np.array(r["optimized_distribution"])
+        
+        # Normalize by the median of the original distribution
+        baseline = np.median(orig_dist)
+        if baseline == 0:
+            normalized_orig = orig_dist
+            normalized_opt = opt_dist
+        else:
+            normalized_orig = orig_dist / baseline
+            normalized_opt = opt_dist / baseline
+        
+        all_normalized_dists.append(normalized_orig)
+        positions.append(i - 0.2)
+        
+        all_normalized_dists.append(normalized_opt)
+        positions.append(i + 0.2)
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    bp = ax.boxplot(all_normalized_dists, positions=positions, widths=0.2, 
+                    patch_artist=True, showfliers=True)
+
+    colors = ['lightsteelblue', 'steelblue'] * len(projects)
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
+
+    ax.set_ylabel('Relative Runtime (vs Original Median)')
+    ax.set_title('Deep Dive Performance Comparison (Normalized)')
+    ax.set_xticks(range(len(projects)))
+    ax.set_xticklabels(projects, rotation=45, ha='right')
+    
+    import matplotlib.patches as mpatches
+    orig_patch = mpatches.Patch(color='lightsteelblue', label='Original')
+    opt_patch = mpatches.Patch(color='steelblue', label='Optimized')
+    ax.legend(handles=[orig_patch, opt_patch])
+
+    plt.tight_layout()
+    plt.savefig(output_path)
+    print(f"\nDeep dive visualization saved to {output_path}")
+
+
 def main():
     results_json = "results.json"
     output_png = "results_plot.png"

@@ -7,7 +7,8 @@ import json
 import argparse
 from pathlib import Path
 import pandas as pd
-from .plot import plot_data
+import numpy as np
+from .plot import plot_data, plot_deep_dive
 
 
 def run_cmd(cmd, cwd=None, env=None, capture=True):
@@ -100,7 +101,7 @@ def generate_profiles_json(src_project_dir, dest_project_dir, requested_db_type)
     return str(profiles_json_path), final_target
 
 
-def benchmark(config_file, dag_bench_root, dee_cli_path, db_type):
+def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=False, n=5):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
 
@@ -154,16 +155,16 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type):
             )
             continue
 
-        # 3. optimize (this now includes baseline and optimized runs)
+        # 3. optimize
         print(f"Optimizing DAG for {project_name}...")
         opt_stats_json = run_cmd(
             [
                 dee_cli_path,
                 "opt",
                 "--stats",
-                "--profiles",
+                "--profiles-file",
                 profiles_json,
-                "--target",
+                "--target-profile",
                 target,
                 "-o",
                 str(opt_dag_json_path),
@@ -172,23 +173,78 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type):
         )
         opt_stats = json.loads(opt_stats_json)
 
-        # Extract times from OMPPass stats (values are in milliseconds as strings)
-        omp_stats = opt_stats.get("OMPPass", {})
-        original_time_ms = float(omp_stats.get("baseline_runtime", 0))
-        optimized_time_ms = float(omp_stats.get("best_runtime", 0))
+        if deep_dive:
+            print(f"Deep dive: Running {n} iterations for original and optimized versions...")
+            def run_multiple_times(dag_path, iterations):
+                warmup_iters = int(iterations * 0.1)
+                if warmup_iters > 0:
+                    print(f"  Running {warmup_iters} warmup iterations...")
+                    for _ in range(warmup_iters):
+                        run_cmd(
+                            [
+                                dee_cli_path,
+                                "run",
+                                "--profiles-file",
+                                profiles_json,
+                                "--target-profile",
+                                target,
+                                str(dag_path),
+                            ]
+                        )
 
-        original_time = original_time_ms / 1000.0
-        optimized_time = optimized_time_ms / 1000.0
+                times = []
+                for i in range(iterations):
+                    print(f"  Iteration {i+1}/{iterations}...")
+                    start = time.time()
+                    run_cmd(
+                        [
+                            dee_cli_path,
+                            "run",
+                            "--profiles-file",
+                            profiles_json,
+                            "--target-profile",
+                            target,
+                            str(dag_path),
+                        ]
+                    )
+                    times.append(time.time() - start)
+                return times
 
-        results.append(
-            {
-                "project": project_name,
-                "original_time": original_time,
-                "optimized_time": optimized_time,
-                "speedup": original_time / optimized_time if optimized_time > 0 else 0,
-                "opt_stats": opt_stats,
-            }
-        )
+            original_times = run_multiple_times(dag_json_path, n)
+            optimized_times = run_multiple_times(opt_dag_json_path, n)
+            
+            original_time = sum(original_times) / n
+            optimized_time = sum(optimized_times) / n
+            
+            results.append(
+                {
+                    "project": project_name,
+                    "original_time": original_time,
+                    "optimized_time": optimized_time,
+                    "speedup": original_time / optimized_time if optimized_time > 0 else 0,
+                    "original_distribution": original_times,
+                    "optimized_distribution": optimized_times,
+                    "opt_stats": opt_stats,
+                }
+            )
+        else:
+            # Extract times from OMPPass stats (values are in milliseconds as strings)
+            omp_stats = opt_stats.get("OMPPass", {})
+            original_time_ms = float(omp_stats.get("baseline_runtime", 0))
+            optimized_time_ms = float(omp_stats.get("best_runtime", 0))
+
+            original_time = original_time_ms / 1000.0
+            optimized_time = optimized_time_ms / 1000.0
+
+            results.append(
+                {
+                    "project": project_name,
+                    "original_time": original_time,
+                    "optimized_time": optimized_time,
+                    "speedup": original_time / optimized_time if optimized_time > 0 else 0,
+                    "opt_stats": opt_stats,
+                }
+            )
 
     return results
 
@@ -201,7 +257,17 @@ def visualize(results):
     # Print summary table
     df = pd.DataFrame(results)
     print("\nBenchmark Results:")
-    print(df[["project", "original_time", "optimized_time", "speedup"]].to_string())
+    cols = ["project", "original_time", "optimized_time", "speedup"]
+    print(df[cols].to_string())
+
+    if any("original_distribution" in r for r in results):
+        print("\nDeep Dive Statistics:")
+        for r in results:
+            if "original_distribution" in r:
+                print(f"Project {r['project']}:")
+                for label, dist in [("Original", r["original_distribution"]), ("Optimized", r["optimized_distribution"])]:
+                    arr = np.array(dist)
+                    print(f"  {label}: median={np.median(arr):.4f}s, min={arr.min():.4f}s, max={arr.max():.4f}s, std={arr.std():.4f}s")
 
     plot_path = "results.png"
     plot_data(results, plot_path)
@@ -216,6 +282,8 @@ def main():
         default="duckdb",
         help="Database type to benchmark (duckdb or postgres)",
     )
+    parser.add_argument("--deep-dive", action="store_true", help="Run optimized and original versions multiple times to compare distributions")
+    parser.add_argument("--n", type=int, default=5, help="Number of iterations per version when --deep-dive is enabled")
     args = parser.parse_args()
 
     dag_bench = os.environ.get("DAG_BENCH")
@@ -229,7 +297,7 @@ def main():
         print(f"Error: dee-cli not found at {dee_cli}. Please build the project or set DEE_PATH.")
         exit(1)
 
-    results = benchmark(args.config, dag_bench, dee_cli, args.db_type)
+    results = benchmark(args.config, dag_bench, dee_cli, args.db_type, deep_dive=args.deep_dive, n=args.n)
     visualize(results)
 
     # Save results to JSON for record
@@ -237,6 +305,9 @@ def main():
     with open(results_path, "w") as f:
         json.dump(results, f, indent=4)
     print(f"Results saved to {results_path.absolute()}")
+
+    if args.deep_dive:
+        plot_deep_dive(results, "deep-dive.png")
 
 
 if __name__ == "__main__":
