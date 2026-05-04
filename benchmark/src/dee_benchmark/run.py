@@ -162,9 +162,9 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=Fals
                 dee_cli_path,
                 "opt",
                 "--stats",
-                "--profiles-file",
+                "--profiles",
                 profiles_json,
-                "--target-profile",
+                "--target",
                 target,
                 "-o",
                 str(opt_dag_json_path),
@@ -174,7 +174,10 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=Fals
         opt_stats = json.loads(opt_stats_json)
 
         if deep_dive:
-            print(f"Deep dive: Running {n} iterations for original and optimized versions...")
+            print(
+                f"Deep dive: Running {n} iterations for original and optimized versions..."
+            )
+
             def run_multiple_times(dag_path, iterations):
                 warmup_iters = int(iterations * 0.1)
                 if warmup_iters > 0:
@@ -184,9 +187,9 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=Fals
                             [
                                 dee_cli_path,
                                 "run",
-                                "--profiles-file",
+                                "--profiles",
                                 profiles_json,
-                                "--target-profile",
+                                "--target",
                                 target,
                                 str(dag_path),
                             ]
@@ -194,15 +197,15 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=Fals
 
                 times = []
                 for i in range(iterations):
-                    print(f"  Iteration {i+1}/{iterations}...")
+                    print(f"  Iteration {i + 1}/{iterations}...")
                     start = time.time()
                     run_cmd(
                         [
                             dee_cli_path,
                             "run",
-                            "--profiles-file",
+                            "--profiles",
                             profiles_json,
-                            "--target-profile",
+                            "--target",
                             target,
                             str(dag_path),
                         ]
@@ -212,16 +215,18 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=Fals
 
             original_times = run_multiple_times(dag_json_path, n)
             optimized_times = run_multiple_times(opt_dag_json_path, n)
-            
+
             original_time = sum(original_times) / n
             optimized_time = sum(optimized_times) / n
-            
+
             results.append(
                 {
                     "project": project_name,
                     "original_time": original_time,
                     "optimized_time": optimized_time,
-                    "speedup": original_time / optimized_time if optimized_time > 0 else 0,
+                    "speedup": original_time / optimized_time
+                    if optimized_time > 0
+                    else 0,
                     "original_distribution": original_times,
                     "optimized_distribution": optimized_times,
                     "opt_stats": opt_stats,
@@ -241,7 +246,9 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=Fals
                     "project": project_name,
                     "original_time": original_time,
                     "optimized_time": optimized_time,
-                    "speedup": original_time / optimized_time if optimized_time > 0 else 0,
+                    "speedup": original_time / optimized_time
+                    if optimized_time > 0
+                    else 0,
                     "opt_stats": opt_stats,
                 }
             )
@@ -265,9 +272,14 @@ def visualize(results):
         for r in results:
             if "original_distribution" in r:
                 print(f"Project {r['project']}:")
-                for label, dist in [("Original", r["original_distribution"]), ("Optimized", r["optimized_distribution"])]:
+                for label, dist in [
+                    ("Original", r["original_distribution"]),
+                    ("Optimized", r["optimized_distribution"]),
+                ]:
                     arr = np.array(dist)
-                    print(f"  {label}: median={np.median(arr):.4f}s, min={arr.min():.4f}s, max={arr.max():.4f}s, std={arr.std():.4f}s")
+                    print(
+                        f"  {label}: median={np.median(arr):.4f}s, min={arr.min():.4f}s, max={arr.max():.4f}s, std={arr.std():.4f}s"
+                    )
 
     plot_path = "results.png"
     plot_data(results, plot_path)
@@ -282,8 +294,17 @@ def main():
         default="duckdb",
         help="Database type to benchmark (duckdb or postgres)",
     )
-    parser.add_argument("--deep-dive", action="store_true", help="Run optimized and original versions multiple times to compare distributions")
-    parser.add_argument("--n", type=int, default=5, help="Number of iterations per version when --deep-dive is enabled")
+    parser.add_argument(
+        "--deep-dive",
+        action="store_true",
+        help="Run optimized and original versions multiple times to compare distributions",
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=5,
+        help="Number of iterations per version when --deep-dive is enabled",
+    )
     args = parser.parse_args()
 
     dag_bench = os.environ.get("DAG_BENCH")
@@ -294,10 +315,19 @@ def main():
     dee_root = os.environ.get("DEE_PATH", os.getcwd())
     dee_cli = os.path.abspath(os.path.join(dee_root, "target/debug/dee-cli"))
     if not os.path.exists(dee_cli):
-        print(f"Error: dee-cli not found at {dee_cli}. Please build the project or set DEE_PATH.")
+        print(
+            f"Error: dee-cli not found at {dee_cli}. Please build the project or set DEE_PATH."
+        )
         exit(1)
 
-    results = benchmark(args.config, dag_bench, dee_cli, args.db_type, deep_dive=args.deep_dive, n=args.n)
+    results = benchmark(
+        args.config,
+        dag_bench,
+        dee_cli,
+        args.db_type,
+        deep_dive=args.deep_dive,
+        n=args.n,
+    )
     visualize(results)
 
     # Save results to JSON for record
