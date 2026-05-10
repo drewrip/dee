@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    ConnectOptions, Executor, PgPool,
+    ConnectOptions, Executor, PgPool, Row,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use std::{sync::Arc, time::Duration};
@@ -25,6 +25,48 @@ impl PostgresProfile {}
 
 pub struct PostgresConnection {
     pool: PgPool,
+}
+
+#[derive(Deserialize, Debug)]
+struct PostgresExplainNode {
+    #[serde(rename = "Node Type")]
+    node_type: String,
+    #[serde(rename = "Plan Rows")]
+    plan_rows: f32,
+    #[serde(rename = "Plans")]
+    #[serde(default)]
+    plans: Vec<PostgresExplainNode>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PostgresExplainWrapper {
+    #[serde(rename = "Plan")]
+    plan: PostgresExplainNode,
+}
+
+fn get_postgres_weight(node_type: &str) -> f32 {
+    match node_type {
+        "Hash Join" => 2.0,
+        "Nested Loop" => 5.0,
+        "Merge Join" => 2.0,
+        "Seq Scan" => 1.0,
+        "Index Scan" => 0.5,
+        "Index Only Scan" => 0.4,
+        "Bitmap Heap Scan" => 0.8,
+        "Bitmap Index Scan" => 0.4,
+        "Sort" => 2.0,
+        "Aggregate" => 2.0,
+        "Hash" => 1.0,
+        "Limit" => 0.1,
+        _ => 1.0,
+    }
+}
+
+fn compute_postgres_node_cost(node: &PostgresExplainNode) -> f32 {
+    let weight = get_postgres_weight(&node.node_type);
+    let current_cost = node.plan_rows * weight;
+    let children_cost: f32 = node.plans.iter().map(compute_postgres_node_cost).sum();
+    current_cost + children_cost
 }
 
 fn materialize_mode_in_pg(mode: MaterializeMode) -> String {
@@ -94,7 +136,30 @@ impl Connector for PostgresConnection {
         self.execute(ddl_text).await
     }
 
-    async fn get_schema(&self, name: String) -> Option<Result<SchemaRef, ConnectorError>> {
+    async fn get_schema(&self, _name: String) -> Option<Result<SchemaRef, ConnectorError>> {
         None
+    }
+
+    async fn cost(&self, query: String) -> Result<Option<f32>, ConnectorError> {
+        let explain_query = format!("EXPLAIN (FORMAT JSON) {}", query);
+        let row = sqlx::query(&explain_query)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| ConnectorError::Execute(format!("Failed to execute explain: {}", e)))?;
+
+        let json_value: serde_json::Value = row
+            .try_get(0)
+            .map_err(|e| ConnectorError::Execute(format!("Failed to get explain JSON: {}", e)))?;
+
+        let wrappers: Vec<PostgresExplainWrapper> = serde_json::from_value(json_value).map_err(|e| {
+            ConnectorError::Execute(format!("Failed to parse explain JSON: {}", e))
+        })?;
+
+        let total_cost = wrappers
+            .iter()
+            .map(|w| compute_postgres_node_cost(&w.plan))
+            .sum();
+
+        Ok(Some(total_cost))
     }
 }
