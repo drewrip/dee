@@ -8,7 +8,7 @@ use duckdb::{Config, DuckdbConnectionManager, params};
 use log::debug;
 use r2d2::Pool;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DuckDBProfile {
@@ -46,6 +46,52 @@ impl DuckDBProfile {
 
 pub struct DuckDBConnection {
     pub pool: Pool<DuckdbConnectionManager>,
+}
+
+#[derive(Deserialize, Debug)]
+struct DuckDBExplainNode {
+    name: String,
+    children: Vec<DuckDBExplainNode>,
+    #[serde(default)]
+    extra_info: HashMap<String, serde_json::Value>,
+}
+
+fn get_duckdb_weight(name: &str) -> f32 {
+    match name {
+        "HASH_JOIN" => 2.0,
+        "NESTED_LOOP_JOIN" => 5.0,
+        "CROSS_PRODUCT" => 10.0,
+        "SEQ_SCAN" => 1.0,
+        "INDEX_SCAN" => 0.5,
+        "FILTER" => 0.5,
+        "PROJECTION" => 0.1,
+        "ORDER_BY" => 2.0,
+        "TOP_N" => 1.0,
+        "AGGREGATE" => 2.0,
+        "HASH_GROUP_BY" => 2.5,
+        "DISTINCT" => 2.0,
+        "UNION" => 0.5,
+        _ => 1.0,
+    }
+}
+
+fn compute_duckdb_node_cost(node: &DuckDBExplainNode) -> f32 {
+    let weight = get_duckdb_weight(&node.name);
+    let cardinality = node
+        .extra_info
+        .get("Estimated Cardinality")
+        .and_then(|v| {
+            if let Some(s) = v.as_str() {
+                s.parse::<f32>().ok()
+            } else {
+                v.as_f64().map(|f| f as f32)
+            }
+        })
+        .unwrap_or(1.0);
+
+    let current_cost = cardinality * weight;
+    let children_cost: f32 = node.children.iter().map(compute_duckdb_node_cost).sum();
+    current_cost + children_cost
 }
 
 fn materialize_mode_in_duckdb(mode: MaterializeMode) -> String {
@@ -131,5 +177,52 @@ impl Connector for DuckDBConnection {
         let stmt = conn.prepare(&tmpl_query).unwrap();
         let schema = stmt.schema().clone();
         Some(Ok(schema))
+    }
+
+    async fn cost(&self, query: String) -> Result<Option<f32>, ConnectorError> {
+        let explain_query = format!("EXPLAIN (FORMAT json) {}", query);
+        let conn = self.pool.get().map_err(|_| {
+            ConnectorError::Execute("didn't get connection from pool".to_string())
+        })?;
+
+        let mut stmt = conn
+            .prepare(&explain_query)
+            .map_err(|e| ConnectorError::Execute(format!("Failed to prepare explain: {}", e)))?;
+
+        let json_str: String = stmt
+            .query_row([], |row| {
+                // DuckDB JSON explain might return two columns: (key, value)
+                // or just one column (value).
+                let col_count = row.as_ref().column_count();
+                if col_count >= 2 {
+                    row.get(1)
+                } else {
+                    row.get(0)
+                }
+            })
+            .map_err(|e| ConnectorError::Execute(format!("Failed to execute explain: {}", e)))?;
+
+        let nodes: Vec<DuckDBExplainNode> = serde_json::from_str(&json_str).map_err(|e| {
+            ConnectorError::Execute(format!("Failed to parse explain JSON: {}", e))
+        })?;
+
+        Ok(Some(nodes.iter().map(compute_duckdb_node_cost).sum()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_duckdb_cost() {
+        let profile = DuckDBProfile::new_from_path(":memory:".to_string());
+        let conn = DuckDBConnection::new(profile).await.unwrap();
+
+        // Create a dummy table to have some plan
+        conn.execute("CREATE TABLE t1 AS SELECT 1 AS id".to_string()).await.unwrap();
+
+        let cost = conn.cost("SELECT * FROM t1".to_string()).await.unwrap();
+        assert!(cost.unwrap() > 0.0);
     }
 }

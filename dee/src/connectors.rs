@@ -40,4 +40,8 @@ pub trait Connector {
     ) -> Result<usize, ConnectorError>;
 
     async fn get_schema(&self, name: String) -> Option<Result<SchemaRef, ConnectorError>>;
+
+    async fn cost(&self, _query: String) -> Result<Option<f32>, ConnectorError> {
+        Ok(None)
+    }
 }

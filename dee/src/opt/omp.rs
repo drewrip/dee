@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use itertools::{Itertools, repeat_n};
 use log::debug;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 use crate::{
     connectors::Connector,
@@ -16,8 +16,8 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    conn: Arc<C>,
     engine: Arc<E>,
+    _phantom: PhantomData<C>,
 }
 
 impl<C, E> OMPPass<C, E>
@@ -25,8 +25,11 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    pub fn new(conn: Arc<C>, engine: Arc<E>) -> Self {
-        Self { conn, engine }
+    pub fn new(_conn: Arc<C>, engine: Arc<E>) -> Self {
+        Self {
+            engine,
+            _phantom: PhantomData,
+        }
     }
 }
 
