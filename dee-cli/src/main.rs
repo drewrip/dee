@@ -28,6 +28,8 @@ pub struct RunCommand {
     profiles: String,
     #[arg(short, long)]
     target: String,
+    #[arg(long)]
+    get_plans: Option<String>,
 
     dag_file: String,
 }
@@ -47,8 +49,42 @@ pub struct OptCommand {
     output: Option<String>,
     #[arg(short, long, action)]
     stats: bool,
+    #[arg(short, long, default_value = "cost")]
+    pub metric: Metric,
+    #[arg(long, default_value = "exhaustive")]
+    pub strategy: Strategy,
 
     dag_file: String,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum Strategy {
+    Exhaustive,
+    Heuristic,
+}
+
+impl From<Strategy> for dee::opt::OMPStrategy {
+    fn from(s: Strategy) -> Self {
+        match s {
+            Strategy::Exhaustive => dee::opt::OMPStrategy::Exhaustive,
+            Strategy::Heuristic => dee::opt::OMPStrategy::Heuristic,
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum Metric {
+    Runtime,
+    Cost,
+}
+
+impl From<Metric> for dee::opt::OptimizationMetric {
+    fn from(m: Metric) -> Self {
+        match m {
+            Metric::Runtime => dee::opt::OptimizationMetric::Runtime,
+            Metric::Cost => dee::opt::OptimizationMetric::Cost,
+        }
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]

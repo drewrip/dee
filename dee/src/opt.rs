@@ -5,6 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use log::debug;
+use serde::{Deserialize, Serialize};
 
 use thiserror::Error;
 
@@ -23,6 +24,12 @@ pub enum OptimizerError {
     NotImplemented(String),
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum OptimizationMetric {
+    Runtime,
+    Cost,
+}
+
 #[async_trait]
 pub trait OptimizerPass<C, E>
 where
@@ -30,6 +37,13 @@ where
     E: Executor<C> + Send,
 {
     async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError>;
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum OMPStrategy {
+    #[default]
+    Exhaustive,
+    Heuristic,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +62,10 @@ where
     run_lr_pass: bool,
     /// Result stats
     stats_on_passes: bool,
+    /// Metric to optimize for
+    omp_metric: OptimizationMetric,
+    /// Strategy for OMP pass
+    omp_strategy: OMPStrategy,
 }
 
 impl<C, E> Optimizer<C, E>
@@ -68,6 +86,8 @@ where
             run_omp_pass: config.run_omp_pass,
             run_lr_pass: config.run_lr_pass,
             stats_on_passes: false,
+            omp_metric: config.omp_metric,
+            omp_strategy: config.omp_strategy,
         }
     }
 
@@ -92,7 +112,9 @@ where
         }
 
         if self.run_omp_pass {
-            let mut pass: OMPPass<C, E> = OMPPass::new(self.conn.clone(), self.engine.clone());
+            let mut pass: OMPPass<C, E> =
+                OMPPass::new(self.conn.clone(), self.engine.clone(), self.omp_metric);
+            pass.set_strategy(self.omp_strategy);
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
                 stats.insert("OMPPass".to_string(), Arc::new(res));
@@ -112,9 +134,11 @@ where
 
 #[derive(Debug, Clone)]
 pub struct OptimizerConfig {
-    run_cse_pass: bool,
-    run_omp_pass: bool,
-    run_lr_pass: bool,
+    pub run_cse_pass: bool,
+    pub run_omp_pass: bool,
+    pub run_lr_pass: bool,
+    pub omp_metric: OptimizationMetric,
+    pub omp_strategy: OMPStrategy,
 }
 
 impl Default for OptimizerConfig {
@@ -123,6 +147,8 @@ impl Default for OptimizerConfig {
             run_cse_pass: false,
             run_omp_pass: true,
             run_lr_pass: false,
+            omp_metric: OptimizationMetric::Cost,
+            omp_strategy: OMPStrategy::Exhaustive,
         }
     }
 }
@@ -143,6 +169,16 @@ impl OptimizerConfig {
 
     pub fn with_lr_pass(mut self) -> Self {
         self.run_lr_pass = true;
+        self
+    }
+
+    pub fn with_omp_metric(mut self, metric: OptimizationMetric) -> Self {
+        self.omp_metric = metric;
+        self
+    }
+
+    pub fn with_omp_strategy(mut self, strategy: OMPStrategy) -> Self {
+        self.omp_strategy = strategy;
         self
     }
 }

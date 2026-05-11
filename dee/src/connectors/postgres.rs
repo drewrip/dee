@@ -140,6 +140,20 @@ impl Connector for PostgresConnection {
         None
     }
 
+    async fn explain(&self, query_text: String) -> Result<String, ConnectorError> {
+        let explain_query = format!("EXPLAIN (FORMAT JSON) {}", query_text);
+        let row = sqlx::query(&explain_query)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| ConnectorError::Execute(format!("Failed to execute explain: {}", e)))?;
+
+        let json_value: serde_json::Value = row
+            .try_get(0)
+            .map_err(|e| ConnectorError::Execute(format!("Failed to get explain JSON: {}", e)))?;
+
+        Ok(json_value.to_string())
+    }
+
     async fn cost(&self, query: String) -> Result<Option<f32>, ConnectorError> {
         let explain_query = format!("EXPLAIN (FORMAT JSON) {}", query);
         let row = sqlx::query(&explain_query)

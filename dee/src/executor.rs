@@ -5,6 +5,8 @@ use log::debug;
 
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -22,13 +24,12 @@ pub enum ExecutorError {
 }
 
 #[async_trait]
-pub trait Executor<C>
+pub trait Executor<C>: Sized
 where
     C: Connector + Send,
 {
-    type ExecutionEngine;
-
-    fn new(conn: Arc<C>) -> Result<Self::ExecutionEngine, ExecutorError>;
+    fn new(conn: Arc<C>) -> Result<Self, ExecutorError>;
+    fn with_plan_dir(self, plan_dir: String) -> Self;
     async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError>;
     async fn cleanup(&self, dag: &Dag) -> Result<usize, ExecutorError>;
     async fn cost(&self, dag: &Dag) -> Result<Option<f32>, ExecutorError>;
@@ -40,6 +41,7 @@ where
     C: Connector,
 {
     conn: Arc<C>,
+    plan_dir: Option<String>,
 }
 
 #[async_trait]
@@ -47,10 +49,16 @@ impl<C> Executor<C> for SimpleEngine<C>
 where
     C: Connector + Send + Sync + 'static,
 {
-    type ExecutionEngine = Self;
-
     fn new(conn: Arc<C>) -> Result<SimpleEngine<C>, ExecutorError> {
-        Ok(SimpleEngine { conn })
+        Ok(SimpleEngine {
+            conn,
+            plan_dir: None,
+        })
+    }
+
+    fn with_plan_dir(mut self, plan_dir: String) -> SimpleEngine<C> {
+        self.plan_dir = Some(plan_dir);
+        self
     }
 
     async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError> {
@@ -59,6 +67,10 @@ where
         let initial_size = work_graph.num_nodes();
         let mut finished = 0;
         let mut in_progress = HashSet::new();
+
+        if let Some(pd) = &self.plan_dir {
+            fs::create_dir_all(pd).map_err(|e| ExecutorError::Exec(e.to_string()))?;
+        }
 
         let node_stats = HashMap::new();
         let start = Utc::now();
@@ -71,15 +83,40 @@ where
             // pop off all nodes with no dependencies and run them
             for node_id in next_nodes.into_iter() {
                 let tn = dag.nodes.get(node_id.clone()).unwrap().clone();
+                let out_degree = dag.nodes.out_degree(&node_id);
                 let conn = Arc::clone(&self.conn);
+                let plan_dir = self.plan_dir.clone();
                 debug!("running node tidx={}", node_id);
                 debug!("work_queue.len()={}", work_queue.len());
                 in_progress.insert(node_id.clone());
                 work_queue.push(tokio::spawn(async move {
-                    let res = conn
-                        .new_relation(tn.materialize, tn.id.clone(), tn.query_text)
-                        .await
-                        .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                    let res = if let Some(pd) = &plan_dir {
+                        match tn.materialize {
+                            MaterializeMode::Table => {
+                                let profile_query = format!(
+                                    "SET enable_profiling = 'json'; SET profiling_output = '{}/table_{}.json'; CREATE TABLE {} AS ({});",
+                                    pd, tn.id, tn.id, tn.query_text
+                                );
+                                conn.execute(profile_query)
+                                    .await
+                                    .map_err(|e| ExecutorError::Exec(e.to_string()))?
+                            }
+                            MaterializeMode::View => {
+                                if out_degree > 1 {
+                                    let plan = conn.explain(tn.query_text.clone()).await.map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                                    let plan_path = PathBuf::from(pd).join(format!("view_{}.json", tn.id));
+                                    fs::write(plan_path, plan).map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                                }
+                                conn.new_relation(tn.materialize, tn.id.clone(), tn.query_text)
+                                    .await
+                                    .map_err(|e| ExecutorError::Exec(e.to_string()))?
+                            }
+                        }
+                    } else {
+                        conn.new_relation(tn.materialize, tn.id.clone(), tn.query_text)
+                            .await
+                            .map_err(|e| ExecutorError::Exec(e.to_string()))?
+                    };
                     debug!("new_relation ({}, {:?})", tn.id, tn.materialize);
                     Ok((res, node_id.clone()))
                 }));

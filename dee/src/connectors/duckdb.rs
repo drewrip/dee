@@ -4,7 +4,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
-use duckdb::{Config, DuckdbConnectionManager, params};
+use duckdb::{Config, DuckdbConnectionManager};
 use log::debug;
 use r2d2::Pool;
 use serde::{Deserialize, Serialize};
@@ -157,9 +157,10 @@ impl Connector for DuckDBConnection {
             .pool
             .get()
             .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
-        conn.execute(&query_text.clone(), params![]).map_err(|e| {
+        conn.execute_batch(&query_text.clone()).map_err(|e| {
             ConnectorError::Execute(format!("{} - query_text:\n{}", e.to_string(), query_text))
-        })
+        })?;
+        Ok(0)
     }
 
     async fn new_relation(
@@ -196,6 +197,29 @@ impl Connector for DuckDBConnection {
         let stmt = conn.prepare(&tmpl_query).unwrap();
         let schema = stmt.schema().clone();
         Some(Ok(schema))
+    }
+
+    async fn explain(&self, query_text: String) -> Result<String, ConnectorError> {
+        let explain_query = format!("EXPLAIN (FORMAT json) {}", query_text);
+        let conn = self.pool.get().map_err(|_| {
+            ConnectorError::Execute("didn't get connection from pool".to_string())
+        })?;
+
+        let mut stmt = conn
+            .prepare(&explain_query)
+            .map_err(|e| ConnectorError::Execute(format!("Failed to prepare explain: {}", e)))?;
+
+        let json_str: String = stmt
+            .query_row([], |row| {
+                let col_count = row.as_ref().column_count();
+                if col_count >= 2 {
+                    row.get(1)
+                } else {
+                    row.get(0)
+                }
+            })
+            .map_err(|e| ConnectorError::Execute(format!("Failed to execute explain: {}", e)))?;
+        Ok(json_str)
     }
 
     async fn cost(&self, query: String) -> Result<Option<f32>, ConnectorError> {
