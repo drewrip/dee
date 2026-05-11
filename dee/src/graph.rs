@@ -170,4 +170,22 @@ impl Graph {
             .join("\n");
         format!("digraph G {{\n{}\n}}", line_section)
     }
+
+    pub fn topological_sort(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut work_graph = self.clone();
+
+        while work_graph.num_nodes() > 0 {
+            let sources: Vec<String> = work_graph.sources().collect();
+            if sources.is_empty() {
+                // Cycle detected or something else wrong, but for now just break
+                break;
+            }
+            for source in sources {
+                result.push(source.clone());
+                work_graph.remove(source);
+            }
+        }
+        result
+    }
 }

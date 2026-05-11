@@ -75,7 +75,16 @@ fn get_duckdb_weight(name: &str) -> f32 {
     }
 }
 
-fn compute_duckdb_node_cost(node: &DuckDBExplainNode) -> f32 {
+fn compute_duckdb_node_cost(node: &DuckDBExplainNode, in_dummy_cte: bool) -> f32 {
+    let cte_name = node
+        .extra_info
+        .get("CTE Name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let is_dummy_cte =
+        (node.name == "CTE" || node.name == "CTE_SCAN") && cte_name.starts_with("__dee_dummy_scan");
+
     let weight = get_duckdb_weight(&node.name);
     let cardinality = node
         .extra_info
@@ -90,7 +99,17 @@ fn compute_duckdb_node_cost(node: &DuckDBExplainNode) -> f32 {
         .unwrap_or(1.0);
 
     let current_cost = cardinality * weight;
-    let children_cost: f32 = node.children.iter().map(compute_duckdb_node_cost).sum();
+
+    if is_dummy_cte && in_dummy_cte {
+        return current_cost;
+    }
+
+    let next_in_dummy = in_dummy_cte || is_dummy_cte;
+    let children_cost: f32 = node
+        .children
+        .iter()
+        .map(|child| compute_duckdb_node_cost(child, next_in_dummy))
+        .sum();
     current_cost + children_cost
 }
 
@@ -206,7 +225,12 @@ impl Connector for DuckDBConnection {
             ConnectorError::Execute(format!("Failed to parse explain JSON: {}", e))
         })?;
 
-        Ok(Some(nodes.iter().map(compute_duckdb_node_cost).sum()))
+        Ok(Some(
+            nodes
+                .iter()
+                .map(|n| compute_duckdb_node_cost(n, false))
+                .sum(),
+        ))
     }
 }
 
