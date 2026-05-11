@@ -31,6 +31,7 @@ where
     fn new(conn: Arc<C>) -> Result<Self::ExecutionEngine, ExecutorError>;
     async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError>;
     async fn cleanup(&self, dag: &Dag) -> Result<usize, ExecutorError>;
+    async fn cost(&self, dag: &Dag) -> Result<Option<f32>, ExecutorError>;
 }
 
 #[derive(Debug)]
@@ -124,6 +125,70 @@ where
         debug!("cleanup, {} relations dropped", num_deleted);
         Ok(num_deleted)
     }
+
+    async fn cost(&self, dag: &Dag) -> Result<Option<f32>, ExecutorError> {
+        let sorted_nodes = dag.nodes.topological_sort();
+        self.conn
+            .execute("SET disabled_optimizers = 'cte_filter_pusher';".to_string())
+            .await
+            .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+
+        let mut total_cost = 0.0;
+        let mut cost_exists = false;
+
+        for (i, node_id) in sorted_nodes.into_iter().enumerate() {
+            let node = dag
+                .nodes
+                .get(node_id.clone())
+                .ok_or(ExecutorError::Exec("node missing".to_string()))?;
+
+            match node.materialize {
+                MaterializeMode::View => {
+                    self.conn
+                        .new_relation(
+                            MaterializeMode::View,
+                            node.id.clone(),
+                            node.query_text.clone(),
+                        )
+                        .await
+                        .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                }
+                MaterializeMode::Table => {
+                    let wrapped_query = format!(
+                        "WITH __dee_dummy_scan_{} AS MATERIALIZED ({}) SELECT * FROM __dee_dummy_scan_{}",
+                        i, node.query_text, i
+                    );
+
+                    let cost_res = self
+                        .conn
+                        .cost(wrapped_query.clone())
+                        .await
+                        .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+
+                    if let Some(c) = cost_res {
+                        total_cost += c;
+                        cost_exists = true;
+                    }
+
+                    self.conn
+                        .new_relation(MaterializeMode::View, node.id.clone(), wrapped_query)
+                        .await
+                        .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                }
+            }
+        }
+
+        self.conn
+            .execute("SET disabled_optimizers = '';".to_string())
+            .await
+            .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+
+        if cost_exists {
+            Ok(Some(total_cost))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -136,3 +201,48 @@ pub struct ExecStats {
 
 #[derive(Clone, Debug)]
 pub struct NodeStats {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectors::duckdb::{DuckDBConnection, DuckDBProfile};
+    use crate::dag::TransformNode;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn test_simple_engine_cost() {
+        let profile = DuckDBProfile::new_from_path(":memory:".to_string());
+        let conn = DuckDBConnection::new(profile).await.unwrap();
+        let engine = SimpleEngine::new(conn.clone()).unwrap();
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "n1".to_string(),
+            TransformNode {
+                id: "n1".to_string(),
+                query_text: "SELECT 1 AS id".to_string(),
+                materialize: MaterializeMode::Table,
+                depends_on: HashSet::new(),
+            },
+        );
+        nodes.insert(
+            "n2".to_string(),
+            TransformNode {
+                id: "n2".to_string(),
+                query_text: "SELECT * FROM n1".to_string(),
+                materialize: MaterializeMode::View,
+                depends_on: HashSet::from_iter(vec!["n1".to_string()]),
+            },
+        );
+
+        let dag = Dag {
+            db: "duckdb".to_string(),
+            nodes: crate::graph::Graph::new(nodes),
+            sources: vec![],
+        };
+
+        let cost = engine.cost(&dag).await.unwrap();
+        assert!(cost.is_some());
+        assert!(cost.unwrap() > 0.0);
+    }
+}
