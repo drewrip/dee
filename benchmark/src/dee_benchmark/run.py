@@ -22,7 +22,7 @@ def run_cmd(cmd, cwd=None, env=None, capture=True):
     return result.stdout
 
 
-def generate_profiles_json(src_project_dir, dest_project_dir, requested_db_type):
+def generate_profiles_json(src_project_dir, dest_project_dir, requested_db_type, max_mem=None):
     profiles_path = src_project_dir / "profiles.yml"
     if not profiles_path.exists():
         return None, None
@@ -75,6 +75,8 @@ def generate_profiles_json(src_project_dir, dest_project_dir, requested_db_type)
 
                 dee_cfg["database"] = str(dest_db_path.absolute())
             dee_cfg["num_connections"] = output_cfg.get("threads", 1)
+            if max_mem:
+                dee_cfg["max_memory"] = max_mem
         elif db_type == "postgres":
             target_key = "postgres"
             dee_cfg["host"] = output_cfg.get("host")
@@ -101,7 +103,7 @@ def generate_profiles_json(src_project_dir, dest_project_dir, requested_db_type)
     return str(profiles_json_path), final_target
 
 
-def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=False, n=5):
+def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=False, n=5, max_mem=None):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
 
@@ -147,7 +149,7 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=Fals
         )
 
         profiles_json, target = generate_profiles_json(
-            src_project_path, dest_project_path, db_type
+            src_project_path, dest_project_path, db_type, max_mem=max_mem
         )
         if not profiles_json:
             print(
@@ -162,6 +164,8 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=Fals
                 dee_cli_path,
                 "opt",
                 "--stats",
+                "--metric",
+                "cost",
                 "--profiles",
                 profiles_json,
                 "--target",
@@ -233,13 +237,18 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=Fals
                 }
             )
         else:
-            # Extract times from OMPPass stats (values are in milliseconds as strings)
+            # Extract values from OMPPass stats
             omp_stats = opt_stats.get("OMPPass", {})
-            original_time_ms = float(omp_stats.get("baseline_runtime", 0))
-            optimized_time_ms = float(omp_stats.get("best_runtime", 0))
+            # New format uses baseline_value/best_value
+            # Old format used baseline_runtime/best_runtime
+            original_val = float(omp_stats.get("baseline_value") or omp_stats.get("baseline_runtime", 0))
+            optimized_val = float(omp_stats.get("best_value") or omp_stats.get("best_runtime", 0))
 
-            original_time = original_time_ms / 1000.0
-            optimized_time = optimized_time_ms / 1000.0
+            # If the metric is Runtime, these are milliseconds.
+            # For Cost, we'll still treat them similarly for the sake of the speedup ratio,
+            # but note that the absolute values in original_time/optimized_time might not be seconds.
+            original_time = original_val / 1000.0
+            optimized_time = optimized_val / 1000.0
 
             results.append(
                 {
@@ -305,7 +314,15 @@ def main():
         default=5,
         help="Number of iterations per version when --deep-dive is enabled",
     )
+    parser.add_argument(
+        "--max-mem",
+        help="Maximum memory for DuckDB connections (e.g., '10GB', '512MB'). Only available for duckdb.",
+    )
     args = parser.parse_args()
+
+    if args.max_mem and args.db_type != "duckdb":
+        print("Error: --max-mem is only supported for duckdb backend.")
+        exit(1)
 
     dag_bench = os.environ.get("DAG_BENCH")
     if not dag_bench:
@@ -327,6 +344,7 @@ def main():
         args.db_type,
         deep_dive=args.deep_dive,
         n=args.n,
+        max_mem=args.max_mem,
     )
     visualize(results)
 
