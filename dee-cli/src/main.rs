@@ -31,7 +31,8 @@ pub struct RunCommand {
     #[arg(long)]
     dump_plans: Option<String>,
 
-    dag_file: String,
+    #[arg(required = true)]
+    dag_files: Vec<String>,
 }
 
 #[derive(Args)]
