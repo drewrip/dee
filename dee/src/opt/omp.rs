@@ -17,6 +17,13 @@ pub enum OMPCostMetric {
     Estimate,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub enum OMPCentrality {
+    #[default]
+    OutDegree,
+    Paths,
+}
+
 #[derive(Debug, Clone)]
 pub struct OMPPass<C, E>
 where
@@ -26,6 +33,7 @@ where
     engine: Arc<E>,
     top_n: Option<usize>,
     cost_metric: OMPCostMetric,
+    centrality: OMPCentrality,
     _phantom: PhantomData<C>,
 }
 
@@ -39,11 +47,13 @@ where
         engine: Arc<E>,
         top_n: Option<usize>,
         cost_metric: OMPCostMetric,
+        centrality: OMPCentrality,
     ) -> Self {
         Self {
             engine,
             top_n,
             cost_metric,
+            centrality,
             _phantom: PhantomData,
         }
     }
@@ -56,7 +66,10 @@ where
     E: Executor<C> + Send + Sync,
 {
     async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError> {
-        debug!("Running OMPPass with metric: {:?}", self.cost_metric);
+        debug!(
+            "Running OMPPass with metric: {:?}, centrality: {:?}",
+            self.cost_metric, self.centrality
+        );
         let mut stats = HashMap::new();
         let _ = self.engine.cleanup(dag).await.unwrap();
 
@@ -81,7 +94,13 @@ where
             .nodes()
             .filter(|n| matches!(n.materialize, MaterializeMode::View))
             .cloned()
-            .map(|n| (n.id.clone(), dag.nodes.out_degree(&n.id)))
+            .map(|n| {
+                let rank = match self.centrality {
+                    OMPCentrality::OutDegree => dag.nodes.out_degree(&n.id),
+                    OMPCentrality::Paths => dag.nodes.paths_to_sinks(&n.id),
+                };
+                (n.id.clone(), rank)
+            })
             .filter(|(_, d)| *d > 1)
             .collect();
 

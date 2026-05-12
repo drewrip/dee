@@ -14,7 +14,7 @@ use crate::{
     executor::Executor,
     opt::{
         cse::CSEPass,
-        omp::{OMPCostMetric, OMPPass},
+        omp::{OMPCentrality, OMPCostMetric, OMPPass},
     },
 };
 
@@ -53,6 +53,8 @@ where
     omp_top: Option<usize>,
     /// OMP cost metric
     omp_cost: OMPCostMetric,
+    /// OMP node centrality metric
+    omp_centrality: OMPCentrality,
     /// Result stats
     stats_on_passes: bool,
 }
@@ -76,6 +78,7 @@ where
             run_lr_pass: config.run_lr_pass,
             omp_top: config.omp_top,
             omp_cost: config.omp_cost,
+            omp_centrality: config.omp_centrality,
             stats_on_passes: false,
         }
     }
@@ -101,8 +104,13 @@ where
         }
 
         if self.run_omp_pass {
-            let mut pass: OMPPass<C, E> =
-                OMPPass::new(self.conn.clone(), self.engine.clone(), self.omp_top, self.omp_cost);
+            let mut pass: OMPPass<C, E> = OMPPass::new(
+                self.conn.clone(),
+                self.engine.clone(),
+                self.omp_top,
+                self.omp_cost,
+                self.omp_centrality,
+            );
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
                 stats.insert("OMPPass".to_string(), Arc::new(res));
@@ -127,6 +135,7 @@ pub struct OptimizerConfig {
     run_lr_pass: bool,
     omp_top: Option<usize>,
     omp_cost: OMPCostMetric,
+    omp_centrality: OMPCentrality,
 }
 
 impl Default for OptimizerConfig {
@@ -137,6 +146,7 @@ impl Default for OptimizerConfig {
             run_lr_pass: false,
             omp_top: None,
             omp_cost: OMPCostMetric::default(),
+            omp_centrality: OMPCentrality::default(),
         }
     }
 }
@@ -167,6 +177,11 @@ impl OptimizerConfig {
 
     pub fn with_omp_cost(mut self, cost: OMPCostMetric) -> Self {
         self.omp_cost = cost;
+        self
+    }
+
+    pub fn with_omp_centrality(mut self, centrality: OMPCentrality) -> Self {
+        self.omp_centrality = centrality;
         self
     }
 }

@@ -113,6 +113,7 @@ def benchmark(
     max_mem=None,
     omp_top=None,
     omp_cost=None,
+    omp_node_centrality=None,
 ):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
@@ -185,6 +186,8 @@ def benchmark(
             opt_cmd.extend(["--omp-top", str(omp_top)])
         if omp_cost:
             opt_cmd.extend(["--omp-cost", omp_cost])
+        if omp_node_centrality:
+            opt_cmd.extend(["--omp-node-centrality", omp_node_centrality])
 
         opt_stats_json = run_cmd(opt_cmd)
         opt_stats = json.loads(opt_stats_json)
@@ -340,6 +343,11 @@ def main():
         choices=["actual", "estimate"],
         help="Cost metric for OMPPass (actual or estimate)",
     )
+    parser.add_argument(
+        "--omp-node-centrality",
+        choices=["outdegree", "paths"],
+        help="Node centrality metric for OMPPass (outdegree or paths)",
+    )
     args = parser.parse_args()
 
     if args.max_mem and args.db_type != "duckdb":
@@ -369,6 +377,7 @@ def main():
         max_mem=args.max_mem,
         omp_top=args.omp_top,
         omp_cost=args.omp_cost,
+        omp_node_centrality=args.omp_node_centrality,
     )
     visualize(results)
 

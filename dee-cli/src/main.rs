@@ -43,6 +43,12 @@ pub enum CliOMPCostMetric {
     Estimate,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum CliOMPCentrality {
+    Outdegree,
+    Paths,
+}
+
 #[derive(Args)]
 pub struct OptCommand {
     #[arg(short, long)]
@@ -57,6 +63,8 @@ pub struct OptCommand {
     omp_top: Option<usize>,
     #[arg(long)]
     omp_cost: Option<CliOMPCostMetric>,
+    #[arg(long, default_value = "outdegree")]
+    omp_node_centrality: CliOMPCentrality,
 
     dag_file: String,
 }
