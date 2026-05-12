@@ -33,6 +33,16 @@ pub trait Connector {
         query_text: String,
     ) -> Result<usize, ConnectorError>;
 
+    async fn new_relation_and_explain(
+        &self,
+        relation_type: MaterializeMode,
+        name: String,
+        query_text: String,
+    ) -> Result<(usize, Option<String>), ConnectorError> {
+        let res = self.new_relation(relation_type, name, query_text).await?;
+        Ok((res, None))
+    }
+
     async fn drop_relation(
         &self,
         relation_type: MaterializeMode,

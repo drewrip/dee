@@ -85,7 +85,9 @@ where
                 .cost(dag)
                 .await
                 .map_err(|_| OptimizerError::Exec("couldn't get baseline cost".to_string()))?
-                .ok_or(OptimizerError::Exec("no cost estimate available".to_string()))?,
+                .ok_or(OptimizerError::Exec(
+                    "no cost estimate available".to_string(),
+                ))?,
         };
 
         let mut best_cost = baseline_cost;
@@ -149,7 +151,9 @@ where
                     .cost(&work_dag)
                     .await
                     .map_err(|e| OptimizerError::Exec(format!("test dag cost failed - {}", e)))?
-                    .ok_or(OptimizerError::Exec("no cost estimate available".to_string()))?,
+                    .ok_or(OptimizerError::Exec(
+                        "no cost estimate available".to_string(),
+                    ))?,
             };
 
             stats.insert(format!("attempt_{}", i + 1), current_cost.to_string());
