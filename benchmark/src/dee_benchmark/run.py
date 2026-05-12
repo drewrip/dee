@@ -103,7 +103,17 @@ def generate_profiles_json(src_project_dir, dest_project_dir, requested_db_type,
     return str(profiles_json_path), final_target
 
 
-def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=False, n=5, max_mem=None):
+def benchmark(
+    config_file,
+    dag_bench_root,
+    dee_cli_path,
+    db_type,
+    deep_dive=False,
+    n=5,
+    max_mem=None,
+    omp_top=None,
+    omp_cost=None,
+):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
 
@@ -159,22 +169,24 @@ def benchmark(config_file, dag_bench_root, dee_cli_path, db_type, deep_dive=Fals
 
         # 3. optimize
         print(f"Optimizing DAG for {project_name}...")
-        opt_stats_json = run_cmd(
-            [
-                dee_cli_path,
-                "opt",
-                "--stats",
-                "--metric",
-                "cost",
-                "--profiles",
-                profiles_json,
-                "--target",
-                target,
-                "-o",
-                str(opt_dag_json_path),
-                str(dag_json_path),
-            ]
-        )
+        opt_cmd = [
+            dee_cli_path,
+            "opt",
+            "--stats",
+            "--profiles",
+            profiles_json,
+            "--target",
+            target,
+            "-o",
+            str(opt_dag_json_path),
+            str(dag_json_path),
+        ]
+        if omp_top:
+            opt_cmd.extend(["--omp-top", str(omp_top)])
+        if omp_cost:
+            opt_cmd.extend(["--omp-cost", omp_cost])
+
+        opt_stats_json = run_cmd(opt_cmd)
         opt_stats = json.loads(opt_stats_json)
 
         if deep_dive:
@@ -318,6 +330,16 @@ def main():
         "--max-mem",
         help="Maximum memory for DuckDB connections (e.g., '10GB', '512MB'). Only available for duckdb.",
     )
+    parser.add_argument(
+        "--omp-top",
+        type=int,
+        help="Number of top views to consider for materialization in OMPPass",
+    )
+    parser.add_argument(
+        "--omp-cost",
+        choices=["actual", "estimate"],
+        help="Cost metric for OMPPass (actual or estimate)",
+    )
     args = parser.parse_args()
 
     if args.max_mem and args.db_type != "duckdb":
@@ -345,6 +367,8 @@ def main():
         deep_dive=args.deep_dive,
         n=args.n,
         max_mem=args.max_mem,
+        omp_top=args.omp_top,
+        omp_cost=args.omp_cost,
     )
     visualize(results)
 

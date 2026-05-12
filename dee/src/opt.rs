@@ -12,7 +12,10 @@ use crate::{
     connectors::Connector,
     dag::Dag,
     executor::Executor,
-    opt::{cse::CSEPass, omp::OMPPass},
+    opt::{
+        cse::CSEPass,
+        omp::{OMPCostMetric, OMPPass},
+    },
 };
 
 #[derive(Error, Debug)]
@@ -46,6 +49,10 @@ where
     run_omp_pass: bool,
     /// Logical rewriting
     run_lr_pass: bool,
+    /// OMP top N
+    omp_top: Option<usize>,
+    /// OMP cost metric
+    omp_cost: OMPCostMetric,
     /// Result stats
     stats_on_passes: bool,
 }
@@ -67,6 +74,8 @@ where
             run_cse_pass: config.run_cse_pass,
             run_omp_pass: config.run_omp_pass,
             run_lr_pass: config.run_lr_pass,
+            omp_top: config.omp_top,
+            omp_cost: config.omp_cost,
             stats_on_passes: false,
         }
     }
@@ -92,7 +101,8 @@ where
         }
 
         if self.run_omp_pass {
-            let mut pass: OMPPass<C, E> = OMPPass::new(self.conn.clone(), self.engine.clone());
+            let mut pass: OMPPass<C, E> =
+                OMPPass::new(self.conn.clone(), self.engine.clone(), self.omp_top, self.omp_cost);
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
                 stats.insert("OMPPass".to_string(), Arc::new(res));
@@ -115,6 +125,8 @@ pub struct OptimizerConfig {
     run_cse_pass: bool,
     run_omp_pass: bool,
     run_lr_pass: bool,
+    omp_top: Option<usize>,
+    omp_cost: OMPCostMetric,
 }
 
 impl Default for OptimizerConfig {
@@ -123,6 +135,8 @@ impl Default for OptimizerConfig {
             run_cse_pass: false,
             run_omp_pass: true,
             run_lr_pass: false,
+            omp_top: None,
+            omp_cost: OMPCostMetric::default(),
         }
     }
 }
@@ -143,6 +157,16 @@ impl OptimizerConfig {
 
     pub fn with_lr_pass(mut self) -> Self {
         self.run_lr_pass = true;
+        self
+    }
+
+    pub fn with_omp_top(mut self, top: Option<usize>) -> Self {
+        self.omp_top = top;
+        self
+    }
+
+    pub fn with_omp_cost(mut self, cost: OMPCostMetric) -> Self {
+        self.omp_cost = cost;
         self
     }
 }
