@@ -19,10 +19,10 @@ pub enum ConnectorError {
 
 #[async_trait]
 pub trait Connector {
-    type Profile;
+    type Config;
     type Connection;
 
-    async fn new(profile: Self::Profile) -> Result<Arc<Self::Connection>, ConnectorError>;
+    async fn new(config: Self::Config) -> Result<Arc<Self::Connection>, ConnectorError>;
 
     async fn execute(&self, query_text: String) -> Result<usize, ConnectorError>;
 

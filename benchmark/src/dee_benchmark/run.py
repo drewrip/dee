@@ -22,7 +22,7 @@ def run_cmd(cmd, cwd=None, env=None, capture=True):
     return result.stdout
 
 
-def generate_profiles_json(src_project_dir, dest_project_dir, requested_db_type, max_mem=None):
+def generate_connections_json(src_project_dir, dest_project_dir, requested_db_type, max_mem=None):
     profiles_path = src_project_dir / "profiles.yml"
     if not profiles_path.exists():
         return None, None
@@ -43,7 +43,7 @@ def generate_profiles_json(src_project_dir, dest_project_dir, requested_db_type,
     profile_cfg = profiles_yml[target_profile_name]
     outputs = profile_cfg.get("outputs", {})
 
-    dee_profiles = {}
+    dee_connections = {}
     final_target = None
 
     for output_name, output_cfg in outputs.items():
@@ -88,19 +88,19 @@ def generate_profiles_json(src_project_dir, dest_project_dir, requested_db_type,
         else:
             continue
 
-        dee_profiles[target_key] = dee_cfg
+        dee_connections[target_key] = dee_cfg
         final_target = target_key
         # We only need one output of the requested type
         break
 
-    if not dee_profiles:
+    if not dee_connections:
         return None, None
 
-    profiles_json_path = dest_project_dir / "profiles.json"
-    with open(profiles_json_path, "w") as f:
-        json.dump(dee_profiles, f, indent=4)
+    connections_json_path = dest_project_dir / "connections.json"
+    with open(connections_json_path, "w") as f:
+        json.dump(dee_connections, f, indent=4)
 
-    return str(profiles_json_path), final_target
+    return str(connections_json_path), final_target
 
 
 def benchmark(
@@ -159,12 +159,12 @@ def benchmark(
             ]
         )
 
-        profiles_json, target = generate_profiles_json(
+        connections_json, target = generate_connections_json(
             src_project_path, dest_project_path, db_type, max_mem=max_mem
         )
-        if not profiles_json:
+        if not connections_json:
             print(
-                f"Warning: Could not generate profiles.json for {project_name} with type {db_type}"
+                f"Warning: Could not generate connections.json for {project_name} with type {db_type}"
             )
             continue
 
@@ -174,8 +174,8 @@ def benchmark(
             dee_cli_path,
             "opt",
             "--stats",
-            "--profiles",
-            profiles_json,
+            "--connections",
+            connections_json,
             "--target",
             target,
             "-o",
@@ -206,8 +206,8 @@ def benchmark(
                             [
                                 dee_cli_path,
                                 "run",
-                                "--profiles",
-                                profiles_json,
+                                "--connections",
+                                connections_json,
                                 "--target",
                                 target,
                                 str(dag_path),
@@ -222,8 +222,8 @@ def benchmark(
                         [
                             dee_cli_path,
                             "run",
-                            "--profiles",
-                            profiles_json,
+                            "--connections",
+                            connections_json,
                             "--target",
                             target,
                             str(dag_path),

@@ -12,14 +12,14 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tempfile;
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct DuckDBProfile {
+pub struct DuckDBConfig {
     pub database: PathBuf,
     pub num_connections: u32,
     pub threads: Option<i64>,
     pub max_memory: Option<String>,
 }
 
-impl DuckDBProfile {
+impl DuckDBConfig {
     pub fn new_from_path(path: String) -> Self {
         Self {
             database: PathBuf::from(path),
@@ -123,17 +123,17 @@ fn materialize_mode_in_duckdb(mode: MaterializeMode) -> String {
 
 #[async_trait]
 impl Connector for DuckDBConnection {
-    type Profile = DuckDBProfile;
+    type Config = DuckDBConfig;
     type Connection = DuckDBConnection;
 
-    async fn new(profile: Self::Profile) -> Result<Arc<Self::Connection>, ConnectorError> {
+    async fn new(config: Self::Config) -> Result<Arc<Self::Connection>, ConnectorError> {
         let mut conf = Config::default();
-        if let Some(max_mem) = profile.max_memory {
+        if let Some(max_mem) = config.max_memory {
             conf = conf
                 .max_memory(&max_mem)
                 .map_err(|_| ConnectorError::Create("set max memory problem".to_string()))?;
         }
-        if let Some(threads) = profile.threads {
+        if let Some(threads) = config.threads {
             conf = conf
                 .threads(threads)
                 .map_err(|_| ConnectorError::Create("set threads problem".to_string()))?;
@@ -143,11 +143,11 @@ impl Connector for DuckDBConnection {
             .access_mode(duckdb::AccessMode::ReadWrite)
             .map_err(|_| ConnectorError::Create("set access_mode".to_string()))?;
 
-        let manager = DuckdbConnectionManager::file_with_flags(profile.database, conf)
+        let manager = DuckdbConnectionManager::file_with_flags(config.database, conf)
             .map_err(|e| ConnectorError::Create(format!("connection manager - {}", e)))?;
         let pool = Pool::builder()
             .connection_timeout(Duration::from_hours(2))
-            .max_size(profile.num_connections)
+            .max_size(config.num_connections)
             .build(manager)
             .map_err(|_| ConnectorError::Create("r2d2 pool".to_string()))?;
         Ok(Arc::new(Self { pool }))
@@ -330,8 +330,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckdb_cost() {
-        let profile = DuckDBProfile::new_from_path(":memory:".to_string());
-        let conn = DuckDBConnection::new(profile).await.unwrap();
+        let config = DuckDBConfig::new_from_path(":memory:".to_string());
+        let conn = DuckDBConnection::new(config).await.unwrap();
 
         // Create a dummy table to have some plan
         conn.execute("CREATE TABLE t1 AS SELECT 1 AS id".to_string())

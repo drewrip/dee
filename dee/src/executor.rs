@@ -243,14 +243,14 @@ pub struct NodeStats {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::duckdb::{DuckDBConnection, DuckDBProfile};
+    use crate::connectors::duckdb::{DuckDBConnection, DuckDBConfig};
     use crate::dag::TransformNode;
     use std::collections::HashSet;
 
     #[tokio::test]
     async fn test_simple_engine_cost() {
-        let profile = DuckDBProfile::new_from_path(":memory:".to_string());
-        let conn = DuckDBConnection::new(profile).await.unwrap();
+        let config = DuckDBConfig::new_from_path(":memory:".to_string());
+        let conn = DuckDBConnection::new(config).await.unwrap();
         let engine = SimpleEngine::new(conn.clone()).unwrap();
 
         let mut nodes = HashMap::new();
