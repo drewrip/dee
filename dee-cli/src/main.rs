@@ -37,6 +37,12 @@ pub struct DrawCommand {
     dag_file: String,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum CliOMPCostMetric {
+    Actual,
+    Estimate,
+}
+
 #[derive(Args)]
 pub struct OptCommand {
     #[arg(short, long)]
@@ -47,6 +53,10 @@ pub struct OptCommand {
     output: Option<String>,
     #[arg(short, long, action)]
     stats: bool,
+    #[arg(long)]
+    omp_top: Option<usize>,
+    #[arg(long)]
+    omp_cost: Option<CliOMPCostMetric>,
 
     dag_file: String,
 }

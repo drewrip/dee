@@ -1,9 +1,9 @@
 use dee::{
-    connectors::{Connector, duckdb::DuckDBConnection, postgres::PostgresConnection},
+    connectors::{duckdb::DuckDBConnection, postgres::PostgresConnection, Connector},
     dag::Dag,
     executor::{Executor, SimpleEngine},
     file::DagFile,
-    opt::Optimizer,
+    opt::{Optimizer, OptimizerConfig},
     profiles::Profile,
 };
 use log::info;
@@ -24,19 +24,32 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
         .expect("target profile not found");
     let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(opt_cmd.dag_file)?)?;
     let mut dag = Dag::try_from(dag_file)?;
+
+    let mut config = OptimizerConfig::new().with_omp_top(opt_cmd.omp_top);
+
+    if let Some(cost_metric) = opt_cmd.omp_cost {
+        let metric = match cost_metric {
+            crate::CliOMPCostMetric::Actual => dee::opt::omp::OMPCostMetric::Actual,
+            crate::CliOMPCostMetric::Estimate => dee::opt::omp::OMPCostMetric::Estimate,
+        };
+        config = config.with_omp_cost(metric);
+    }
+
     let opt_stats = match &target_profile {
         Profile::DuckDB(profile) => {
             let conn = DuckDBConnection::new(profile.clone()).await?;
             let engine = SimpleEngine::new(conn.clone())?;
             engine.cleanup(&dag).await?;
-            let mut optimizer = Optimizer::new(conn, Arc::new(engine)).stats_on_passes(true);
+            let mut optimizer =
+                Optimizer::new_with_config(conn, Arc::new(engine), config).stats_on_passes(true);
             optimizer.run(&mut dag).await?
         }
         Profile::Postgres(profile) => {
             let conn = PostgresConnection::new(profile.clone()).await?;
             let engine = SimpleEngine::new(conn.clone())?;
             engine.cleanup(&dag).await?;
-            let mut optimizer = Optimizer::new(conn, Arc::new(engine)).stats_on_passes(true);
+            let mut optimizer =
+                Optimizer::new_with_config(conn, Arc::new(engine), config).stats_on_passes(true);
             optimizer.run(&mut dag).await?
         }
     };

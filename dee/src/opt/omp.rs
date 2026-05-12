@@ -10,6 +10,13 @@ use crate::{
     opt::{Dag, OptimizerError, OptimizerPass},
 };
 
+#[derive(Debug, Clone, Copy, Default)]
+pub enum OMPCostMetric {
+    #[default]
+    Actual,
+    Estimate,
+}
+
 #[derive(Debug, Clone)]
 pub struct OMPPass<C, E>
 where
@@ -17,6 +24,8 @@ where
     E: Executor<C> + Send + Sync,
 {
     engine: Arc<E>,
+    top_n: Option<usize>,
+    cost_metric: OMPCostMetric,
     _phantom: PhantomData<C>,
 }
 
@@ -25,9 +34,16 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    pub fn new(_conn: Arc<C>, engine: Arc<E>) -> Self {
+    pub fn new(
+        _conn: Arc<C>,
+        engine: Arc<E>,
+        top_n: Option<usize>,
+        cost_metric: OMPCostMetric,
+    ) -> Self {
         Self {
             engine,
+            top_n,
+            cost_metric,
             _phantom: PhantomData,
         }
     }
@@ -40,27 +56,41 @@ where
     E: Executor<C> + Send + Sync,
 {
     async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError> {
-        debug!("Running OMPPass");
+        debug!("Running OMPPass with metric: {:?}", self.cost_metric);
         let mut stats = HashMap::new();
-        let top_n = 3;
         let _ = self.engine.cleanup(dag).await.unwrap();
-        let run_result = self
-            .engine
-            .run(dag)
-            .await
-            .map_err(|_| OptimizerError::Exec("couldn't get baseline".to_string()))?;
-        let mut best_runtime = run_result.duration.num_milliseconds();
-        let baseline_runtime = best_runtime;
+
+        let baseline_cost = match self.cost_metric {
+            OMPCostMetric::Actual => self
+                .engine
+                .run(dag)
+                .await
+                .map(|r| r.duration.num_milliseconds() as f32)
+                .map_err(|_| OptimizerError::Exec("couldn't get baseline runtime".to_string()))?,
+            OMPCostMetric::Estimate => self
+                .engine
+                .cost(dag)
+                .await
+                .map_err(|_| OptimizerError::Exec("couldn't get baseline cost".to_string()))?
+                .ok_or(OptimizerError::Exec("no cost estimate available".to_string()))?,
+        };
+
+        let mut best_cost = baseline_cost;
         let mut candidates: Vec<(String, usize)> = dag
             .nodes
             .nodes()
             .filter(|n| matches!(n.materialize, MaterializeMode::View))
             .cloned()
             .map(|n| (n.id.clone(), dag.nodes.out_degree(&n.id)))
+            .filter(|(_, d)| *d > 1)
             .collect();
 
         candidates.sort_by_key(|k| k.1);
-        let top_candidates: Vec<_> = candidates.iter().rev().take(top_n).collect();
+        let top_candidates: Vec<_> = if let Some(n) = self.top_n {
+            candidates.iter().rev().take(n).collect()
+        } else {
+            candidates.iter().rev().collect()
+        };
 
         let plans: Vec<Vec<MaterializeMode>> = repeat_n(
             [MaterializeMode::View, MaterializeMode::Table].into_iter(),
@@ -87,18 +117,25 @@ where
                     .ok_or(OptimizerError::Exec("missing node".to_string()))?
                     .materialize = node.1.clone();
             }
-            let run_result = self
-                .engine
-                .run(&work_dag)
-                .await
-                .map_err(|e| OptimizerError::Exec(format!("test dag run failed - {}", e)))?;
 
-            stats.insert(
-                format!("attempt_{}", i + 1),
-                run_result.duration.num_milliseconds().to_string(),
-            );
-            if run_result.duration.num_milliseconds() < best_runtime {
-                best_runtime = run_result.duration.num_milliseconds();
+            let current_cost = match self.cost_metric {
+                OMPCostMetric::Actual => self
+                    .engine
+                    .run(&work_dag)
+                    .await
+                    .map(|r| r.duration.num_milliseconds() as f32)
+                    .map_err(|e| OptimizerError::Exec(format!("test dag run failed - {}", e)))?,
+                OMPCostMetric::Estimate => self
+                    .engine
+                    .cost(&work_dag)
+                    .await
+                    .map_err(|e| OptimizerError::Exec(format!("test dag cost failed - {}", e)))?
+                    .ok_or(OptimizerError::Exec("no cost estimate available".to_string()))?,
+            };
+
+            stats.insert(format!("attempt_{}", i + 1), current_cost.to_string());
+            if current_cost < best_cost {
+                best_cost = current_cost;
                 best_plan = plan.clone();
             } else {
                 for node in baseline_plan.iter().enumerate() {
@@ -112,14 +149,14 @@ where
             }
         }
 
-        stats.insert("baseline_runtime".into(), baseline_runtime.to_string());
-        stats.insert("best_runtime".into(), best_runtime.to_string());
-        let change = (best_runtime as f32 - baseline_runtime as f32) / (baseline_runtime as f32);
+        stats.insert("baseline_value".into(), baseline_cost.to_string());
+        stats.insert("best_value".into(), best_cost.to_string());
+        let change = (best_cost - baseline_cost) / (baseline_cost);
         stats.insert("opt_change".into(), change.to_string());
         debug!(
-            "OMPPass change: {:.2}ms -> {:.2}ms ({:.2}%)",
-            baseline_runtime,
-            best_runtime,
+            "OMPPass change: {:.2} -> {:.2} ({:.2}%)",
+            baseline_cost,
+            best_cost,
             change * 100.0,
         );
 
