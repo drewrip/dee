@@ -1,4 +1,4 @@
-use crate::dag::TransformNode;
+use crate::dag::{MaterializeMode, TransformNode};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -187,5 +187,44 @@ impl Graph {
             }
         }
         result
+    }
+
+    pub fn paths_to_sinks(&self, node: &String) -> usize {
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for n in self.g.values() {
+            for parent in &n.depends_on {
+                children.entry(parent.clone()).or_default().push(n.id.clone());
+            }
+        }
+
+        let mut memo = HashMap::new();
+        self.count_paths_helper(node, &children, &mut memo)
+    }
+
+    fn count_paths_helper(
+        &self,
+        node_id: &String,
+        children_map: &HashMap<String, Vec<String>>,
+        memo: &mut HashMap<String, usize>,
+    ) -> usize {
+        if let Some(&count) = memo.get(node_id) {
+            return count;
+        }
+
+        let mut count = 0;
+        if let Some(node) = self.g.get(node_id) {
+            if matches!(node.materialize, MaterializeMode::Table) {
+                count += 1;
+            }
+        }
+
+        if let Some(children) = children_map.get(node_id) {
+            for child in children {
+                count += self.count_paths_helper(child, children_map, memo);
+            }
+        }
+
+        memo.insert(node_id.clone(), count);
+        count
     }
 }

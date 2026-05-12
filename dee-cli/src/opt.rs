@@ -35,6 +35,12 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
         config = config.with_omp_cost(metric);
     }
 
+    let centrality = match opt_cmd.omp_node_centrality {
+        crate::CliOMPCentrality::Outdegree => dee::opt::omp::OMPCentrality::OutDegree,
+        crate::CliOMPCentrality::Paths => dee::opt::omp::OMPCentrality::Paths,
+    };
+    config = config.with_omp_centrality(centrality);
+
     let opt_stats = match &target_profile {
         Profile::DuckDB(profile) => {
             let conn = DuckDBConnection::new(profile.clone()).await?;
