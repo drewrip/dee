@@ -12,7 +12,7 @@ use sqlx::{
 use std::{sync::Arc, time::Duration};
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct PostgresProfile {
+pub struct PostgresConfig {
     host: String,
     port: Option<i32>,
     user: String,
@@ -21,7 +21,7 @@ pub struct PostgresProfile {
     num_connections: Option<u32>,
 }
 
-impl PostgresProfile {}
+impl PostgresConfig {}
 
 pub struct PostgresConnection {
     pool: PgPool,
@@ -78,20 +78,20 @@ fn materialize_mode_in_pg(mode: MaterializeMode) -> String {
 
 #[async_trait]
 impl Connector for PostgresConnection {
-    type Profile = PostgresProfile;
+    type Config = PostgresConfig;
     type Connection = PostgresConnection;
 
-    async fn new(profile: Self::Profile) -> Result<Arc<Self::Connection>, ConnectorError> {
+    async fn new(config: Self::Config) -> Result<Arc<Self::Connection>, ConnectorError> {
         let conn_options = PgConnectOptions::new_without_pgpass()
-            .host(&profile.host)
-            .port(profile.port.unwrap_or(5432) as u16)
-            .username(&profile.user)
-            .password(&profile.password)
-            .database(&profile.database)
+            .host(&config.host)
+            .port(config.port.unwrap_or(5432) as u16)
+            .username(&config.user)
+            .password(&config.password)
+            .database(&config.database)
             .log_slow_statements(log::LevelFilter::Off, Duration::from_hours(2));
 
         let pool = PgPoolOptions::new()
-            .max_connections(profile.num_connections.unwrap_or(4))
+            .max_connections(config.num_connections.unwrap_or(4))
             .connect_with(conn_options)
             .await
             .map_err(|_| ConnectorError::Create("couldn't create PgPool".into()))?;

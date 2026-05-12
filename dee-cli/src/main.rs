@@ -25,7 +25,7 @@ pub enum CliCommand {
 #[derive(Args)]
 pub struct RunCommand {
     #[arg(short, long)]
-    profiles: String,
+    connections: String,
     #[arg(short, long)]
     target: String,
     #[arg(long)]
@@ -54,7 +54,7 @@ pub enum CliOMPCentrality {
 #[derive(Args)]
 pub struct OptCommand {
     #[arg(short, long)]
-    profiles: String,
+    connections: String,
     #[arg(short, long)]
     target: String,
     #[arg(short, long)]
