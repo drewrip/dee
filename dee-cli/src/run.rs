@@ -23,7 +23,10 @@ pub async fn run(run_cmd: RunCommand) -> Result<(), Box<dyn Error>> {
     let exec_stats = match &target_profile {
         Profile::DuckDB(profile) => {
             let conn = DuckDBConnection::new(profile.clone()).await?;
-            let engine = SimpleEngine::new(conn)?;
+            let mut engine = SimpleEngine::new(conn)?;
+            if let Some(dump_plans) = &run_cmd.dump_plans {
+                engine = engine.with_plans_dir(dump_plans.clone());
+            }
 
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(run_cmd.dag_file)?)?;
             let dag = Dag::try_from(dag_file)?;
@@ -32,7 +35,10 @@ pub async fn run(run_cmd: RunCommand) -> Result<(), Box<dyn Error>> {
         }
         Profile::Postgres(profile) => {
             let conn = PostgresConnection::new(profile.clone()).await?;
-            let engine = SimpleEngine::new(conn)?;
+            let mut engine = SimpleEngine::new(conn)?;
+            if let Some(dump_plans) = &run_cmd.dump_plans {
+                engine = engine.with_plans_dir(dump_plans.clone());
+            }
 
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(run_cmd.dag_file)?)?;
             let dag = Dag::try_from(dag_file)?;

@@ -40,6 +40,17 @@ where
     C: Connector,
 {
     conn: Arc<C>,
+    plans_dir: Option<String>,
+}
+
+impl<C> SimpleEngine<C>
+where
+    C: Connector,
+{
+    pub fn with_plans_dir(mut self, plans_dir: String) -> Self {
+        self.plans_dir = Some(plans_dir);
+        self
+    }
 }
 
 #[async_trait]
@@ -50,7 +61,10 @@ where
     type ExecutionEngine = Self;
 
     fn new(conn: Arc<C>) -> Result<SimpleEngine<C>, ExecutorError> {
-        Ok(SimpleEngine { conn })
+        Ok(SimpleEngine {
+            conn,
+            plans_dir: None,
+        })
     }
 
     async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError> {
@@ -72,14 +86,38 @@ where
             for node_id in next_nodes.into_iter() {
                 let tn = dag.nodes.get(node_id.clone()).unwrap().clone();
                 let conn = Arc::clone(&self.conn);
+                let plans_dir = self.plans_dir.clone();
                 debug!("running node tidx={}", node_id);
                 debug!("work_queue.len()={}", work_queue.len());
                 in_progress.insert(node_id.clone());
                 work_queue.push(tokio::spawn(async move {
-                    let res = conn
-                        .new_relation(tn.materialize, tn.id.clone(), tn.query_text)
-                        .await
-                        .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                    let res = if let Some(dir) = plans_dir {
+                        let (res, plan) = conn
+                            .new_relation_and_explain(tn.materialize, tn.id.clone(), tn.query_text)
+                            .await
+                            .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+
+                        if let Some(plan_str) = plan {
+                            let rel_type = match tn.materialize {
+                                MaterializeMode::Table => "table",
+                                MaterializeMode::View => "view",
+                            };
+                            let filename = format!("{}_{}.json", tn.id, rel_type);
+                            let path = std::path::Path::new(&dir).join(filename);
+                            if let Some(parent) = path.parent() {
+                                std::fs::create_dir_all(parent)
+                                    .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                            }
+                            std::fs::write(path, plan_str)
+                                .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                        }
+                        res
+                    } else {
+                        conn.new_relation(tn.materialize, tn.id.clone(), tn.query_text)
+                            .await
+                            .map_err(|e| ExecutorError::Exec(e.to_string()))?
+                    };
+
                     debug!("new_relation ({}, {:?})", tn.id, tn.materialize);
                     Ok((res, node_id.clone()))
                 }));

@@ -28,6 +28,8 @@ pub struct RunCommand {
     profiles: String,
     #[arg(short, long)]
     target: String,
+    #[arg(long)]
+    dump_plans: Option<String>,
 
     dag_file: String,
 }
