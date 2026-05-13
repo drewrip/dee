@@ -8,7 +8,7 @@ use duckdb::{Config, DuckdbConnectionManager, params};
 use log::debug;
 use r2d2::Pool;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, process::Command, sync::Arc, time::Duration};
 use tempfile;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -135,6 +135,26 @@ fn parse_duckdb_size_bytes(value: &str) -> Option<u64> {
         _ => return None,
     };
     Some((quantity * multiplier).round() as u64)
+}
+
+fn sample_process_cpu_usage(pid: u32) -> Result<Option<f64>, ConnectorError> {
+    let output = Command::new("ps")
+        .args(["-o", "%cpu=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|e| ConnectorError::Execute(format!("Failed to run ps for cpu usage: {}", e)))?;
+
+    if !output.status.success() {
+        return Err(ConnectorError::Execute(format!(
+            "ps exited with status {} while sampling cpu usage",
+            output.status
+        )));
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|e| {
+        ConnectorError::Execute(format!("Failed to decode ps cpu usage output: {}", e))
+    })?;
+
+    Ok(stdout.trim().parse::<f64>().ok())
 }
 
 #[async_trait]
@@ -357,6 +377,10 @@ impl Connector for DuckDBConnection {
 
         Ok(parse_duckdb_size_bytes(&memory_usage))
     }
+
+    async fn sample_system_cpu_usage(&self) -> Result<Option<f64>, ConnectorError> {
+        sample_process_cpu_usage(std::process::id())
+    }
 }
 
 #[cfg(test)]
@@ -381,5 +405,12 @@ mod tests {
     fn test_parse_duckdb_size_bytes() {
         assert_eq!(parse_duckdb_size_bytes("44.0 KiB"), Some(45056));
         assert_eq!(parse_duckdb_size_bytes("1.0 B"), Some(1));
+    }
+
+    #[test]
+    fn test_sample_process_cpu_usage() {
+        let cpu = sample_process_cpu_usage(std::process::id()).unwrap();
+        assert!(cpu.is_some());
+        assert!(cpu.unwrap() >= 0.0);
     }
 }
