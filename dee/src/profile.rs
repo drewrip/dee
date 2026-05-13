@@ -435,9 +435,11 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       padding-top: 12px;
     }}
     .detail-name {{
-      font-size: 23px;
+      font-size: 21px;
       font-weight: 700;
       letter-spacing: -0.04em;
+      word-break: break-word;
+      line-height: 1.2;
     }}
     .detail-meta {{
       display: flex;
