@@ -182,7 +182,11 @@ pub fn build_dag_run_profile(dag_file: &str, dag: &Dag, exec_stats: &ExecStats) 
 pub fn render_profile_summary(report: &ProfileReport) -> String {
     let mut lines = vec!["Profile summary".to_string()];
     for run in &report.runs {
-        let peak_memory = run.system_samples.iter().filter_map(|s| s.memory_bytes).max();
+        let peak_memory = run
+            .system_samples
+            .iter()
+            .filter_map(|s| s.memory_bytes)
+            .max();
         let peak_cpu = run
             .system_samples
             .iter()
@@ -537,8 +541,8 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
   <div class="shell">
     <div class="hero">
       <div class="eyebrow">dee profiler</div>
-      <h1>dee profiling report</h1>
-      <p>{} DAG run(s), generated {}. Source tables are part of the graph, long names wrap inside nodes, and the DAG layout is computed in the browser with D3 plus `d3-dag`'s Sugiyama algorithm for a clearer layered flow.</p>
+      <h1>profiling report</h1>
+      <p>{} DAG run(s), generated {}.</p>
     </div>
     <div class="tabs" id="tabs"></div>
     <div id="pages"></div>
@@ -981,7 +985,6 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
               <span><span class="swatch" style="background: var(--table)"></span>Table nodes</span>
               <span><span class="swatch" style="background: var(--view)"></span>View nodes</span>
               <span><span class="swatch" style="background: var(--source)"></span>Source tables</span>
-              <span><span class="swatch" style="background: #94a3b8"></span>D3 + d3-dag Sugiyama layout</span>
             </div>
             <div class="dag-layout" data-run-index="${{index}}">
               <div class="dag-canvas" data-dag-canvas></div>
