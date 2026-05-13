@@ -16,6 +16,6 @@ r2d2 = "0.8.10"
 futures = "0.3.32"
 log = "0.4.29"
 datafusion = { version = "53.0.0", features = ["sql"] }
-chrono = "0.4.44"
+chrono = { version = "0.4.44", features = ["serde"] }
 itertools = "0.14.0"
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio"] }

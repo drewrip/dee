@@ -28,6 +28,12 @@ pub struct RunCommand {
     connections: String,
     #[arg(short, long)]
     target: String,
+    #[arg(long, action)]
+    profile: bool,
+    #[arg(long)]
+    profile_dump: Option<String>,
+    #[arg(long)]
+    profile_viz: Option<String>,
     #[arg(long)]
     dump_plans: Option<String>,
 

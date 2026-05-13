@@ -162,4 +162,19 @@ impl Connector for PostgresConnection {
 
         Ok(Some(total_cost))
     }
+
+    async fn sample_system_memory_usage(&self) -> Result<Option<u64>, ConnectorError> {
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(total_bytes), 0)::BIGINT AS memory_bytes FROM pg_backend_memory_contexts",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ConnectorError::Execute(format!("Failed to sample memory usage: {}", e)))?;
+
+        let memory_bytes: i64 = row.try_get("memory_bytes").map_err(|e| {
+            ConnectorError::Execute(format!("Failed to decode memory usage sample: {}", e))
+        })?;
+
+        Ok(Some(memory_bytes.max(0) as u64))
+    }
 }

@@ -24,6 +24,15 @@ pub enum MaterializeMode {
     Table,
 }
 
+impl MaterializeMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MaterializeMode::View => "view",
+            MaterializeMode::Table => "table",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SourceNode {
     pub name: String,

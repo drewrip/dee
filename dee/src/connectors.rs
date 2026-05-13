@@ -54,4 +54,12 @@ pub trait Connector {
     async fn cost(&self, _query: String) -> Result<Option<f32>, ConnectorError> {
         Ok(None)
     }
+
+    async fn sample_system_cpu_usage(&self) -> Result<Option<f64>, ConnectorError> {
+        Ok(None)
+    }
+
+    async fn sample_system_memory_usage(&self) -> Result<Option<u64>, ConnectorError> {
+        Ok(None)
+    }
 }
