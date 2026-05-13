@@ -5,4 +5,5 @@ pub mod executor;
 pub mod file;
 pub mod graph;
 pub mod opt;
+pub mod profile;
 pub mod connections;

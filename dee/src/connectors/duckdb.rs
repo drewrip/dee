@@ -121,6 +121,22 @@ fn materialize_mode_in_duckdb(mode: MaterializeMode) -> String {
     }
 }
 
+fn parse_duckdb_size_bytes(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    let mut parts = trimmed.split_whitespace();
+    let quantity = parts.next()?.parse::<f64>().ok()?;
+    let unit = parts.next().unwrap_or("B").to_ascii_uppercase();
+    let multiplier = match unit.as_str() {
+        "B" => 1.0,
+        "KB" | "KIB" => 1024.0,
+        "MB" | "MIB" => 1024.0 * 1024.0,
+        "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
+        "TB" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((quantity * multiplier).round() as u64)
+}
+
 #[async_trait]
 impl Connector for DuckDBConnection {
     type Config = DuckDBConfig;
@@ -322,6 +338,25 @@ impl Connector for DuckDBConnection {
                 .sum(),
         ))
     }
+
+    async fn sample_system_memory_usage(&self) -> Result<Option<u64>, ConnectorError> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
+
+        let mut stmt = conn
+            .prepare("SELECT memory_usage FROM pragma_database_size()")
+            .map_err(|e| {
+                ConnectorError::Execute(format!("Failed to prepare memory usage sample: {}", e))
+            })?;
+
+        let memory_usage: String = stmt
+            .query_row([], |row| row.get(0))
+            .map_err(|e| ConnectorError::Execute(format!("Failed to query memory usage: {}", e)))?;
+
+        Ok(parse_duckdb_size_bytes(&memory_usage))
+    }
 }
 
 #[cfg(test)]
@@ -340,5 +375,11 @@ mod tests {
 
         let cost = conn.cost("SELECT * FROM t1".to_string()).await.unwrap();
         assert!(cost.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_parse_duckdb_size_bytes() {
+        assert_eq!(parse_duckdb_size_bytes("44.0 KiB"), Some(45056));
+        assert_eq!(parse_duckdb_size_bytes("1.0 B"), Some(1));
     }
 }
