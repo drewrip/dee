@@ -394,7 +394,8 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       align-items: start;
     }}
     .dag-canvas {{
-      min-height: 320px;
+      aspect-ratio: 16 / 10;
+      width: 100%;
       border-radius: 20px;
       background: linear-gradient(180deg, rgba(248,250,252,0.95), rgba(255,255,255,0.95));
       border: 1px solid rgba(148,163,184,0.16);
@@ -403,7 +404,6 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       cursor: grab;
     }}
     .dag-canvas:active {{ cursor: grabbing; }}
-    .dag-canvas svg {{ min-width: 1180px; }}
     .dag-canvas .graph,
     .dag-canvas svg text {{
       font-family: Inter, ui-sans-serif, system-ui, sans-serif;
@@ -417,7 +417,7 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       opacity: 0.95;
     }}
     .dag-sidepanel {{
-      min-height: 620px;
+      min-height: 480px;
       border-radius: 20px;
       background: rgba(255,255,255,0.92);
       border: 1px solid rgba(148,163,184,0.16);
@@ -672,8 +672,8 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
         .nodeSize((node) => node.data.kind === "source" ? [110, 250] : [150, 300]);
       const {{ width, height }} = layout(dag);
 
-      const outerWidth = Math.max(height + 180, 1280);
-      const outerHeight = Math.max(width + 120, 380);
+      const outerWidth = Math.max(height + 300, (width + 200) * 1.6, 1280);
+      const outerHeight = outerWidth / 1.6;
       const svg = d3.select(container)
         .append("svg")
         .attr("viewBox", `0 0 ${{outerWidth}} ${{outerHeight}}`)
@@ -692,8 +692,8 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
         .attr("d", "M 0 0 L 10 5 L 0 10 z")
         .attr("fill", "#c2cfdf");
 
-      const initialTransform = d3.zoomIdentity.translate(110, 90);
-      const root = viewport.append("g").attr("transform", "translate(110,90)");
+      const initialTransform = d3.zoomIdentity.translate(150, 100);
+      const root = viewport.append("g").attr("transform", "translate(150,100)");
       const linkLayer = root.append("g");
       const nodeLayer = root.append("g");
       const zoom = d3.zoom()
