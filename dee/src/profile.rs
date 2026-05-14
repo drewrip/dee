@@ -534,6 +534,56 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       user-select: none;
       pointer-events: none;
     }}
+    .plan-tree {{
+      margin-top: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+    }}
+    .plan-node {{
+      border-left: 1px solid var(--grid);
+      padding-left: 12px;
+      margin-bottom: 4px;
+    }}
+    .plan-header {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer;
+      padding: 6px 10px;
+      border-radius: 8px;
+      transition: background 0.2s;
+    }}
+    .plan-header:hover {{ background: rgba(0,0,0,0.04); }}
+    .plan-toggle {{ 
+      width: 16px; 
+      height: 16px; 
+      display: flex; 
+      align-items: center; 
+      justify-content: center; 
+      transition: transform 0.2s;
+      color: var(--muted);
+      font-size: 10px;
+    }}
+    .plan-node.folded > .plan-children {{ display: none; }}
+    .plan-node.folded > .plan-header .plan-toggle {{ transform: rotate(-90deg); }}
+    .plan-type {{ font-weight: 700; min-width: 140px; }}
+    .plan-impact-wrap {{ width: 100px; height: 8px; background: var(--grid); border-radius: 4px; overflow: hidden; flex-shrink: 0; }}
+    .plan-impact-bar {{ height: 100%; background: var(--cpu); }}
+    .plan-rows {{ color: var(--muted); min-width: 80px; text-align: right; }}
+    .plan-bytes {{ color: var(--muted); min-width: 80px; text-align: right; font-size: 11px; }}
+    .plan-timing {{ color: var(--muted); min-width: 60px; text-align: right; font-size: 10px; }}
+    .plan-extra {{ 
+      margin: 4px 0 8px 20px; 
+      padding: 10px; 
+      background: #f8fafc; 
+      border: 1px solid var(--grid); 
+      border-radius: 8px; 
+      display: none; 
+      font-size: 11px;
+    }}
+    .plan-extra.active {{ display: block; }}
+    .plan-extra-row {{ display: flex; gap: 8px; margin-bottom: 2px; }}
+    .plan-extra-key {{ font-weight: 700; color: var(--muted); min-width: 120px; }}
     @media (max-width: 1100px) {{
       body {{ padding: 18px; }}
       .dag-layout {{ grid-template-columns: 1fr; }}
@@ -577,6 +627,76 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;");
+    }}
+
+    function formatCount(n) {{
+      if (n == null) return "0";
+      if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+      return n.toString();
+    }}
+
+    function renderPlanNode(node, totalTiming) {{
+      const timing = node.operator_timing || 0;
+      const impact = totalTiming > 0 ? (timing / totalTiming) * 100 : 0;
+      const children = node.children || [];
+      const childrenHtml = children.map(child => renderPlanNode(child, totalTiming)).join("");
+
+      const extraInfoHtml = Object.entries(node.extra_info || {{}})
+        .map(([k, v]) => `
+          <div class="plan-extra-row">
+            <span class="plan-extra-key">${{escapeHtml(k)}}</span>
+            <span class="plan-extra-val">${{escapeHtml(JSON.stringify(v))}}</span>
+          </div>
+        `)
+        .join("");
+
+      return `
+        <div class="plan-node">
+          <div class="plan-header" onclick="
+            if (event.target.closest('.plan-toggle')) {{
+              this.parentElement.classList.toggle('folded');
+            }} else {{
+              this.nextElementSibling.classList.toggle('active');
+            }}
+            event.stopPropagation();
+          ">
+            <div class="plan-toggle">${{children.length ? "▼" : ""}}</div>
+            <span class="plan-type">${{escapeHtml(node.operator_type || node.operator_name || "UNKNOWN")}}</span>
+            <div class="plan-impact-wrap">
+              <div class="plan-impact-bar" style="width: ${{impact}}%"></div>
+            </div>
+            <span class="plan-rows">${{formatCount(node.operator_cardinality)}} rows</span>
+            <span class="plan-bytes">${{formatBytes(node.result_set_size)}}</span>
+            <span class="plan-timing">${{(timing * 1000).toFixed(2)}}ms</span>
+          </div>
+          <div class="plan-extra">${{extraInfoHtml || "No extra info recorded."}}</div>
+          <div class="plan-children">${{childrenHtml}}</div>
+        </div>
+      `;
+    }}
+
+
+    function renderPlan(planJson) {{
+      if (!planJson) return "No plan available.";
+      try {{
+        const plan = JSON.parse(planJson);
+        let totalTiming = 0;
+        const walk = (n) => {{
+          totalTiming += (n.operator_timing || 0);
+          (n.children || []).forEach(walk);
+        }};
+        (plan.children || []).forEach(walk);
+        
+        return `
+          <div class="plan-tree">
+            ${{plan.children.map(child => renderPlanNode(child, totalTiming)).join("")}}
+          </div>
+        `;
+      }} catch (e) {{
+        return `<div style="color: var(--cpu)">Error parsing plan: ${{escapeHtml(e.message)}}</div>`;
+      }}
     }}
 
     function wrapTextLines(text, maxChars, maxLines) {{
@@ -635,6 +755,7 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
     }}
 
     function appendWrappedText(group, lines, x, y, lineHeight, attrs = {{}}) {{
+
       const text = group.append("text").attr("x", x).attr("y", y);
       Object.entries(attrs).forEach(([key, value]) => text.attr(key, value));
       lines.forEach((line, index) => {{
@@ -1033,7 +1154,7 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
                         ${{!hasPlan ? '<span style="color: var(--cpu); margin-left: 8px; font-size: 11px;">(no plan available)</span>' : ''}}
                       </summary>
                       <div style="margin-top: 12px;">
-                        <pre><code>${{hasPlan ? escapeHtml(exec.plan) : "No plan was captured for this node."}}</code></pre>
+                        ${{hasPlan ? renderPlan(exec.plan) : "No plan was captured for this node."}}
                       </div>
                     </details>
                   `;
@@ -1109,7 +1230,7 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
           ${{exec && exec.plan ? `
             <div class="detail-box">
               <h3>Plan</h3>
-              <pre><code>${{escapeHtml(exec.plan)}}</code></pre>
+              ${{renderPlan(exec.plan)}}
             </div>
           ` : ""}}
           <div class="detail-box">
