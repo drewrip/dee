@@ -69,7 +69,10 @@ where
         engine = engine.with_plans_dir(dump_plans.clone());
     }
     if profiling_enabled {
-        engine = engine.with_profiling(ProfilingConfig::default());
+        engine = engine.with_profiling(ProfilingConfig {
+            collect_plans: true,
+            ..ProfilingConfig::default()
+        });
     }
 
     let mut runs = Vec::new();
