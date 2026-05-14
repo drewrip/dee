@@ -584,6 +584,77 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
     .plan-extra.active {{ display: block; }}
     .plan-extra-row {{ display: flex; gap: 8px; margin-bottom: 2px; }}
     .plan-extra-key {{ font-weight: 700; color: var(--muted); min-width: 120px; }}
+    .view-plan-btn {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 8px 16px;
+      border-radius: 12px;
+      background: var(--ink);
+      color: white;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      transition: opacity 0.2s;
+      cursor: pointer;
+    }}
+    .view-plan-btn:hover {{ opacity: 0.85; }}
+    .view-plan-btn.disabled {{
+      background: var(--grid);
+      color: var(--muted);
+      cursor: not-allowed;
+      opacity: 0.7;
+    }}
+    .panel summary {{
+      cursor: pointer;
+      list-style: none;
+      outline: none;
+    }}
+    .panel summary::-webkit-details-marker {{ display: none; }}
+    .panel summary h2 {{
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+    }}
+    .panel summary h2::before {{
+      content: "▼";
+      font-size: 14px;
+      color: var(--muted);
+      transition: transform 0.2s;
+    }}
+    .panel[open] summary h2::before {{ transform: rotate(0); }}
+    .panel:not([open]) summary h2::before {{ transform: rotate(-90deg); }}
+    
+    .back-to-top {{
+      position: fixed;
+      bottom: 30px;
+      right: 30px;
+      width: 48px;
+      height: 48px;
+      border-radius: 24px;
+      background: var(--ink);
+      color: white;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+      opacity: 0;
+      visibility: hidden;
+      transition: all 0.3s;
+      z-index: 1000;
+      border: none;
+    }}
+    .back-to-top.visible {{
+      opacity: 1;
+      visibility: visible;
+    }}
+    .back-to-top:hover {{
+      transform: translateY(-4px);
+      box-shadow: 0 12px 28px rgba(0,0,0,0.2);
+    }}
+
     @media (max-width: 1100px) {{
       body {{ padding: 18px; }}
       .dag-layout {{ grid-template-columns: 1fr; }}
@@ -600,6 +671,11 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
     </div>
     <div class="tabs" id="tabs"></div>
     <div id="pages"></div>
+    <button class="back-to-top" id="backToTop" title="Back to top">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 15l-6-6-6 6"/>
+      </svg>
+    </button>
   </div>
   <script src="https://unpkg.com/d3@7/dist/d3.min.js"></script>
   <script src="https://unpkg.com/d3-dag@1.1.0"></script>
@@ -626,7 +702,13 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       return text
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;");
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }}
+
+    function safeId(id) {{
+      return id.replace(/[^a-z0-9_-]/gi, '_');
     }}
 
     function formatCount(n) {{
@@ -699,6 +781,17 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       }}
     }}
 
+    function scrollToPlan(id) {{
+      const el = document.getElementById(id);
+      if (el) {{
+        el.open = true;
+        el.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+        el.style.outline = '2px solid var(--accent)';
+        el.style.outlineOffset = '4px';
+        setTimeout(() => {{ el.style.outline = 'none'; }}, 2000);
+      }}
+    }}
+
     function wrapTextLines(text, maxChars, maxLines) {{
       if (!text || maxChars <= 0 || maxLines <= 0) return [];
       const words = text.split(/\s+/).filter(Boolean);
@@ -767,7 +860,7 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       return text;
     }}
 
-    function renderDagCanvas(pageEl, run) {{
+    function renderDagCanvas(pageEl, run, index) {{
       const container = pageEl.querySelector("[data-dag-canvas]");
       const detail = pageEl.querySelector("[data-node-detail]");
       if (!container || !detail) return;
@@ -987,7 +1080,7 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
 
       const setSelected = (nodeId) => {{
         nodeGroups.classed("selected", (node) => node.data.id === nodeId);
-        renderNodeDetail(run, nodeId, detail);
+        renderNodeDetail(run, nodeId, detail, index);
       }};
 
       nodeGroups.on("click", (_, node) => setSelected(node.data.id));
@@ -1103,8 +1196,8 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
             <div class="card"><div class="label">Peak CPU</div><div class="value">${{peakCpu ? `${{peakCpu.toFixed(1)}}%` : "n/a"}}</div></div>
           </div>
 
-          <div class="panel">
-            <h2>DAG</h2>
+          <details class="panel" open>
+            <summary><h2>DAG</h2></summary>
             <div class="legend">
               <span><span class="swatch" style="background: var(--table)"></span>Table nodes</span>
               <span><span class="swatch" style="background: var(--view)"></span>View nodes</span>
@@ -1116,17 +1209,17 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
                 <div class="detail-empty">Select a node to inspect its materialization mode, runtime, dependencies, and SQL or schema.</div>
               </aside>
             </div>
-          </div>
+          </details>
 
           <div class="section-stack">
-            <div class="panel">
-              <h2>Execution Gantt</h2>
+            <details class="panel" open>
+              <summary><h2>Execution Gantt</h2></summary>
               <div class="subtle">Execution windows for each node, ordered by observed start time.</div>
               <div class="svg-wrap">${{buildGanttSvg(run)}}</div>
-            </div>
+            </details>
 
-            <div class="panel">
-              <h2>System samples</h2>
+            <details class="panel" open>
+              <summary><h2>System samples</h2></summary>
               <div class="subtle">Aligned CPU and memory time series make it easier to compare resource pressure with node execution phases.</div>
               <div class="legend">
                 <span><span class="swatch" style="background: var(--cpu)"></span>CPU usage</span>
@@ -1136,17 +1229,17 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
                 <div class="svg-wrap">${{buildTimelineSvg(run, sample => sample.cpu_percent, "var(--cpu)", "CPU usage", value => `${{value.toFixed(1)}}%`)}}</div>
                 <div class="svg-wrap">${{buildTimelineSvg(run, sample => sample.memory_bytes, "var(--mem)", "Memory usage", value => formatBytes(value))}}</div>
               </div>
-            </div>
+            </details>
 
-            <div class="panel">
-              <h2>Table Node Plans</h2>
+            <details class="panel" open>
+              <summary><h2>Table Node Plans</h2></summary>
               <div class="subtle">Collapsible query plans for all nodes materialized as tables.</div>
               <div class="query-list">
                 ${{run.graph.nodes.filter(n => n.materialization === "table").map(node => {{
                   const exec = nodeIndex[node.id];
                   const hasPlan = exec && exec.plan;
                   return `
-                    <details class="query-item">
+                    <details class="query-item" id="run-${{index}}-plan-${{safeId(node.id)}}">
                       <summary style="cursor: pointer; font-weight: 700;">
                         ${{escapeHtml(node.id)}}
                         <span class="node-tag table">table</span>
@@ -1160,28 +1253,30 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
                   `;
                 }}).join("")}}
               </div>
-            </div>
+            </details>
           </div>
 
-          <div class="panel">
-            <h2>Nodes and SQL</h2>
+          <details class="panel" open>
+            <summary><h2>Nodes and SQL</h2></summary>
             <div class="subtle">Full node inventory for scanning SQL and materialization choices outside the graph view.</div>
             <div class="query-list">
               ${{run.graph.nodes.map(node => `
-                <div class="query-item">
-                  <strong>${{escapeHtml(node.id)}}</strong>
-                  <span class="node-tag ${{node.materialization}}">${{node.materialization}}</span>
-                  <span style="color: var(--muted); margin-left: 8px;">${{nodeIndex[node.id] ? `${{nodeIndex[node.id].duration_ms}} ms` : "not executed"}}</span>
-                  <pre><code>${{escapeHtml(node.query_text)}}</code></pre>
-                </div>
+                <details class="query-item">
+                  <summary style="cursor: pointer;">
+                    <strong>${{escapeHtml(node.id)}}</strong>
+                    <span class="node-tag ${{node.materialization}}">${{node.materialization}}</span>
+                    <span style="color: var(--muted); margin-left: 8px;">${{nodeIndex[node.id] ? `${{nodeIndex[node.id].duration_ms}} ms` : "not executed"}}</span>
+                  </summary>
+                  <pre style="margin-top: 12px;"><code>${{escapeHtml(node.query_text)}}</code></pre>
+                </details>
               `).join("")}}
             </div>
-          </div>
+          </details>
         </section>
       `;
     }}
 
-    function renderNodeDetail(run, nodeId, container) {{
+    function renderNodeDetail(run, nodeId, container, runIndex) {{
       const source = run.graph.sources.find(item => item.name === nodeId);
       if (source) {{
         const downstream = run.graph.source_edges.filter(edge => edge.from === nodeId).map(edge => edge.to);
@@ -1214,6 +1309,9 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       const exec = run.node_executions.find(item => item.node_id === nodeId);
       const downstream = run.graph.edges.filter(edge => edge.from === nodeId).map(edge => edge.to);
       const upstream = node.depends_on;
+      const isTable = node.materialization === "table";
+      const hasPlan = isTable && exec && exec.plan;
+      
       container.innerHTML = `
         <div class="detail-name">${{escapeHtml(node.id)}}</div>
         <div class="detail-meta">
@@ -1222,17 +1320,19 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
           <span class="pill">${{upstream.length}} upstream</span>
           <span class="pill">${{downstream.length}} downstream</span>
         </div>
+        
+        <div class="view-plan-btn-wrap">
+          <a class="view-plan-btn ${{hasPlan ? "" : "disabled"}}" 
+             ${{hasPlan ? `onclick="scrollToPlan('run-${{runIndex}}-plan-${{safeId(node.id)}}')"` : ""}}>
+            View Query Plan
+          </a>
+        </div>
+
         <div class="detail-grid">
           <div class="detail-box">
             <h3>Timing</h3>
             <pre>${{exec ? `start: ${{exec.start}}\nfinish: ${{exec.finish}}\nduration: ${{exec.duration_ms}} ms` : "No execution timing recorded."}}</pre>
           </div>
-          ${{exec && exec.plan ? `
-            <div class="detail-box">
-              <h3>Plan</h3>
-              ${{renderPlan(exec.plan)}}
-            </div>
-          ` : ""}}
           <div class="detail-box">
             <h3>Dependencies</h3>
             <pre>${{upstream.length ? upstream.join("\n") : "No upstream dependencies."}}</pre>
@@ -1261,13 +1361,25 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
 
     const tabEls = [...document.querySelectorAll(".tab")];
     const pageEls = [...document.querySelectorAll(".page")];
-    pageEls.forEach((pageEl, index) => renderDagCanvas(pageEl, report.runs[index]));
+    pageEls.forEach((pageEl, index) => renderDagCanvas(pageEl, report.runs[index], index));
     tabEls.forEach(tab => {{
       tab.addEventListener("click", () => {{
         const index = Number(tab.dataset.index);
         tabEls.forEach((el, idx) => el.classList.toggle("active", idx === index));
         pageEls.forEach((el, idx) => el.classList.toggle("active", idx === index));
       }});
+    }});
+
+    const backToTop = document.getElementById("backToTop");
+    window.addEventListener("scroll", () => {{
+      if (window.pageYOffset > 300) {{
+        backToTop.classList.add("visible");
+      }} else {{
+        backToTop.classList.remove("visible");
+      }}
+    }});
+    backToTop.addEventListener("click", () => {{
+      window.scrollTo({{ top: 0, behavior: "smooth" }});
     }});
   </script>
 </body>
