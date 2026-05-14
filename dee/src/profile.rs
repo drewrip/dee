@@ -982,7 +982,6 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
 
           <div class="panel">
             <h2>DAG</h2>
-            <div class="subtle">Source tables use a third color, each node labels both in-degree and out-degree, long names wrap inside the node card, and the Sugiyama layout uses wider gaps to reduce crossings and make branch structure easier to follow.</div>
             <div class="legend">
               <span><span class="swatch" style="background: var(--table)"></span>Table nodes</span>
               <span><span class="swatch" style="background: var(--view)"></span>View nodes</span>
