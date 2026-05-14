@@ -65,12 +65,14 @@ where
 #[derive(Clone, Debug)]
 pub struct ProfilingConfig {
     pub sample_interval: Duration,
+    pub collect_plans: bool,
 }
 
 impl Default for ProfilingConfig {
     fn default() -> Self {
         Self {
             sample_interval: Duration::from_millis(250),
+            collect_plans: false,
         }
     }
 }
@@ -172,6 +174,8 @@ where
             (None, None)
         };
 
+        let collect_plans = self.profiling.as_ref().map(|p| p.collect_plans).unwrap_or(false);
+
         let mut node_stats = node_stats;
         while work_graph.num_nodes() > 0 {
             let next_nodes: Vec<_> = work_graph
@@ -184,36 +188,40 @@ where
                 let tn = dag.nodes.get(node_id.clone()).unwrap().clone();
                 let conn = Arc::clone(&self.conn);
                 let plans_dir = self.plans_dir.clone();
+                let collect_plans = collect_plans;
                 debug!("running node tidx={}", node_id);
                 debug!("work_queue.len()={}", work_queue.len());
                 in_progress.insert(node_id.clone());
                 work_queue.push(tokio::spawn(async move {
                     let node_start = Utc::now();
-                    let res = if let Some(dir) = plans_dir {
+                    let (res, plan) = if plans_dir.is_some() || collect_plans {
                         let (res, plan) = conn
                             .new_relation_and_explain(tn.materialize, tn.id.clone(), tn.query_text)
                             .await
                             .map_err(|e| ExecutorError::Exec(e.to_string()))?;
 
-                        if let Some(plan_str) = plan {
-                            let rel_type = match tn.materialize {
-                                MaterializeMode::Table => "table",
-                                MaterializeMode::View => "view",
-                            };
-                            let filename = format!("{}_{}.json", tn.id, rel_type);
-                            let path = std::path::Path::new(&dir).join(filename);
-                            if let Some(parent) = path.parent() {
-                                std::fs::create_dir_all(parent)
+                        if let Some(plan_str) = plan.clone() {
+                            if let Some(dir) = plans_dir {
+                                let rel_type = match tn.materialize {
+                                    MaterializeMode::Table => "table",
+                                    MaterializeMode::View => "view",
+                                };
+                                let filename = format!("{}_{}.json", tn.id, rel_type);
+                                let path = std::path::Path::new(&dir).join(filename);
+                                if let Some(parent) = path.parent() {
+                                    std::fs::create_dir_all(parent)
+                                        .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                                }
+                                std::fs::write(path, plan_str)
                                     .map_err(|e| ExecutorError::Exec(e.to_string()))?;
                             }
-                            std::fs::write(path, plan_str)
-                                .map_err(|e| ExecutorError::Exec(e.to_string()))?;
                         }
-                        res
+                        (res, plan)
                     } else {
-                        conn.new_relation(tn.materialize, tn.id.clone(), tn.query_text)
+                        let res = conn.new_relation(tn.materialize, tn.id.clone(), tn.query_text)
                             .await
-                            .map_err(|e| ExecutorError::Exec(e.to_string()))?
+                            .map_err(|e| ExecutorError::Exec(e.to_string()))?;
+                        (res, None)
                     };
                     let node_finish = Utc::now();
 
@@ -225,11 +233,11 @@ where
                             start: node_start,
                             finish: node_finish,
                             duration: node_finish - node_start,
+                            plan,
                         },
                     ))
                 }));
             }
-
             // wait for work_queue to empty
             while let Some(item) = work_queue.next().await {
                 let (_, node_id, stats) =
@@ -361,6 +369,7 @@ pub struct NodeStats {
     pub start: DateTime<Utc>,
     pub finish: DateTime<Utc>,
     pub duration: TimeDelta,
+    pub plan: Option<String>,
 }
 
 #[cfg(test)]

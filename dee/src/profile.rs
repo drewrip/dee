@@ -61,6 +61,7 @@ pub struct NodeExecutionProfile {
     pub start: DateTime<Utc>,
     pub finish: DateTime<Utc>,
     pub duration_ms: i64,
+    pub plan: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,6 +159,7 @@ pub fn build_dag_run_profile(dag_file: &str, dag: &Dag, exec_stats: &ExecStats) 
             start: stats.start,
             finish: stats.finish,
             duration_ms: stats.duration.num_milliseconds(),
+            plan: stats.plan.clone(),
         })
         .collect();
     node_executions.sort_by(|a, b| a.start.cmp(&b.start).then(a.node_id.cmp(&b.node_id)));
@@ -1014,6 +1016,30 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
                 <div class="svg-wrap">${{buildTimelineSvg(run, sample => sample.memory_bytes, "var(--mem)", "Memory usage", value => formatBytes(value))}}</div>
               </div>
             </div>
+
+            <div class="panel">
+              <h2>Table Node Plans</h2>
+              <div class="subtle">Collapsible query plans for all nodes materialized as tables.</div>
+              <div class="query-list">
+                ${{run.graph.nodes.filter(n => n.materialization === "table").map(node => {{
+                  const exec = nodeIndex[node.id];
+                  const hasPlan = exec && exec.plan;
+                  return `
+                    <details class="query-item">
+                      <summary style="cursor: pointer; font-weight: 700;">
+                        ${{escapeHtml(node.id)}}
+                        <span class="node-tag table">table</span>
+                        <span style="color: var(--muted); margin-left: 8px;">${{exec ? `${{exec.duration_ms}} ms` : "not executed"}}</span>
+                        ${{!hasPlan ? '<span style="color: var(--cpu); margin-left: 8px; font-size: 11px;">(no plan available)</span>' : ''}}
+                      </summary>
+                      <div style="margin-top: 12px;">
+                        <pre><code>${{hasPlan ? escapeHtml(exec.plan) : "No plan was captured for this node."}}</code></pre>
+                      </div>
+                    </details>
+                  `;
+                }}).join("")}}
+              </div>
+            </div>
           </div>
 
           <div class="panel">
@@ -1080,10 +1106,17 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
             <h3>Timing</h3>
             <pre>${{exec ? `start: ${{exec.start}}\nfinish: ${{exec.finish}}\nduration: ${{exec.duration_ms}} ms` : "No execution timing recorded."}}</pre>
           </div>
+          ${{exec && exec.plan ? `
+            <div class="detail-box">
+              <h3>Plan</h3>
+              <pre><code>${{escapeHtml(exec.plan)}}</code></pre>
+            </div>
+          ` : ""}}
           <div class="detail-box">
             <h3>Dependencies</h3>
             <pre>${{upstream.length ? upstream.join("\n") : "No upstream dependencies."}}</pre>
           </div>
+
           <div class="detail-box">
             <h3>Dependents</h3>
             <pre>${{downstream.length ? downstream.join("\n") : "No downstream dependents."}}</pre>
