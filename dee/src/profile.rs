@@ -1350,23 +1350,142 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       `;
     }}
 
+    const runColors = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899"];
+
+    function buildCompareTimelineSvg(runs, accessor, label, formatter) {{
+      const width = 1180;
+      const height = 300;
+      const margin = {{ top: 40, right: 180, bottom: 40, left: 64 }};
+      
+      const allSamples = runs.flatMap((run, i) => 
+        run.system_samples
+          .filter(sample => accessor(sample) != null)
+          .map(sample => ({{ ...sample, runIndex: i }}))
+      );
+
+      const maxX = Math.max(...runs.map(run => run.duration_ms), ...allSamples.map(s => s.elapsed_ms), 1);
+      let maxY = allSamples.length ? Math.max(...allSamples.map(s => accessor(s))) : 1;
+      if (maxY <= 0) maxY = 1;
+      
+      const plotWidth = width - margin.left - margin.right;
+      const plotHeight = height - margin.top - margin.bottom;
+      const x = value => margin.left + (value / maxX) * plotWidth;
+      const y = value => margin.top + plotHeight - (value / maxY) * plotHeight;
+
+      const grid = [0, 0.25, 0.5, 0.75, 1].map(tick => {{
+        const yy = margin.top + plotHeight - tick * plotHeight;
+        const value = maxY * tick;
+        return `
+          <line x1="${{margin.left}}" y1="${{yy}}" x2="${{width - margin.right}}" y2="${{yy}}" stroke="var(--grid)" stroke-dasharray="4 6" />
+          <text x="${{margin.left - 10}}" y="${{yy + 4}}" text-anchor="end" font-size="11" fill="var(--muted)">${{formatter(value)}}</text>
+        `;
+      }}).join("");
+
+      const xTicks = [0, 0.25, 0.5, 0.75, 1].map(tick => {{
+        const xx = margin.left + tick * plotWidth;
+        const value = Math.round(maxX * tick);
+        return `
+          <line x1="${{xx}}" y1="${{margin.top}}" x2="${{xx}}" y2="${{height - margin.bottom}}" stroke="var(--grid)" stroke-dasharray="4 6" />
+          <text x="${{xx}}" y="${{height - 10}}" text-anchor="middle" font-size="11" fill="var(--muted)">${{value}} ms</text>
+        `;
+      }}).join("");
+
+      const paths = runs.map((run, i) => {{
+        const samples = run.system_samples.filter(sample => accessor(sample) != null);
+        if (!samples.length) return "";
+        const pathData = samples.map((sample, idx) => `${{idx === 0 ? "M" : "L"}} ${{x(sample.elapsed_ms)}} ${{y(accessor(sample))}}`).join(" ");
+        const color = runColors[i % runColors.length];
+        return `<path d="${{pathData}}" fill="none" stroke="${{color}}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />`;
+      }}).join("");
+
+      const legend = runs.map((run, i) => {{
+        const color = runColors[i % runColors.length];
+        const yy = margin.top + i * 22;
+        return `
+          <g transform="translate(${{width - margin.right + 15}}, ${{yy}})">
+            <rect width="12" height="12" rx="3" fill="${{color}}" />
+            <text x="20" y="10" font-size="11" font-weight="600" fill="var(--ink)">DAG ${{i + 1}}: ${{escapeHtml(run.dag_file)}}</text>
+          </g>
+        `;
+      }}).join("");
+
+      return `
+        <svg viewBox="0 0 ${{width}} ${{height}}" aria-label="${{label}} comparison chart">
+          <text x="${{margin.left}}" y="20" font-size="16" font-weight="700" fill="var(--ink)">${{label}} Comparison</text>
+          ${{grid}}
+          ${{xTicks}}
+          <line x1="${{margin.left}}" y1="${{height - margin.bottom}}" x2="${{width - margin.right}}" y2="${{height - margin.bottom}}" stroke="var(--ink)" />
+          <line x1="${{margin.left}}" y1="${{margin.top}}" x2="${{margin.left}}" y2="${{height - margin.bottom}}" stroke="var(--ink)" />
+          ${{paths}}
+          ${{legend}}
+        </svg>
+      `;
+    }}
+
+    function renderComparePage(runs) {{
+      return `
+        <section class="page" data-page="compare">
+          <div class="summary">
+            ${{runs.map((run, i) => `
+              <div class="card">
+                <div class="label" style="color: ${{runColors[i % runColors.length]}}">DAG ${{i + 1}}</div>
+                <div class="value" style="font-size: 18px;">${{escapeHtml(run.dag_file)}}</div>
+                <div style="font-size: 14px; margin-top: 5px; color: var(--muted);">${{formatMs(run.duration_ms)}}</div>
+              </div>
+            `).join("")}}
+          </div>
+
+          <div class="section-stack">
+            <details class="panel" open>
+              <summary><h2>Resource Comparison</h2></summary>
+              <div class="subtle">Overlaid CPU and memory metrics for all DAG runs. Aligned by start time (T=0).</div>
+              <div class="chart-stack">
+                <div class="svg-wrap">${{buildCompareTimelineSvg(runs, sample => sample.cpu_percent, "CPU usage", value => `${{value.toFixed(1)}}%`)}}</div>
+                <div class="svg-wrap">${{buildCompareTimelineSvg(runs, sample => sample.memory_bytes, "Memory usage", value => formatBytes(value))}}</div>
+              </div>
+            </details>
+          </div>
+        </section>
+      `;
+    }}
+
     const tabs = document.getElementById("tabs");
     const pages = document.getElementById("pages");
-    tabs.innerHTML = report.runs.map((run, index) => `
+
+    let tabHtml = report.runs.map((run, index) => `
       <button class="tab${{index === 0 ? " active" : ""}}" data-index="${{index}}">
         DAG ${{index + 1}}
       </button>
     `).join("");
-    pages.innerHTML = report.runs.map(renderRun).join("");
+
+    let pageHtml = report.runs.map(renderRun).join("");
+
+    if (report.runs.length > 1) {{
+      tabHtml += `
+        <button class="tab" data-index="compare">
+          Compare
+        </button>
+      `;
+      pageHtml += renderComparePage(report.runs);
+    }}
+
+    tabs.innerHTML = tabHtml;
+    pages.innerHTML = pageHtml;
 
     const tabEls = [...document.querySelectorAll(".tab")];
     const pageEls = [...document.querySelectorAll(".page")];
-    pageEls.forEach((pageEl, index) => renderDagCanvas(pageEl, report.runs[index], index));
+
+    report.runs.forEach((_, index) => {{
+      renderDagCanvas(pageEls[index], report.runs[index], index);
+    }});
+
     tabEls.forEach(tab => {{
       tab.addEventListener("click", () => {{
-        const index = Number(tab.dataset.index);
-        tabEls.forEach((el, idx) => el.classList.toggle("active", idx === index));
-        pageEls.forEach((el, idx) => el.classList.toggle("active", idx === index));
+        const targetId = tab.dataset.index;
+        tabEls.forEach(el => el.classList.toggle("active", el.dataset.index === targetId));
+        pageEls.forEach(el => {{
+          el.classList.toggle("active", el.dataset.page === targetId);
+        }});
       }});
     }});
 
