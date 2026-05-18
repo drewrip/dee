@@ -22,7 +22,7 @@ def run_cmd(cmd, cwd=None, env=None, capture=True):
     return result.stdout
 
 
-def generate_connections_json(src_project_dir, dest_project_dir, requested_db_type, max_mem=None):
+def generate_connections_json(src_project_dir, dest_project_dir, requested_db_type, max_mem=None, threads=None):
     profiles_path = src_project_dir / "profiles.yml"
     if not profiles_path.exists():
         return None, None
@@ -77,6 +77,8 @@ def generate_connections_json(src_project_dir, dest_project_dir, requested_db_ty
             dee_cfg["num_connections"] = output_cfg.get("threads", 1)
             if max_mem:
                 dee_cfg["max_memory"] = max_mem
+            if threads:
+                dee_cfg["threads"] = threads
         elif db_type == "postgres":
             target_key = "postgres"
             dee_cfg["host"] = output_cfg.get("host")
@@ -111,9 +113,13 @@ def benchmark(
     deep_dive=False,
     n=5,
     max_mem=None,
+    threads=None,
     omp_top=None,
     omp_cost=None,
     omp_node_centrality=None,
+    enable=None,
+    disable=None,
+    hmp_no_plan_dups=False,
 ):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
@@ -160,7 +166,7 @@ def benchmark(
         )
 
         connections_json, target = generate_connections_json(
-            src_project_path, dest_project_path, db_type, max_mem=max_mem
+            src_project_path, dest_project_path, db_type, max_mem=max_mem, threads=threads
         )
         if not connections_json:
             print(
@@ -188,36 +194,21 @@ def benchmark(
             opt_cmd.extend(["--omp-cost", omp_cost])
         if omp_node_centrality:
             opt_cmd.extend(["--omp-node-centrality", omp_node_centrality])
+        if enable:
+            opt_cmd.extend(["--enable", enable])
+        if disable:
+            opt_cmd.extend(["--disable", disable])
+        if hmp_no_plan_dups:
+            opt_cmd.append("--hmp-no-plan-dups")
 
         opt_stats_json = run_cmd(opt_cmd)
         opt_stats = json.loads(opt_stats_json)
 
-        if deep_dive:
-            print(
-                f"Deep dive: Running {n} iterations for original and optimized versions..."
-            )
-
-            def run_multiple_times(dag_path, iterations):
-                warmup_iters = int(iterations * 0.1)
-                if warmup_iters > 0:
-                    print(f"  Running {warmup_iters} warmup iterations...")
-                    for _ in range(warmup_iters):
-                        run_cmd(
-                            [
-                                dee_cli_path,
-                                "run",
-                                "--connections",
-                                connections_json,
-                                "--target",
-                                target,
-                                str(dag_path),
-                            ]
-                        )
-
-                times = []
-                for i in range(iterations):
-                    print(f"  Iteration {i + 1}/{iterations}...")
-                    start = time.time()
+        def run_multiple_times(dag_path, iterations):
+            warmup_iters = int(iterations * 0.1)
+            if warmup_iters > 0:
+                print(f"  Running {warmup_iters} warmup iterations...")
+                for _ in range(warmup_iters):
                     run_cmd(
                         [
                             dee_cli_path,
@@ -229,53 +220,49 @@ def benchmark(
                             str(dag_path),
                         ]
                     )
-                    times.append(time.time() - start)
-                return times
 
-            original_times = run_multiple_times(dag_json_path, n)
-            optimized_times = run_multiple_times(opt_dag_json_path, n)
+            times = []
+            for i in range(iterations):
+                print(f"  Iteration {i + 1}/{iterations}...")
+                start = time.time()
+                run_cmd(
+                    [
+                        dee_cli_path,
+                        "run",
+                        "--connections",
+                        connections_json,
+                        "--target",
+                        target,
+                        str(dag_path),
+                    ]
+                )
+                times.append(time.time() - start)
+            return times
 
-            original_time = sum(original_times) / n
-            optimized_time = sum(optimized_times) / n
+        num_iters = n if deep_dive else 1
+        print(
+            f"Running {num_iters} iteration(s) for original and optimized versions..."
+        )
 
-            results.append(
-                {
-                    "project": project_name,
-                    "original_time": original_time,
-                    "optimized_time": optimized_time,
-                    "speedup": original_time / optimized_time
-                    if optimized_time > 0
-                    else 0,
-                    "original_distribution": original_times,
-                    "optimized_distribution": optimized_times,
-                    "opt_stats": opt_stats,
-                }
-            )
-        else:
-            # Extract values from OMPPass stats
-            omp_stats = opt_stats.get("OMPPass", {})
-            # New format uses baseline_value/best_value
-            # Old format used baseline_runtime/best_runtime
-            original_val = float(omp_stats.get("baseline_value") or omp_stats.get("baseline_runtime", 0))
-            optimized_val = float(omp_stats.get("best_value") or omp_stats.get("best_runtime", 0))
+        original_times = run_multiple_times(dag_json_path, num_iters)
+        optimized_times = run_multiple_times(opt_dag_json_path, num_iters)
 
-            # If the metric is Runtime, these are milliseconds.
-            # For Cost, we'll still treat them similarly for the sake of the speedup ratio,
-            # but note that the absolute values in original_time/optimized_time might not be seconds.
-            original_time = original_val / 1000.0
-            optimized_time = optimized_val / 1000.0
+        original_time = sum(original_times) / num_iters
+        optimized_time = sum(optimized_times) / num_iters
 
-            results.append(
-                {
-                    "project": project_name,
-                    "original_time": original_time,
-                    "optimized_time": optimized_time,
-                    "speedup": original_time / optimized_time
-                    if optimized_time > 0
-                    else 0,
-                    "opt_stats": opt_stats,
-                }
-            )
+        result = {
+            "project": project_name,
+            "original_time": original_time,
+            "optimized_time": optimized_time,
+            "speedup": original_time / optimized_time if optimized_time > 0 else 0,
+            "opt_stats": opt_stats,
+        }
+
+        if deep_dive:
+            result["original_distribution"] = original_times
+            result["optimized_distribution"] = optimized_times
+
+        results.append(result)
 
     return results
 
@@ -334,6 +321,11 @@ def main():
         help="Maximum memory for DuckDB connections (e.g., '10GB', '512MB'). Only available for duckdb.",
     )
     parser.add_argument(
+        "--threads",
+        type=int,
+        help="Maximum number of threads for DuckDB connections. Only available for duckdb.",
+    )
+    parser.add_argument(
         "--omp-top",
         type=int,
         help="Number of top views to consider for materialization in OMPPass",
@@ -348,10 +340,27 @@ def main():
         choices=["outdegree", "paths"],
         help="Node centrality metric for OMPPass (outdegree or paths)",
     )
+    parser.add_argument(
+        "--enable",
+        help="Comma-separated list of optimization passes to enable",
+    )
+    parser.add_argument(
+        "--disable",
+        help="Comma-separated list of optimization passes to disable",
+    )
+    parser.add_argument(
+        "--hmp-no-plan-dups",
+        action="store_true",
+        help="Disable duplicate operator counting within a single plan in HMPPass",
+    )
     args = parser.parse_args()
 
     if args.max_mem and args.db_type != "duckdb":
         print("Error: --max-mem is only supported for duckdb backend.")
+        exit(1)
+
+    if args.threads and args.db_type != "duckdb":
+        print("Error: --threads is only supported for duckdb backend.")
         exit(1)
 
     dag_bench = os.environ.get("DAG_BENCH")
@@ -375,9 +384,13 @@ def main():
         deep_dive=args.deep_dive,
         n=args.n,
         max_mem=args.max_mem,
+        threads=args.threads,
         omp_top=args.omp_top,
         omp_cost=args.omp_cost,
         omp_node_centrality=args.omp_node_centrality,
+        enable=args.enable,
+        disable=args.disable,
+        hmp_no_plan_dups=args.hmp_no_plan_dups,
     )
     visualize(results)
 
