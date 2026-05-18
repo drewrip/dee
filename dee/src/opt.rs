@@ -1,5 +1,6 @@
 pub mod cse;
 pub mod omp;
+pub mod hmp;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -15,6 +16,7 @@ use crate::{
     opt::{
         cse::CSEPass,
         omp::{OMPCentrality, OMPCostMetric, OMPPass},
+        hmp::HMPPass,
     },
 };
 
@@ -47,6 +49,8 @@ where
     run_cse_pass: bool,
     /// Optimal materialization plan
     run_omp_pass: bool,
+    /// Heuristic materialization plan
+    run_hmp_pass: bool,
     /// Logical rewriting
     run_lr_pass: bool,
     /// OMP top N
@@ -75,6 +79,7 @@ where
             engine,
             run_cse_pass: config.run_cse_pass,
             run_omp_pass: config.run_omp_pass,
+            run_hmp_pass: config.run_hmp_pass,
             run_lr_pass: config.run_lr_pass,
             omp_top: config.omp_top,
             omp_cost: config.omp_cost,
@@ -101,6 +106,16 @@ where
             }
         } else {
             debug!("skipping CSE pass");
+        }
+
+        if self.run_hmp_pass {
+            let mut pass: HMPPass<C, E> = HMPPass::new(self.conn.clone());
+            let res = pass.run(dag).await?;
+            if self.stats_on_passes {
+                stats.insert("HMPPass".to_string(), Arc::new(res));
+            }
+        } else {
+            debug!("skipping HMP pass");
         }
 
         if self.run_omp_pass {
@@ -132,6 +147,7 @@ where
 pub struct OptimizerConfig {
     run_cse_pass: bool,
     run_omp_pass: bool,
+    run_hmp_pass: bool,
     run_lr_pass: bool,
     omp_top: Option<usize>,
     omp_cost: OMPCostMetric,
@@ -141,8 +157,9 @@ pub struct OptimizerConfig {
 impl Default for OptimizerConfig {
     fn default() -> Self {
         OptimizerConfig {
-            run_cse_pass: false,
+            run_cse_pass: true,
             run_omp_pass: true,
+            run_hmp_pass: true,
             run_lr_pass: false,
             omp_top: None,
             omp_cost: OMPCostMetric::default(),
@@ -155,6 +172,31 @@ impl OptimizerConfig {
         Self::default()
     }
 
+    pub fn with_all_disabled(mut self) -> Self {
+        self.run_cse_pass = false;
+        self.run_omp_pass = false;
+        self.run_hmp_pass = false;
+        self.run_lr_pass = false;
+        self
+    }
+
+    pub fn with_all_enabled(mut self) -> Self {
+        self.run_cse_pass = true;
+        self.run_omp_pass = true;
+        self.run_hmp_pass = true;
+        self.run_lr_pass = false; // LR is still not implemented
+        self
+    }
+
+    pub fn set_pass(&mut self, name: &str, enabled: bool) {
+        match name.to_lowercase().as_str() {
+            "cse" => self.run_cse_pass = enabled,
+            "omp" => self.run_omp_pass = enabled,
+            "hmp" => self.run_hmp_pass = enabled,
+            _ => debug!("Unknown optimizer pass: {}", name),
+        }
+    }
+
     pub fn with_cse_pass(mut self) -> Self {
         self.run_cse_pass = true;
         self
@@ -162,6 +204,11 @@ impl OptimizerConfig {
 
     pub fn with_omp_pass(mut self) -> Self {
         self.run_omp_pass = true;
+        self
+    }
+
+    pub fn with_hmp_pass(mut self) -> Self {
+        self.run_hmp_pass = true;
         self
     }
 
