@@ -166,14 +166,20 @@ where
         }
         debug!("Analyzed {} materialized nodes", materialized_node_count);
 
-        // 3. Sort operators by total timing descending
-        let mut ranked_ops: Vec<_> = timing_map.into_iter().collect();
-        ranked_ops.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // 3. Calculate potential duplication time and sort operators by it descending
+        let mut ranked_ops: Vec<_> = timing_map.into_iter().map(|(sig, t)| {
+            let n = occurrence_map.get(&sig).cloned().unwrap_or(1) as f64;
+            let potential_duplication_time = if n > 0.0 { t - t/n } else { 0.0 };
+            (sig, t, potential_duplication_time)
+        }).collect();
+
+        ranked_ops.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
         if !ranked_ops.is_empty() {
-            debug!("Top 5 bottlenecks by total operator timing across all plans:");
-            for (i, (op, timing)) in ranked_ops.iter().take(5).enumerate() {
-                debug!("  {}. {:?} - {:.4}s (Found {} times)", i+1, op, timing, occurrence_map.get(op).unwrap_or(&0));
+            debug!("Top 5 bottlenecks by potential duplication time across all plans:");
+            for (i, (op, timing, pdt)) in ranked_ops.iter().take(5).enumerate() {
+                debug!("  {}. {:?} - PDT: {:.4}s (Total Timing: {:.4}s, Found {} times)", 
+                    i+1, op, pdt, timing, occurrence_map.get(op).unwrap_or(&0));
             }
         }
 
@@ -182,13 +188,14 @@ where
         let sorted_node_ids = dag.nodes.topological_sort();
         let mut node_to_materialize = None;
 
-        for (op_key, timing) in ranked_ops {
+        for (op_key, timing, pdt) in ranked_ops {
             let count = occurrence_map.get(&op_key).cloned().unwrap_or(0);
             if count <= 1 {
                 continue;
             }
 
-            debug!("Evaluating operator {:?} (timing={:.4}s, occurrences={})", op_key, timing, count);
+            debug!("Evaluating operator {:?} (PDT={:.4}s, timing={:.4}s, occurrences={})", op_key, pdt, timing, count);
+
 
             // Search through EXPLAIN plans of non-materialized nodes
             let mut candidate_node_id = None;
