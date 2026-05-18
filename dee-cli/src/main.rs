@@ -75,6 +75,11 @@ pub struct OptCommand {
     #[arg(long, default_value = "outdegree")]
     omp_node_centrality: CliOMPCentrality,
 
+    #[arg(long, value_delimiter = ',', conflicts_with = "disable")]
+    enable: Option<Vec<String>>,
+    #[arg(long, value_delimiter = ',', conflicts_with = "enable")]
+    disable: Option<Vec<String>>,
+
     dag_file: String,
 }
 

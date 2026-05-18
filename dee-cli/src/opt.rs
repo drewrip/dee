@@ -27,6 +27,18 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
 
     let mut config = OptimizerConfig::new().with_omp_top(opt_cmd.omp_top);
 
+    if let Some(enabled_passes) = opt_cmd.enable {
+        config = config.with_all_disabled();
+        for pass_name in enabled_passes {
+            config.set_pass(&pass_name, true);
+        }
+    } else if let Some(disabled_passes) = opt_cmd.disable {
+        config = config.with_all_enabled();
+        for pass_name in disabled_passes {
+            config.set_pass(&pass_name, false);
+        }
+    }
+
     if let Some(cost_metric) = opt_cmd.omp_cost {
         let metric = match cost_metric {
             crate::CliOMPCostMetric::Actual => dee::opt::omp::OMPCostMetric::Actual,
