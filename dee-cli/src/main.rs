@@ -80,6 +80,9 @@ pub struct OptCommand {
     #[arg(long, value_delimiter = ',', conflicts_with = "enable")]
     disable: Option<Vec<String>>,
 
+    #[arg(long, action)]
+    hmp_no_plan_dups: bool,
+
     dag_file: String,
 }
 

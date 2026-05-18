@@ -59,6 +59,8 @@ where
     omp_cost: OMPCostMetric,
     /// OMP node centrality metric
     omp_centrality: OMPCentrality,
+    /// HMP no plan dups
+    hmp_no_plan_dups: bool,
     /// Result stats
     stats_on_passes: bool,
 }
@@ -84,6 +86,7 @@ where
             omp_top: config.omp_top,
             omp_cost: config.omp_cost,
             omp_centrality: config.omp_centrality,
+            hmp_no_plan_dups: config.hmp_no_plan_dups,
             stats_on_passes: false,
         }
     }
@@ -109,7 +112,7 @@ where
         }
 
         if self.run_hmp_pass {
-            let mut pass: HMPPass<C, E> = HMPPass::new(self.conn.clone());
+            let mut pass: HMPPass<C, E> = HMPPass::new(self.conn.clone(), self.hmp_no_plan_dups);
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
                 stats.insert("HMPPass".to_string(), Arc::new(res));
@@ -145,13 +148,14 @@ where
 
 #[derive(Debug, Clone)]
 pub struct OptimizerConfig {
-    run_cse_pass: bool,
-    run_omp_pass: bool,
-    run_hmp_pass: bool,
-    run_lr_pass: bool,
-    omp_top: Option<usize>,
-    omp_cost: OMPCostMetric,
-    omp_centrality: OMPCentrality,
+    pub run_cse_pass: bool,
+    pub run_omp_pass: bool,
+    pub run_hmp_pass: bool,
+    pub run_lr_pass: bool,
+    pub omp_top: Option<usize>,
+    pub omp_cost: OMPCostMetric,
+    pub omp_centrality: OMPCentrality,
+    pub hmp_no_plan_dups: bool,
 }
 
 impl Default for OptimizerConfig {
@@ -164,6 +168,7 @@ impl Default for OptimizerConfig {
             omp_top: None,
             omp_cost: OMPCostMetric::default(),
             omp_centrality: OMPCentrality::default(),
+            hmp_no_plan_dups: false,
         }
     }
 }
@@ -229,6 +234,11 @@ impl OptimizerConfig {
 
     pub fn with_omp_centrality(mut self, centrality: OMPCentrality) -> Self {
         self.omp_centrality = centrality;
+        self
+    }
+
+    pub fn with_hmp_no_plan_dups(mut self, no_dups: bool) -> Self {
+        self.hmp_no_plan_dups = no_dups;
         self
     }
 }

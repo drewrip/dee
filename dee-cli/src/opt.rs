@@ -25,7 +25,9 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
     let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(opt_cmd.dag_file)?)?;
     let mut dag = Dag::try_from(dag_file)?;
 
-    let mut config = OptimizerConfig::new().with_omp_top(opt_cmd.omp_top);
+    let mut config = OptimizerConfig::new()
+        .with_omp_top(opt_cmd.omp_top)
+        .with_hmp_no_plan_dups(opt_cmd.hmp_no_plan_dups);
 
     if let Some(enabled_passes) = opt_cmd.enable {
         config = config.with_all_disabled();
