@@ -17,6 +17,7 @@ where
     E: Executor<C> + Send + Sync,
 {
     conn: Arc<C>,
+    no_plan_dups: bool,
     _phantom: PhantomData<E>,
 }
 
@@ -61,16 +62,23 @@ impl DuckDBPlan {
     fn collect_operator_stats(
         &self, 
         timing_map: &mut HashMap<OpKey, f64>,
+        occurrence_map: &mut HashMap<OpKey, usize>,
+        no_plan_dups: bool,
         plan_sigs: &mut HashSet<OpKey>
     ) {
         if let Some(sig) = self.get_sig() {
             if let Some(t) = self.operator_timing {
                 *timing_map.entry(sig.clone()).or_insert(0.0) += t;
             }
-            plan_sigs.insert(sig);
+            
+            if no_plan_dups {
+                plan_sigs.insert(sig);
+            } else {
+                *occurrence_map.entry(sig).or_insert(0) += 1;
+            }
         }
         for child in &self.children {
-            child.collect_operator_stats(timing_map, plan_sigs);
+            child.collect_operator_stats(timing_map, occurrence_map, no_plan_dups, plan_sigs);
         }
     }
 
@@ -94,9 +102,10 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    pub fn new(conn: Arc<C>) -> Self {
+    pub fn new(conn: Arc<C>, no_plan_dups: bool) -> Self {
         Self {
             conn,
+            no_plan_dups,
             _phantom: PhantomData,
         }
     }
@@ -132,7 +141,7 @@ where
         // 2. Build ranking of operators from EXPLAIN ANALYZE (Materialized nodes)
         debug!("Analyzing EXPLAIN ANALYZE plans from materialized nodes to find performance bottlenecks");
         let mut timing_map: HashMap<OpKey, f64> = HashMap::new();
-        let mut plan_counts: HashMap<OpKey, usize> = HashMap::new();
+        let mut occurrence_map: HashMap<OpKey, usize> = HashMap::new();
 
         let mut materialized_node_count = 0;
         for node in dag.nodes.nodes() {
@@ -141,10 +150,14 @@ where
                 if let Some(node_stat) = exec_stats.node_stats.get(&node.id) {
                     if let Some(plan_str) = &node_stat.plan {
                         if let Ok(plan) = serde_json::from_str::<DuckDBPlan>(plan_str) {
-                            let mut plan_sigs = HashSet::new();
-                            plan.collect_operator_stats(&mut timing_map, &mut plan_sigs);
-                            for sig in plan_sigs {
-                                *plan_counts.entry(sig).or_insert(0) += 1;
+                            if self.no_plan_dups {
+                                let mut plan_sigs = HashSet::new();
+                                plan.collect_operator_stats(&mut timing_map, &mut occurrence_map, true, &mut plan_sigs);
+                                for sig in plan_sigs {
+                                    *occurrence_map.entry(sig).or_insert(0) += 1;
+                                }
+                            } else {
+                                plan.collect_operator_stats(&mut timing_map, &mut occurrence_map, false, &mut HashSet::new());
                             }
                         }
                     }
@@ -160,7 +173,7 @@ where
         if !ranked_ops.is_empty() {
             debug!("Top 5 bottlenecks by total operator timing across all plans:");
             for (i, (op, timing)) in ranked_ops.iter().take(5).enumerate() {
-                debug!("  {}. {:?} - {:.4}s (Found in {} plans)", i+1, op, timing, plan_counts.get(op).unwrap_or(&0));
+                debug!("  {}. {:?} - {:.4}s (Found {} times)", i+1, op, timing, occurrence_map.get(op).unwrap_or(&0));
             }
         }
 
@@ -170,7 +183,7 @@ where
         let mut node_to_materialize = None;
 
         for (op_key, timing) in ranked_ops {
-            let count = plan_counts.get(&op_key).cloned().unwrap_or(0);
+            let count = occurrence_map.get(&op_key).cloned().unwrap_or(0);
             if count <= 1 {
                 continue;
             }
