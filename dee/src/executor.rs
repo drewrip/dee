@@ -204,6 +204,7 @@ where
                             if let Some(dir) = plans_dir {
                                 let rel_type = match tn.materialize {
                                     MaterializeMode::Table => "table",
+                                    MaterializeMode::TempTable => "temp_table",
                                     MaterializeMode::View => "view",
                                 };
                                 let filename = format!("{}_{}.json", tn.id, rel_type);
@@ -285,6 +286,11 @@ where
                 .drop_relation(MaterializeMode::Table, node.id.clone())
                 .await
                 .unwrap_or(0);
+            num_deleted += self
+                .conn
+                .drop_relation(MaterializeMode::TempTable, node.id.clone())
+                .await
+                .unwrap_or(0);
         }
         debug!("cleanup, {} relations dropped", num_deleted);
         Ok(num_deleted)
@@ -317,7 +323,7 @@ where
                         .await
                         .map_err(|e| ExecutorError::Exec(e.to_string()))?;
                 }
-                MaterializeMode::Table => {
+                MaterializeMode::Table | MaterializeMode::TempTable => {
                     let wrapped_query = format!(
                         "WITH __dee_dummy_scan_{} AS MATERIALIZED ({}) SELECT * FROM __dee_dummy_scan_{}",
                         i, node.query_text, i

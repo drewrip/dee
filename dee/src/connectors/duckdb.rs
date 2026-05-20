@@ -116,7 +116,7 @@ fn compute_duckdb_node_cost(node: &DuckDBExplainNode, in_dummy_cte: bool) -> f32
 
 fn materialize_mode_in_duckdb(mode: MaterializeMode) -> String {
     match mode {
-        MaterializeMode::Table => "TABLE".to_string(),
+        MaterializeMode::Table | MaterializeMode::TempTable => "TABLE".to_string(),
         MaterializeMode::View => "VIEW".to_string(),
     }
 }
@@ -253,7 +253,7 @@ impl Connector for DuckDBConnection {
                 })?;
                 Ok((res, Some(json_str)))
             }
-            MaterializeMode::Table => {
+            MaterializeMode::Table | MaterializeMode::TempTable => {
                 let temp_file = tempfile::Builder::new()
                     .suffix(".json")
                     .tempfile()

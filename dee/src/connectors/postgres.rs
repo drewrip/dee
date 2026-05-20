@@ -71,7 +71,7 @@ fn compute_postgres_node_cost(node: &PostgresExplainNode) -> f32 {
 
 fn materialize_mode_in_pg(mode: MaterializeMode) -> String {
     match mode {
-        MaterializeMode::Table => "TABLE".to_string(),
+        MaterializeMode::Table | MaterializeMode::TempTable => "TABLE".to_string(),
         MaterializeMode::View => "VIEW".to_string(),
     }
 }
@@ -119,7 +119,7 @@ impl Connector for PostgresConnection {
     ) -> Result<usize, ConnectorError> {
         let ddl_text = match relation_type {
             MaterializeMode::View => format!("CREATE OR REPLACE VIEW {} AS ({})", name, query_text),
-            MaterializeMode::Table => {
+            MaterializeMode::Table | MaterializeMode::TempTable => {
                 format!("CREATE TABLE {} AS ({})", name, query_text)
             }
         };

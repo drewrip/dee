@@ -213,7 +213,7 @@ impl Graph {
 
         let mut count = 0;
         if let Some(node) = self.g.get(node_id) {
-            if matches!(node.materialize, MaterializeMode::Table) {
+            if matches!(node.materialize, MaterializeMode::Table | MaterializeMode::TempTable) {
                 count += 1;
             }
         }

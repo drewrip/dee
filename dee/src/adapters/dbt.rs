@@ -86,7 +86,13 @@ impl From<DbtManifest> for DagFile {
                 .map(|dep_id| id_to_rel.get(dep_id).cloned().unwrap_or_else(|| dep_id.clone()))
                 .collect();
                 
-            let materialize = node.config.materialized.as_deref().map(|m| m == "table" || m == "incremental");
+            let materialize = node.config.materialized.as_deref().map(|m| {
+                if m == "table" || m == "incremental" {
+                    "table".to_string()
+                } else {
+                    "view".to_string()
+                }
+            });
             
             // Use relation_name as the ID so it matches what's used in queries
             let node_id = node.relation_name.clone().unwrap_or_else(|| id.clone());
