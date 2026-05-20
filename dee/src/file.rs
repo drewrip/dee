@@ -17,7 +17,7 @@ pub struct DagFileNode {
     pub id: String,
     pub query_text: String,
     pub depends_on: Vec<String>,
-    pub materialize: Option<bool>,
+    pub materialize: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

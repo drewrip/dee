@@ -6,7 +6,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use thiserror::Error;
 
 use crate::{
-    file::{DagColumn, DagFile, DagFileMetadata, DagFileNode, DagFileSource},
+    file::{DagFile, DagFileNode, DagFileSource},
     graph::Graph,
 };
 
@@ -18,10 +18,11 @@ pub enum FormatError {
 
 /// Interal DAG representation
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaterializeMode {
     View,
     Table,
+    TempTable,
 }
 
 impl MaterializeMode {
@@ -29,6 +30,17 @@ impl MaterializeMode {
         match self {
             MaterializeMode::View => "view",
             MaterializeMode::Table => "table",
+            MaterializeMode::TempTable => "temp_table",
+        }
+    }
+}
+
+impl From<String> for MaterializeMode {
+    fn from(value: String) -> Self {
+        match value.to_lowercase().as_str() {
+            "table" => MaterializeMode::Table,
+            "temp_table" => MaterializeMode::TempTable,
+            _ => MaterializeMode::View,
         }
     }
 }
@@ -75,12 +87,12 @@ impl From<DagFileNode> for TransformNode {
     fn from(value: DagFileNode) -> Self {
         // If materialize strategy isn't provided, default to view
         let materialize = match value.materialize {
-            Some(should_materialize) => {
-                if should_materialize {
-                    MaterializeMode::Table
-                } else {
-                    MaterializeMode::View
+            Some(s) => {
+                let mode = MaterializeMode::from(s);
+                if matches!(mode, MaterializeMode::TempTable) {
+                    log::warn!("Encountered 'temp_table' materialize mode in DAG file for node '{}'. This is intended for internal use and is probably not desired in a configuration file.", value.id);
                 }
+                mode
             }
             None => MaterializeMode::View,
         };
@@ -133,15 +145,11 @@ impl TryFrom<DagFile> for Dag {
 }
 
 fn transform_to_file_node(value: &TransformNode) -> DagFileNode {
-    let materialize = match value.materialize {
-        MaterializeMode::View => false,
-        MaterializeMode::Table => true,
-    };
     DagFileNode {
         id: value.id.clone(),
         query_text: value.query_text.clone(),
         depends_on: value.depends_on.clone().into_iter().collect(),
-        materialize: Some(materialize),
+        materialize: Some(value.materialize.as_str().to_string()),
     }
 }
 
@@ -162,7 +170,7 @@ impl From<Dag> for DagFile {
                     .schema
                     .flattened_fields()
                     .iter()
-                    .map(|f| DagColumn {
+                    .map(|f| crate::file::DagColumn {
                         name: f.name().clone(),
                         data_type: f.data_type().to_string(),
                     })
@@ -170,11 +178,38 @@ impl From<Dag> for DagFile {
             })
             .collect();
         DagFile {
-            metadata: Some(DagFileMetadata {
+            metadata: Some(crate::file::DagFileMetadata {
                 sql_dialect: Some(value.db.clone()),
             }),
             sources,
             nodes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file::DagFileNode;
+
+    #[test]
+    fn test_materialize_mode_from_string() {
+        assert_eq!(MaterializeMode::from("table".to_string()), MaterializeMode::Table);
+        assert_eq!(MaterializeMode::from("TABLE".to_string()), MaterializeMode::Table);
+        assert_eq!(MaterializeMode::from("temp_table".to_string()), MaterializeMode::TempTable);
+        assert_eq!(MaterializeMode::from("view".to_string()), MaterializeMode::View);
+        assert_eq!(MaterializeMode::from("unknown".to_string()), MaterializeMode::View);
+    }
+
+    #[test]
+    fn test_transform_node_from_dag_file_node() {
+        let dfn = DagFileNode {
+            id: "test".to_string(),
+            query_text: "SELECT 1".to_string(),
+            depends_on: vec![],
+            materialize: Some("temp_table".to_string()),
+        };
+        let tn = TransformNode::from(dfn);
+        assert_eq!(tn.materialize, MaterializeMode::TempTable);
     }
 }

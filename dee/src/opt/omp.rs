@@ -114,7 +114,7 @@ where
         };
 
         let plans: Vec<Vec<MaterializeMode>> = repeat_n(
-            [MaterializeMode::View, MaterializeMode::Table].into_iter(),
+            [MaterializeMode::View, MaterializeMode::TempTable].into_iter(),
             top_candidates.len(),
         )
         .multi_cartesian_product()
@@ -186,7 +186,7 @@ where
         let mut new_mats = vec![];
         for node in best_plan.clone().into_iter().enumerate() {
             let node_id = top_candidates.get(node.0).unwrap().0.clone();
-            if matches!(node.1, MaterializeMode::Table) {
+            if matches!(node.1, MaterializeMode::TempTable) {
                 new_mats.push(node_id.clone());
             }
             dag.nodes

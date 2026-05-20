@@ -246,7 +246,7 @@ where
         if let Some(node_id) = node_to_materialize {
             debug!("Heuristic complete: selected node '{}' for materialization", node_id);
             stats.insert("new_materialization".into(), node_id.clone());
-            dag.nodes.get_mut(node_id).unwrap().materialize = MaterializeMode::Table;
+            dag.nodes.get_mut(node_id).unwrap().materialize = MaterializeMode::TempTable;
         } else {
             debug!("Heuristic complete: no suitable node found to materialize");
             stats.insert("new_materialization".into(), "none".into());
