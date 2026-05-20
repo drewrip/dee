@@ -16,6 +16,8 @@ pub struct DagRunProfile {
     pub run_started_at: DateTime<Utc>,
     pub run_finished_at: DateTime<Utc>,
     pub duration_ms: i64,
+    pub estimated_cpu_seconds: f64,
+    pub time_executing_nodes_ms: i64,
     pub graph: DagGraphProfile,
     pub node_executions: Vec<NodeExecutionProfile>,
     pub system_samples: Vec<SystemUsageSample>,
@@ -164,12 +166,29 @@ pub fn build_dag_run_profile(dag_file: &str, dag: &Dag, exec_stats: &ExecStats) 
         .collect();
     node_executions.sort_by(|a, b| a.start.cmp(&b.start).then(a.node_id.cmp(&b.node_id)));
 
+    let time_executing_nodes_ms = node_executions.iter().map(|e| e.duration_ms).sum();
+
+    let mut estimated_cpu_seconds = 0.0;
+    if !exec_stats.system_samples.is_empty() {
+        for i in 0..exec_stats.system_samples.len() - 1 {
+            let s1 = &exec_stats.system_samples[i];
+            let s2 = &exec_stats.system_samples[i + 1];
+            if let (Some(cpu1), Some(cpu2)) = (s1.cpu_percent, s2.cpu_percent) {
+                let dt_s = (s2.elapsed_ms - s1.elapsed_ms) as f64 / 1000.0;
+                let avg_cpu = (cpu1 + cpu2) / 2.0 / 100.0;
+                estimated_cpu_seconds += avg_cpu * dt_s;
+            }
+        }
+    }
+
     DagRunProfile {
         dag_file: dag_file.to_string(),
         db: dag.db.clone(),
         run_started_at: exec_stats.start,
         run_finished_at: exec_stats.finish,
         duration_ms: exec_stats.duration.num_milliseconds(),
+        estimated_cpu_seconds,
+        time_executing_nodes_ms,
         graph: DagGraphProfile {
             nodes,
             sources,
@@ -198,11 +217,13 @@ pub fn render_profile_summary(report: &ProfileReport) -> String {
                 None => Some(v),
             });
         lines.push(format!(
-            "- {}: {} nodes, {} sources in {} ms{}{}",
+            "- {}: {} nodes, {} sources in {} ms, est. cpu {:.3}s, node exec {} ms{}{}",
             run.dag_file,
             run.graph.nodes.len(),
             run.graph.sources.len(),
             run.duration_ms,
+            run.estimated_cpu_seconds,
+            run.time_executing_nodes_ms,
             peak_memory
                 .map(|v| format!(", peak memory {}", format_bytes(v)))
                 .unwrap_or_default(),
@@ -653,6 +674,83 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
     .back-to-top:hover {{
       transform: translateY(-4px);
       box-shadow: 0 12px 28px rgba(0,0,0,0.2);
+    }}
+
+    .compare-table {{
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      margin-top: 10px;
+    }}
+    .compare-table th, .compare-table td {{
+      padding: 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--grid);
+    }}
+    .compare-table th {{
+      background: rgba(248, 250, 252, 0.8);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      font-weight: 700;
+    }}
+    .compare-row:hover td {{
+      background: rgba(0,0,0,0.02);
+    }}
+    .compare-label {{
+      font-weight: 700;
+      color: var(--ink);
+      width: 200px;
+    }}
+    .compare-value {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+    }}
+    .compare-delta {{
+      font-size: 11px;
+      margin-left: 6px;
+      font-weight: 600;
+    }}
+    .delta-pos {{ color: #ef4444; }}
+    .delta-neg {{ color: #10b981; }}
+    .delta-neutral {{ color: var(--muted); }}
+    
+    .baseline-selector {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--grid);
+      background: white;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      transition: all 0.2s;
+    }}
+    .baseline-selector:hover {{
+      border-color: var(--muted);
+    }}
+    .baseline-selector.active {{
+      background: var(--ink);
+      color: white;
+      border-color: var(--ink);
+    }}
+    .baseline-tag {{
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--ink);
+      color: white;
+      font-size: 9px;
+      text-transform: uppercase;
+      font-weight: 800;
+      margin-left: 8px;
+      vertical-align: middle;
+    }}
+    .compare-col-highlight {{
+      background: rgba(15, 23, 42, 0.03) !important;
     }}
 
     @media (max-width: 1100px) {{
@@ -1192,6 +1290,8 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
             <div class="card"><div class="label">Nodes</div><div class="value">${{run.graph.nodes.length}}</div></div>
             <div class="card"><div class="label">Sources</div><div class="value">${{run.graph.sources.length}}</div></div>
             <div class="card"><div class="label">Runtime</div><div class="value">${{formatMs(run.duration_ms)}}</div></div>
+            <div class="card"><div class="label">Node Exec Time</div><div class="value">${{formatMs(run.time_executing_nodes_ms)}}</div></div>
+            <div class="card"><div class="label">Est. CPU Seconds</div><div class="value">${{run.estimated_cpu_seconds.toFixed(3)}}s</div></div>
             <div class="card"><div class="label">Peak memory</div><div class="value">${{peakMemory ? formatBytes(peakMemory) : "n/a"}}</div></div>
             <div class="card"><div class="label">Peak CPU</div><div class="value">${{peakCpu ? `${{peakCpu.toFixed(1)}}%` : "n/a"}}</div></div>
           </div>
@@ -1423,17 +1523,65 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
     }}
 
     function renderComparePage(runs) {{
+      const metrics = [
+        {{ label: "Runtime", key: "duration_ms", formatter: formatMs, type: "time" }},
+        {{ label: "Node Exec Time", key: "time_executing_nodes_ms", formatter: formatMs, type: "time" }},
+        {{ label: "Est. CPU Seconds", key: "estimated_cpu_seconds", formatter: (v) => `${{v.toFixed(3)}}s`, type: "cpu" }},
+        {{ label: "Peak Memory", key: "peak_memory", formatter: formatBytes, type: "memory" }},
+        {{ label: "Peak CPU", key: "peak_cpu", formatter: (v) => `${{v.toFixed(1)}}%`, type: "percent" }},
+      ];
+
+      const headerCells = runs.map((run, i) => `
+        <th data-run-index="${{i}}">
+          <div style="color: ${{runColors[i % runColors.length]}}; margin-bottom: 8px;">DAG ${{i + 1}}</div>
+          <div style="font-size: 14px; color: var(--ink); margin-bottom: 12px; font-weight: 700;">${{escapeHtml(run.dag_file)}}</div>
+          <button class="baseline-selector" data-run-index="${{i}}" onclick="updateBaseline(${{i}})">
+            Set as Baseline
+          </button>
+        </th>
+      `).join("");
+
+      const rows = metrics.map(metric => `
+        <tr class="compare-row" data-metric="${{metric.key}}">
+          <td class="compare-label">${{metric.label}}</td>
+          ${{runs.map((run, i) => {{
+            let value;
+            if (metric.key === "peak_memory") {{
+              value = run.system_samples.reduce((acc, sample) => sample.memory_bytes == null ? acc : Math.max(acc, sample.memory_bytes), 0);
+            }} else if (metric.key === "peak_cpu") {{
+              value = run.system_samples.reduce((acc, sample) => sample.cpu_percent == null ? acc : Math.max(acc, sample.cpu_percent), 0);
+            }} else {{
+              value = run[metric.key];
+            }}
+            return `
+              <td data-run-index="${{i}}" data-raw-value="${{value}}">
+                <div class="compare-value">${{metric.formatter(value)}}</div>
+                <div class="compare-delta" data-delta-for="${{i}}"></div>
+              </td>
+            `;
+          }}).join("")}}
+        </tr>
+      `).join("");
+
       return `
         <section class="page" data-page="compare">
-          <div class="summary">
-            ${{runs.map((run, i) => `
-              <div class="card">
-                <div class="label" style="color: ${{runColors[i % runColors.length]}}">DAG ${{i + 1}}</div>
-                <div class="value" style="font-size: 18px;">${{escapeHtml(run.dag_file)}}</div>
-                <div style="font-size: 14px; margin-top: 5px; color: var(--muted);">${{formatMs(run.duration_ms)}}</div>
-              </div>
-            `).join("")}}
-          </div>
+          <details class="panel" open>
+            <summary><h2>Core Metrics Comparison</h2></summary>
+            <div class="subtle">Compare performance metrics side-by-side. Select a baseline DAG to see relative improvements or regressions.</div>
+            <div class="svg-wrap" style="padding: 0; overflow-x: auto;">
+              <table class="compare-table">
+                <thead>
+                  <tr>
+                    <th style="width: 200px;">Metric</th>
+                    ${{headerCells}}
+                  </tr>
+                </thead>
+                <tbody>
+                  ${{rows}}
+                </tbody>
+              </table>
+            </div>
+          </details>
 
           <div class="section-stack">
             <details class="panel" open>
@@ -1471,6 +1619,67 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
 
     tabs.innerHTML = tabHtml;
     pages.innerHTML = pageHtml;
+
+    function updateBaseline(baselineIndex) {{
+      const baselineSelectors = document.querySelectorAll('.baseline-selector');
+      baselineSelectors.forEach(s => {{
+        const idx = parseInt(s.dataset.runIndex);
+        s.classList.toggle('active', idx === baselineIndex);
+        s.innerText = idx === baselineIndex ? 'Baseline' : 'Set as Baseline';
+        
+        // Add/remove baseline tag in header
+        const th = s.closest('th');
+        let tag = th.querySelector('.baseline-tag');
+        if (idx === baselineIndex) {{
+          if (!tag) {{
+            tag = document.createElement('span');
+            tag.className = 'baseline-tag';
+            tag.innerText = 'BASELINE';
+            th.querySelector('div:nth-child(2)').appendChild(tag);
+          }}
+        }} else if (tag) {{
+          tag.remove();
+        }}
+
+        // Highlight column
+        const table = th.closest('table');
+        const cells = table.querySelectorAll(`[data-run-index="${{idx}}"]`);
+        cells.forEach(c => c.classList.toggle('compare-col-highlight', idx === baselineIndex));
+      }});
+
+      // Update deltas
+      const rows = document.querySelectorAll('.compare-row');
+      rows.forEach(row => {{
+        const baselineCell = row.querySelector(`td[data-run-index="${{baselineIndex}}"]`);
+        const baselineValue = parseFloat(baselineCell.dataset.rawValue);
+
+        const deltaCells = row.querySelectorAll('.compare-delta');
+        deltaCells.forEach(deltaCell => {{
+          const runIdx = parseInt(deltaCell.dataset.deltaFor);
+          if (runIdx === baselineIndex) {{
+            deltaCell.innerText = '';
+            return;
+          }}
+
+          const cell = row.querySelector(`td[data-run-index="${{runIdx}}"]`);
+          const value = parseFloat(cell.dataset.rawValue);
+          
+          if (baselineValue === 0) {{
+            deltaCell.innerText = '';
+            return;
+          }}
+
+          const pct = ((value - baselineValue) / baselineValue) * 100;
+          const sign = pct > 0 ? '+' : '';
+          deltaCell.innerText = `(${{sign}}${{pct.toFixed(1)}}%)`;
+          deltaCell.className = 'compare-delta ' + (pct > 0.1 ? 'delta-pos' : (pct < -0.1 ? 'delta-neg' : 'delta-neutral'));
+        }});
+      }});
+    }}
+
+    if (report.runs.length > 1) {{
+      updateBaseline(0);
+    }}
 
     const tabEls = [...document.querySelectorAll(".tab")];
     const pageEls = [...document.querySelectorAll(".page")];
