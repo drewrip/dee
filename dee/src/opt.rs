@@ -4,7 +4,7 @@ pub mod hmp;
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use log::debug;
+use log::{debug, warn};
 
 use thiserror::Error;
 
@@ -179,7 +179,7 @@ impl OptimizerConfig {
         match name.to_lowercase().as_str() {
             "omp" => self.run_omp_pass = enabled,
             "hmp" => self.run_hmp_pass = enabled,
-            _ => debug!("Unknown optimizer pass: {}", name),
+            _ => warn!("Unknown optimizer pass: {}", name),
         }
     }
 
