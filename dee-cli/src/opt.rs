@@ -18,10 +18,10 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
     info!("Optimizing DAG: {}", opt_cmd.dag_file);
 
     let connections_files: HashMap<String, Connection> =
-        serde_json::from_str(&fs::read_to_string(opt_cmd.connections)?)?;
+        serde_json::from_str(&fs::read_to_string(&opt_cmd.connections)?)?;
     let target_connection = connections_files
         .get(&opt_cmd.target)
-        .expect("target connection not found");
+        .ok_or_else(|| format!("connection '{}' not found in '{}'", opt_cmd.target, opt_cmd.connections))?;
     let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(opt_cmd.dag_file)?)?;
     let mut dag = Dag::try_from(dag_file)?;
 
@@ -77,16 +77,16 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
         let mut buf = Vec::new();
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
         let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-        opt_stats.serialize(&mut ser).unwrap();
-        let stats_str = String::from_utf8(buf).unwrap();
+        opt_stats.serialize(&mut ser)?;
+        let stats_str = String::from_utf8(buf)?;
         println!("{}", stats_str);
     }
     let new_dag_file: DagFile = DagFile::from(dag);
     let mut buf = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-    new_dag_file.serialize(&mut ser).unwrap();
-    let out_str = String::from_utf8(buf).unwrap();
+    new_dag_file.serialize(&mut ser)?;
+    let out_str = String::from_utf8(buf)?;
     if let Some(output) = opt_cmd.output {
         fs::write(output, out_str)?;
     } else {

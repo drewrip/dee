@@ -19,7 +19,7 @@ pub async fn run(run_cmd: RunCommand) -> Result<(), Box<dyn std::error::Error>> 
         serde_json::from_str(&fs::read_to_string(&run_cmd.connections)?)?;
     let target_connection = connections_files
         .get(&run_cmd.target)
-        .expect("target connection not found");
+        .ok_or_else(|| format!("connection '{}' not found in '{}'", run_cmd.target, run_cmd.connections))?;
     let profiling_enabled = run_cmd.profile
         || run_cmd.profile_dump.is_some()
         || run_cmd.profile_viz.is_some();
