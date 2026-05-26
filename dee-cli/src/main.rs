@@ -101,9 +101,16 @@ pub struct ConvertCommand {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() {
     env_logger::init();
     let args = CliArgs::parse();
+    if let Err(e) = run(args).await {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run(args: CliArgs) -> Result<(), Box<dyn Error>> {
     match args.command {
         CliCommand::Run(run_cmd) => run::run(run_cmd).await?,
         CliCommand::Opt(opt_cmd) => opt::opt(opt_cmd).await?,
@@ -121,8 +128,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let mut buf = Vec::new();
                 let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
                 let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-                dag_file.serialize(&mut ser).unwrap();
-                let out_str = String::from_utf8(buf).unwrap();
+                dag_file.serialize(&mut ser)?;
+                let out_str = String::from_utf8(buf)?;
                 if let Some(output) = convert_cmd.output {
                     fs::write(output, out_str)?;
                 } else {
