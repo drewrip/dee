@@ -79,12 +79,12 @@ where
                 .run(dag)
                 .await
                 .map(|r| r.duration.num_milliseconds() as f32)
-                .map_err(|_| OptimizerError::Exec("couldn't get baseline runtime".to_string()))?,
+                .map_err(|e| OptimizerError::Exec(format!("couldn't get baseline runtime: {e}")))?,
             OMPCostMetric::Estimate => self
                 .engine
                 .cost(dag)
                 .await
-                .map_err(|_| OptimizerError::Exec("couldn't get baseline cost".to_string()))?
+                .map_err(|e| OptimizerError::Exec(format!("couldn't get baseline cost: {e}")))?
                 .ok_or(OptimizerError::Exec(
                     "no cost estimate available".to_string(),
                 ))?,
