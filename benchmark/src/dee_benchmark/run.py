@@ -369,7 +369,7 @@ def main():
         exit(1)
 
     dee_root = os.environ.get("DEE_PATH", os.getcwd())
-    dee_cli = os.path.abspath(os.path.join(dee_root, "target/debug/dee-cli"))
+    dee_cli = os.path.abspath(os.path.join(dee_root, "target/release/dee-cli"))
     if not os.path.exists(dee_cli):
         print(
             f"Error: dee-cli not found at {dee_cli}. Please build the project or set DEE_PATH."
