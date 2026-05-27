@@ -44,6 +44,10 @@ pub struct RunCommand {
 #[derive(Args)]
 pub struct DrawCommand {
     dag_file: String,
+    #[arg(long, action)]
+    dot: bool,
+    #[arg(short, long)]
+    output: Option<String>,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -111,8 +115,17 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn Error>> {
         CliCommand::Draw(draw_cmd) => {
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(draw_cmd.dag_file)?)?;
             let dag = Dag::try_from(dag_file)?;
-            let dotfile = dag.nodes.draw();
-            println!("{}", dotfile);
+            if draw_cmd.dot {
+                println!("{}", dag.nodes.draw());
+            } else {
+                let source_names: Vec<String> =
+                    dag.sources.iter().map(|s| s.name.clone()).collect();
+                let svg = dag.nodes.draw_svg(&source_names);
+                match draw_cmd.output {
+                    Some(path) => fs::write(path, svg)?,
+                    None => print!("{}", svg),
+                }
+            }
         }
         CliCommand::Convert(convert_cmd) => match convert_cmd.format {
             ConvertFormat::Dbt => {
