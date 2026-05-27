@@ -270,6 +270,8 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       --view-soft: rgba(15,118,110,0.14);
       --source: #d97706;
       --source-soft: rgba(245,158,11,0.14);
+      --temp-table: #7c3aed;
+      --temp-table-soft: rgba(124,58,237,0.14);
       --accent: #0f172a;
       --cpu: #ef4444;
       --mem: #8b5cf6;
@@ -485,6 +487,7 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
     .pill.table {{ background: var(--table-soft); color: var(--table); border-color: rgba(37,99,235,0.16); }}
     .pill.view {{ background: var(--view-soft); color: var(--view); border-color: rgba(15,118,110,0.16); }}
     .pill.source {{ background: var(--source-soft); color: #b45309; border-color: rgba(217,119,6,0.18); }}
+    .pill.temp_table {{ background: var(--temp-table-soft); color: var(--temp-table); border-color: rgba(124,58,237,0.16); }}
     .detail-grid {{ display: grid; gap: 12px; }}
     .detail-box {{
       border-radius: 16px;
@@ -532,6 +535,7 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
     }}
     .node-tag.table {{ background: var(--table-soft); color: var(--table); }}
     .node-tag.view {{ background: var(--view-soft); color: var(--view); }}
+    .node-tag.temp_table {{ background: var(--temp-table-soft); color: var(--temp-table); }}
     .section-stack {{ display: grid; gap: 18px; }}
     .chart-stack {{ display: grid; gap: 14px; }}
     .svg-wrap {{
@@ -1131,9 +1135,12 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
 
         const info = run.graph.nodes.find((item) => item.id === node.data.id);
         const exec = run.node_executions.find((item) => item.node_id === node.data.id);
-        const isTable = info.materialization === "table";
-        const fill = isTable ? "rgba(37, 99, 235, 0.14)" : "rgba(15, 118, 110, 0.14)";
-        const stroke = isTable ? "#2563eb" : "#0f766e";
+        const fill = info.materialization === "table" ? "rgba(37, 99, 235, 0.14)"
+          : info.materialization === "temp_table" ? "rgba(124, 58, 237, 0.14)"
+          : "rgba(15, 118, 110, 0.14)";
+        const stroke = info.materialization === "table" ? "#2563eb"
+          : info.materialization === "temp_table" ? "#7c3aed"
+          : "#0f766e";
         const runtime = exec ? `${{exec.duration_ms}} ms` : "runtime unavailable";
         const nameLines = wrapTextLines(info.id, 23, 2);
         const metaLines = wrapTextLines(
@@ -1149,11 +1156,12 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
           .attr("rx", 22)
           .attr("fill", fill)
           .attr("stroke", stroke)
-          .attr("stroke-width", isTable ? 2.5 : 2);
+          .attr("stroke-width", info.materialization === "table" ? 2.5 : 2);
+        const badgeWidth = {{ table: 66, view: 52, temp_table: 104 }}[info.materialization] || 66;
         group.append("rect")
           .attr("x", 14)
           .attr("y", 14)
-          .attr("width", 66)
+          .attr("width", badgeWidth)
           .attr("height", 22)
           .attr("rx", 11)
           .attr("fill", fill);
@@ -1258,7 +1266,9 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
         const start = new Date(row.start).getTime() - new Date(run.run_started_at).getTime();
         const duration = Math.max(row.duration_ms, 4);
         const node = nodesById[row.node_id];
-        const fill = node.materialization === "table" ? "rgba(37,99,235,0.78)" : "rgba(15,118,110,0.78)";
+        const fill = node.materialization === "table" ? "rgba(37,99,235,0.78)"
+          : node.materialization === "temp_table" ? "rgba(124,58,237,0.78)"
+          : "rgba(15,118,110,0.78)";
         return `
           <text x="${{margin.left - 12}}" y="${{top + 14}}" text-anchor="end" font-size="12" fill="var(--ink)">${{escapeHtml(row.node_id)}}</text>
           <rect x="${{x(start)}}" y="${{top}}" width="${{Math.max((duration / maxX) * plotWidth, 4)}}" height="20" rx="8" fill="${{fill}}" />
@@ -1301,6 +1311,7 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
             <div class="legend">
               <span><span class="swatch" style="background: var(--table)"></span>Table nodes</span>
               <span><span class="swatch" style="background: var(--view)"></span>View nodes</span>
+              <span><span class="swatch" style="background: var(--temp-table)"></span>Temp table nodes</span>
               <span><span class="swatch" style="background: var(--source)"></span>Source tables</span>
             </div>
             <div class="dag-layout" data-run-index="${{index}}">
@@ -1409,8 +1420,7 @@ pub fn render_profile_html(report: &ProfileReport) -> Result<String, serde_json:
       const exec = run.node_executions.find(item => item.node_id === nodeId);
       const downstream = run.graph.edges.filter(edge => edge.from === nodeId).map(edge => edge.to);
       const upstream = node.depends_on;
-      const isTable = node.materialization === "table";
-      const hasPlan = isTable && exec && exec.plan;
+      const hasPlan = (node.materialization === "table" || node.materialization === "temp_table") && exec && exec.plan;
       
       container.innerHTML = `
         <div class="detail-name">${{escapeHtml(node.id)}}</div>

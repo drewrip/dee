@@ -74,7 +74,7 @@ def generate_connections_json(src_project_dir, dest_project_dir, requested_db_ty
                     )
 
                 dee_cfg["database"] = str(dest_db_path.absolute())
-            dee_cfg["num_connections"] = output_cfg.get("threads", 1)
+            dee_cfg["num_connections"] = 16
             if max_mem:
                 dee_cfg["max_memory"] = max_mem
             if threads:
