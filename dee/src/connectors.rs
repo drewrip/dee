@@ -51,10 +51,6 @@ pub trait Connector {
 
     async fn get_schema(&self, name: String) -> Option<Result<SchemaRef, ConnectorError>>;
 
-    async fn cost(&self, _query: String) -> Result<Option<f32>, ConnectorError> {
-        Ok(None)
-    }
-
     async fn sample_system_cpu_usage(&self) -> Result<Option<f64>, ConnectorError> {
         Ok(None)
     }

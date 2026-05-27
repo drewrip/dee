@@ -8,7 +8,7 @@ use duckdb::{Config, DuckdbConnectionManager, params};
 use log::debug;
 use r2d2::Pool;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, process::Command, sync::Arc, time::Duration};
+use std::{path::PathBuf, process::Command, sync::Arc, time::Duration};
 use tempfile;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -47,71 +47,6 @@ impl DuckDBConfig {
 
 pub struct DuckDBConnection {
     pub pool: Pool<DuckdbConnectionManager>,
-}
-
-#[derive(Deserialize, Debug)]
-struct DuckDBExplainNode {
-    name: String,
-    children: Vec<DuckDBExplainNode>,
-    #[serde(default)]
-    extra_info: HashMap<String, serde_json::Value>,
-}
-
-fn get_duckdb_weight(name: &str) -> f32 {
-    match name {
-        "HASH_JOIN" => 15.0,
-        "NESTED_LOOP_JOIN" => 20.0,
-        "CROSS_PRODUCT" => 100.0,
-        "SEQ_SCAN" => 1.0,
-        "INDEX_SCAN" => 0.5,
-        "FILTER" => 0.1,
-        "PROJECTION" => 0.1,
-        "ORDER_BY" => 2.0,
-        "TOP_N" => 0.1,
-        "AGGREGATE" => 2.0,
-        "HASH_GROUP_BY" => 15.0,
-        "DISTINCT" => 2.0,
-        "UNION" => 0.5,
-        _ => 1.0,
-    }
-}
-
-fn compute_duckdb_node_cost(node: &DuckDBExplainNode, in_dummy_cte: bool) -> f32 {
-    let cte_name = node
-        .extra_info
-        .get("CTE Name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let is_dummy_cte =
-        (node.name == "CTE" || node.name == "CTE_SCAN") && cte_name.starts_with("__dee_dummy_scan");
-
-    let weight = get_duckdb_weight(&node.name);
-    let cardinality = node
-        .extra_info
-        .get("Estimated Cardinality")
-        .and_then(|v| {
-            if let Some(s) = v.as_str() {
-                s.parse::<f32>().ok()
-            } else {
-                v.as_f64().map(|f| f as f32)
-            }
-        })
-        .unwrap_or(1.0);
-
-    let current_cost = cardinality * weight;
-
-    if is_dummy_cte && in_dummy_cte {
-        return current_cost;
-    }
-
-    let next_in_dummy = in_dummy_cte || is_dummy_cte;
-    let children_cost: f32 = node
-        .children
-        .iter()
-        .map(|child| compute_duckdb_node_cost(child, next_in_dummy))
-        .sum();
-    current_cost + children_cost
 }
 
 fn materialize_mode_in_duckdb(mode: MaterializeMode) -> String {
@@ -334,41 +269,6 @@ impl Connector for DuckDBConnection {
         Some(Ok(schema))
     }
 
-    async fn cost(&self, query: String) -> Result<Option<f32>, ConnectorError> {
-        let explain_query = format!("EXPLAIN (FORMAT json) {}", query);
-        let conn = self
-            .pool
-            .get()
-            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
-
-        let mut stmt = conn
-            .prepare(&explain_query)
-            .map_err(|e| ConnectorError::Execute(format!("Failed to prepare explain: {}", e)))?;
-
-        let json_str: String = stmt
-            .query_row([], |row| {
-                // DuckDB JSON explain might return two columns: (key, value)
-                // or just one column (value).
-                let col_count = row.as_ref().column_count();
-                if col_count >= 2 {
-                    row.get(1)
-                } else {
-                    row.get(0)
-                }
-            })
-            .map_err(|e| ConnectorError::Execute(format!("Failed to execute explain: {}", e)))?;
-
-        let nodes: Vec<DuckDBExplainNode> = serde_json::from_str(&json_str)
-            .map_err(|e| ConnectorError::Execute(format!("Failed to parse explain JSON: {}", e)))?;
-
-        Ok(Some(
-            nodes
-                .iter()
-                .map(|n| compute_duckdb_node_cost(n, false))
-                .sum(),
-        ))
-    }
-
     async fn sample_system_memory_usage(&self) -> Result<Option<u64>, ConnectorError> {
         let conn = self
             .pool
@@ -396,20 +296,6 @@ impl Connector for DuckDBConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_duckdb_cost() {
-        let config = DuckDBConfig::new_from_path(":memory:".to_string());
-        let conn = DuckDBConnection::new(config).await.unwrap();
-
-        // Create a dummy table to have some plan
-        conn.execute("CREATE TABLE t1 AS SELECT 1 AS id".to_string())
-            .await
-            .unwrap();
-
-        let cost = conn.cost("SELECT * FROM t1".to_string()).await.unwrap();
-        assert!(cost.unwrap() > 0.0);
-    }
 
     #[test]
     fn test_parse_duckdb_size_bytes() {
