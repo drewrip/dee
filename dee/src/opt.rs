@@ -14,7 +14,7 @@ use crate::{
     executor::Executor,
     opt::{
         hmp::HMPPass,
-        omp::{OMPCentrality, OMPCostMetric, OMPPass},
+        omp::{OMPCentrality, OMPPass},
     },
 };
 
@@ -51,8 +51,6 @@ where
     run_lr_pass: bool,
     /// OMP top N
     omp_top: Option<usize>,
-    /// OMP cost metric
-    omp_cost: OMPCostMetric,
     /// OMP node centrality metric
     omp_centrality: OMPCentrality,
     /// OMP early termination
@@ -81,7 +79,6 @@ where
             run_hmp_pass: config.run_hmp_pass,
             run_lr_pass: config.run_lr_pass,
             omp_top: config.omp_top,
-            omp_cost: config.omp_cost,
             omp_centrality: config.omp_centrality,
             omp_early_termination: config.omp_early_termination,
             hmp_no_plan_dups: config.hmp_no_plan_dups,
@@ -115,7 +112,6 @@ where
                 self.conn.clone(),
                 self.engine.clone(),
                 self.omp_top,
-                self.omp_cost,
                 self.omp_centrality,
                 self.omp_early_termination,
             );
@@ -142,7 +138,6 @@ pub struct OptimizerConfig {
     pub run_hmp_pass: bool,
     pub run_lr_pass: bool,
     pub omp_top: Option<usize>,
-    pub omp_cost: OMPCostMetric,
     pub omp_centrality: OMPCentrality,
     pub omp_early_termination: bool,
     pub hmp_no_plan_dups: bool,
@@ -155,7 +150,6 @@ impl Default for OptimizerConfig {
             run_hmp_pass: true,
             run_lr_pass: false,
             omp_top: None,
-            omp_cost: OMPCostMetric::default(),
             omp_centrality: OMPCentrality::default(),
             omp_early_termination: true,
             hmp_no_plan_dups: false,
@@ -206,11 +200,6 @@ impl OptimizerConfig {
 
     pub fn with_omp_top(mut self, top: Option<usize>) -> Self {
         self.omp_top = top;
-        self
-    }
-
-    pub fn with_omp_cost(mut self, cost: OMPCostMetric) -> Self {
-        self.omp_cost = cost;
         self
     }
 

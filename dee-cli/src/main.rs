@@ -47,12 +47,6 @@ pub struct DrawCommand {
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
-pub enum CliOMPCostMetric {
-    Actual,
-    Estimate,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
 pub enum CliOMPCentrality {
     Outdegree,
     Paths,
@@ -70,8 +64,6 @@ pub struct OptCommand {
     stats: bool,
     #[arg(long)]
     omp_top: Option<usize>,
-    #[arg(long)]
-    omp_cost: Option<CliOMPCostMetric>,
     #[arg(long, default_value = "outdegree")]
     omp_node_centrality: CliOMPCentrality,
 

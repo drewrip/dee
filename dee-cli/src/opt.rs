@@ -45,14 +45,6 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    if let Some(cost_metric) = opt_cmd.omp_cost {
-        let metric = match cost_metric {
-            crate::CliOMPCostMetric::Actual => dee::opt::omp::OMPCostMetric::Actual,
-            crate::CliOMPCostMetric::Estimate => dee::opt::omp::OMPCostMetric::Estimate,
-        };
-        config = config.with_omp_cost(metric);
-    }
-
     let centrality = match opt_cmd.omp_node_centrality {
         crate::CliOMPCentrality::Outdegree => dee::opt::omp::OMPCentrality::OutDegree,
         crate::CliOMPCentrality::Paths => dee::opt::omp::OMPCentrality::Paths,
