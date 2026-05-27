@@ -5,7 +5,10 @@ use dee::{
     dag::Dag,
     executor::{Executor, ProfilingConfig, SimpleEngine},
     file::DagFile,
-    profile::{DagRunProfile, ProfileReport, build_dag_run_profile, render_profile_html, render_profile_summary},
+    profile::{
+        DagRunProfile, ProfileReport, build_dag_run_profile, render_profile_html,
+        render_profile_summary,
+    },
 };
 use log::info;
 
@@ -17,12 +20,14 @@ use crate::RunCommand;
 pub async fn run(run_cmd: RunCommand) -> Result<(), Box<dyn std::error::Error>> {
     let connections_files: HashMap<String, Connection> =
         serde_json::from_str(&fs::read_to_string(&run_cmd.connections)?)?;
-    let target_connection = connections_files
-        .get(&run_cmd.target)
-        .ok_or_else(|| format!("connection '{}' not found in '{}'", run_cmd.target, run_cmd.connections))?;
-    let profiling_enabled = run_cmd.profile
-        || run_cmd.profile_dump.is_some()
-        || run_cmd.profile_viz.is_some();
+    let target_connection = connections_files.get(&run_cmd.target).ok_or_else(|| {
+        format!(
+            "connection '{}' not found in '{}'",
+            run_cmd.target, run_cmd.connections
+        )
+    })?;
+    let profiling_enabled =
+        run_cmd.profile || run_cmd.profile_dump.is_some() || run_cmd.profile_viz.is_some();
 
     let runs = match &target_connection {
         Connection::DuckDB(config) => {

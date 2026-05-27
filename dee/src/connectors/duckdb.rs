@@ -188,11 +188,12 @@ impl Connector for DuckDBConnection {
             .map_err(|_| ConnectorError::Create("r2d2 pool".to_string()))?;
 
         {
-            let conn = pool
-                .get()
-                .map_err(|_| ConnectorError::Create("couldn't get connection for ICU setup".to_string()))?;
-            conn.execute_batch("INSTALL icu; LOAD icu;")
-                .map_err(|e| ConnectorError::Create(format!("failed to install/load ICU: {}", e)))?;
+            let conn = pool.get().map_err(|_| {
+                ConnectorError::Create("couldn't get connection for ICU setup".to_string())
+            })?;
+            conn.execute_batch("INSTALL icu; LOAD icu;").map_err(|e| {
+                ConnectorError::Create(format!("failed to install/load ICU: {}", e))
+            })?;
         }
 
         Ok(Arc::new(Self { pool }))

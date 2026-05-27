@@ -1,6 +1,6 @@
+use crate::file::{DagColumn, DagFile, DagFileMetadata, DagFileNode, DagFileSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::file::{DagFile, DagFileNode, DagFileSource, DagColumn, DagFileMetadata};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DbtManifest {
@@ -51,7 +51,7 @@ pub struct DbtColumn {
 impl From<DbtManifest> for DagFile {
     fn from(manifest: DbtManifest) -> Self {
         let mut nodes = Vec::new();
-        
+
         // Map to keep track of unique_id to relation_name mapping for dependency resolution
         let mut id_to_rel = HashMap::new();
         for (id, node) in &manifest.nodes {
@@ -70,22 +70,32 @@ impl From<DbtManifest> for DagFile {
         }
 
         for (id, node) in &manifest.nodes {
-            let query_text = node.compiled_code.as_ref()
+            let query_text = node
+                .compiled_code
+                .as_ref()
                 .or(node.raw_code.as_ref())
                 .cloned()
                 .unwrap_or_default();
-            
+
             // Per user request, DO NOT change the query_text.
             // dbt compiled queries already use relation_names.
             let final_query = query_text;
-            
+
             // Filter depends_on to only include nodes that exist in our nodes list,
             // and use their relation_name as the ID.
-            let depends_on: Vec<String> = node.depends_on.nodes.iter()
+            let depends_on: Vec<String> = node
+                .depends_on
+                .nodes
+                .iter()
                 .filter(|dep_id| manifest.nodes.contains_key(*dep_id))
-                .map(|dep_id| id_to_rel.get(dep_id).cloned().unwrap_or_else(|| dep_id.clone()))
+                .map(|dep_id| {
+                    id_to_rel
+                        .get(dep_id)
+                        .cloned()
+                        .unwrap_or_else(|| dep_id.clone())
+                })
                 .collect();
-                
+
             let materialize = node.config.materialized.as_deref().map(|m| {
                 if m == "table" || m == "incremental" {
                     "table".to_string()
@@ -93,10 +103,10 @@ impl From<DbtManifest> for DagFile {
                     "view".to_string()
                 }
             });
-            
+
             // Use relation_name as the ID so it matches what's used in queries
             let node_id = node.relation_name.clone().unwrap_or_else(|| id.clone());
-            
+
             nodes.push(DagFileNode {
                 id: node_id,
                 query_text: final_query,

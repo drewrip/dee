@@ -193,7 +193,10 @@ impl Graph {
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
         for n in self.g.values() {
             for parent in &n.depends_on {
-                children.entry(parent.clone()).or_default().push(n.id.clone());
+                children
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(n.id.clone());
             }
         }
 
@@ -213,7 +216,10 @@ impl Graph {
 
         let mut count = 0;
         if let Some(node) = self.g.get(node_id) {
-            if matches!(node.materialize, MaterializeMode::Table | MaterializeMode::TempTable) {
+            if matches!(
+                node.materialize,
+                MaterializeMode::Table | MaterializeMode::TempTable
+            ) {
                 count += 1;
             }
         }

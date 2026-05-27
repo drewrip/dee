@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod connections;
 pub mod connectors;
 pub mod dag;
 pub mod executor;
@@ -6,4 +7,3 @@ pub mod file;
 pub mod graph;
 pub mod opt;
 pub mod profile;
-pub mod connections;

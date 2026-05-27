@@ -1,5 +1,5 @@
-pub mod omp;
 pub mod hmp;
+pub mod omp;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -13,8 +13,8 @@ use crate::{
     dag::Dag,
     executor::Executor,
     opt::{
-        omp::{OMPCentrality, OMPCostMetric, OMPPass},
         hmp::HMPPass,
+        omp::{OMPCentrality, OMPCostMetric, OMPPass},
     },
 };
 
@@ -55,6 +55,8 @@ where
     omp_cost: OMPCostMetric,
     /// OMP node centrality metric
     omp_centrality: OMPCentrality,
+    /// OMP early termination
+    omp_early_termination: bool,
     /// HMP no plan dups
     hmp_no_plan_dups: bool,
     /// Result stats
@@ -81,6 +83,7 @@ where
             omp_top: config.omp_top,
             omp_cost: config.omp_cost,
             omp_centrality: config.omp_centrality,
+            omp_early_termination: config.omp_early_termination,
             hmp_no_plan_dups: config.hmp_no_plan_dups,
             stats_on_passes: false,
         }
@@ -114,6 +117,7 @@ where
                 self.omp_top,
                 self.omp_cost,
                 self.omp_centrality,
+                self.omp_early_termination,
             );
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
@@ -140,6 +144,7 @@ pub struct OptimizerConfig {
     pub omp_top: Option<usize>,
     pub omp_cost: OMPCostMetric,
     pub omp_centrality: OMPCentrality,
+    pub omp_early_termination: bool,
     pub hmp_no_plan_dups: bool,
 }
 
@@ -152,6 +157,7 @@ impl Default for OptimizerConfig {
             omp_top: None,
             omp_cost: OMPCostMetric::default(),
             omp_centrality: OMPCentrality::default(),
+            omp_early_termination: true,
             hmp_no_plan_dups: false,
         }
     }
@@ -210,6 +216,11 @@ impl OptimizerConfig {
 
     pub fn with_omp_centrality(mut self, centrality: OMPCentrality) -> Self {
         self.omp_centrality = centrality;
+        self
+    }
+
+    pub fn with_omp_early_termination(mut self, early_termination: bool) -> Self {
+        self.omp_early_termination = early_termination;
         self
     }
 
