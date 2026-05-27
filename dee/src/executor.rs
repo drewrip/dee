@@ -22,6 +22,8 @@ use crate::{
 pub enum ExecutorError {
     #[error("couldn't execute DAG - {0}")]
     Exec(String),
+    #[error("execution cancelled")]
+    Cancelled,
 }
 
 #[async_trait]
@@ -35,6 +37,7 @@ where
     async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError>;
     async fn cleanup(&self, dag: &Dag) -> Result<usize, ExecutorError>;
     async fn cost(&self, dag: &Dag) -> Result<Option<f32>, ExecutorError>;
+    fn cancel_sender(&self) -> Arc<watch::Sender<bool>>;
 }
 
 #[derive(Debug)]
@@ -45,6 +48,8 @@ where
     conn: Arc<C>,
     plans_dir: Option<String>,
     profiling: Option<ProfilingConfig>,
+    cancel_tx: Arc<watch::Sender<bool>>,
+    cancel_rx: watch::Receiver<bool>,
 }
 
 impl<C> SimpleEngine<C>
@@ -151,11 +156,18 @@ where
     type ExecutionEngine = Self;
 
     fn new(conn: Arc<C>) -> Result<SimpleEngine<C>, ExecutorError> {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         Ok(SimpleEngine {
             conn,
             plans_dir: None,
             profiling: None,
+            cancel_tx: Arc::new(cancel_tx),
+            cancel_rx,
         })
+    }
+
+    fn cancel_sender(&self) -> Arc<watch::Sender<bool>> {
+        Arc::clone(&self.cancel_tx)
     }
 
     async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError> {
@@ -174,10 +186,24 @@ where
             (None, None)
         };
 
-        let collect_plans = self.profiling.as_ref().map(|p| p.collect_plans).unwrap_or(false);
+        let collect_plans = self
+            .profiling
+            .as_ref()
+            .map(|p| p.collect_plans)
+            .unwrap_or(false);
 
         let mut node_stats = node_stats;
         while work_graph.num_nodes() > 0 {
+            if *self.cancel_rx.borrow() {
+                debug!("SimpleEngine: cancellation requested, stopping execution");
+                drop(work_queue);
+                if let Some(ref stop) = sampler_stop {
+                    let _ = stop.send(true);
+                }
+                self.cleanup(dag).await?;
+                return Err(ExecutorError::Cancelled);
+            }
+
             let next_nodes: Vec<_> = work_graph
                 .sources()
                 .filter(|n| !in_progress.contains(n))
@@ -219,7 +245,8 @@ where
                         }
                         (res, plan)
                     } else {
-                        let res = conn.new_relation(tn.materialize, tn.id.clone(), tn.query_text)
+                        let res = conn
+                            .new_relation(tn.materialize, tn.id.clone(), tn.query_text)
                             .await
                             .map_err(|e| ExecutorError::Exec(e.to_string()))?;
                         (res, None)

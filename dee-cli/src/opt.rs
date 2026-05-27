@@ -1,10 +1,10 @@
 use dee::{
-    connectors::{duckdb::DuckDBConnection, postgres::PostgresConnection, Connector},
+    connections::Connection,
+    connectors::{Connector, duckdb::DuckDBConnection, postgres::PostgresConnection},
     dag::Dag,
     executor::{Executor, SimpleEngine},
     file::DagFile,
     opt::{Optimizer, OptimizerConfig},
-    connections::Connection,
 };
 use log::info;
 use serde::Serialize;
@@ -19,14 +19,18 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
 
     let connections_files: HashMap<String, Connection> =
         serde_json::from_str(&fs::read_to_string(&opt_cmd.connections)?)?;
-    let target_connection = connections_files
-        .get(&opt_cmd.target)
-        .ok_or_else(|| format!("connection '{}' not found in '{}'", opt_cmd.target, opt_cmd.connections))?;
+    let target_connection = connections_files.get(&opt_cmd.target).ok_or_else(|| {
+        format!(
+            "connection '{}' not found in '{}'",
+            opt_cmd.target, opt_cmd.connections
+        )
+    })?;
     let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(opt_cmd.dag_file)?)?;
     let mut dag = Dag::try_from(dag_file)?;
 
     let mut config = OptimizerConfig::new()
         .with_omp_top(opt_cmd.omp_top)
+        .with_omp_early_termination(!opt_cmd.omp_exhaust)
         .with_hmp_no_plan_dups(opt_cmd.hmp_no_plan_dups);
 
     if let Some(enabled_passes) = opt_cmd.enable {

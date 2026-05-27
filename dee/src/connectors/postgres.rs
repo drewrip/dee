@@ -151,9 +151,8 @@ impl Connector for PostgresConnection {
             .try_get(0)
             .map_err(|e| ConnectorError::Execute(format!("Failed to get explain JSON: {}", e)))?;
 
-        let wrappers: Vec<PostgresExplainWrapper> = serde_json::from_value(json_value).map_err(|e| {
-            ConnectorError::Execute(format!("Failed to parse explain JSON: {}", e))
-        })?;
+        let wrappers: Vec<PostgresExplainWrapper> = serde_json::from_value(json_value)
+            .map_err(|e| ConnectorError::Execute(format!("Failed to parse explain JSON: {}", e)))?;
 
         let total_cost = wrappers
             .iter()

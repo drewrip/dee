@@ -6,7 +6,7 @@ use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 use crate::{
     connectors::Connector,
     dag::MaterializeMode,
-    executor::Executor,
+    executor::{Executor, ExecutorError},
     opt::{Dag, OptimizerError, OptimizerPass},
 };
 
@@ -34,6 +34,7 @@ where
     top_n: Option<usize>,
     cost_metric: OMPCostMetric,
     centrality: OMPCentrality,
+    early_termination: bool,
     _phantom: PhantomData<C>,
 }
 
@@ -48,12 +49,14 @@ where
         top_n: Option<usize>,
         cost_metric: OMPCostMetric,
         centrality: OMPCentrality,
+        early_termination: bool,
     ) -> Self {
         Self {
             engine,
             top_n,
             cost_metric,
             centrality,
+            early_termination,
             _phantom: PhantomData,
         }
     }
@@ -125,7 +128,6 @@ where
             .iter()
             .map(|c| dag.nodes.get(c.0.clone()).unwrap().materialize)
             .collect();
-        let baseline_plan = best_plan.clone();
         for (i, plan) in plans.iter().enumerate() {
             debug!("OMPPass: iter {}", i + 1);
             let _ = self.engine.cleanup(dag).await.unwrap();
@@ -140,12 +142,46 @@ where
             }
 
             let current_cost = match self.cost_metric {
-                OMPCostMetric::Actual => self
-                    .engine
-                    .run(&work_dag)
-                    .await
-                    .map(|r| r.duration.num_milliseconds() as f32)
-                    .map_err(|e| OptimizerError::Exec(format!("test dag run failed - {}", e)))?,
+                OMPCostMetric::Actual => {
+                    if self.early_termination {
+                        let cancel_tx = self.engine.cancel_sender();
+                        // Reset any prior cancellation before starting the run.
+                        cancel_tx.send(false).ok();
+                        let budget_ms = best_cost as u64;
+                        let cancel_tx_timer = Arc::clone(&cancel_tx);
+                        let timer = tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(budget_ms)).await;
+                            cancel_tx_timer.send(true).ok();
+                        });
+                        let result = self.engine.run(&work_dag).await;
+                        timer.abort();
+                        match result {
+                            Ok(r) => r.duration.num_milliseconds() as f32,
+                            Err(ExecutorError::Cancelled) => {
+                                debug!("OMPPass: plan {} cancelled after {}ms", i + 1, budget_ms);
+                                stats.insert(
+                                    format!("attempt_{}", i + 1),
+                                    format!("cancelled({})", budget_ms),
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(OptimizerError::Exec(format!(
+                                    "test dag run failed - {}",
+                                    e
+                                )));
+                            }
+                        }
+                    } else {
+                        self.engine
+                            .run(&work_dag)
+                            .await
+                            .map(|r| r.duration.num_milliseconds() as f32)
+                            .map_err(|e| {
+                                OptimizerError::Exec(format!("test dag run failed - {}", e))
+                            })?
+                    }
+                }
                 OMPCostMetric::Estimate => self
                     .engine
                     .cost(&work_dag)
@@ -157,18 +193,13 @@ where
             };
 
             stats.insert(format!("attempt_{}", i + 1), current_cost.to_string());
-            if current_cost < best_cost {
+            if self.early_termination && matches!(self.cost_metric, OMPCostMetric::Actual) {
+                // Completed within the timeout window — it's the new best by definition
                 best_cost = current_cost;
                 best_plan = plan.clone();
-            } else {
-                for node in baseline_plan.iter().enumerate() {
-                    let node_id = top_candidates.get(node.0).unwrap().0.clone();
-                    work_dag
-                        .nodes
-                        .get_mut(node_id.clone())
-                        .ok_or(OptimizerError::Exec("missing node".to_string()))?
-                        .materialize = node.1.clone();
-                }
+            } else if current_cost < best_cost {
+                best_cost = current_cost;
+                best_plan = plan.clone();
             }
         }
 

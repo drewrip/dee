@@ -90,7 +90,10 @@ impl From<DagFileNode> for TransformNode {
             Some(s) => {
                 let mode = MaterializeMode::from(s);
                 if matches!(mode, MaterializeMode::TempTable) {
-                    log::warn!("Encountered 'temp_table' materialize mode in DAG file for node '{}'. This is intended for internal use and is probably not desired in a configuration file.", value.id);
+                    log::warn!(
+                        "Encountered 'temp_table' materialize mode in DAG file for node '{}'. This is intended for internal use and is probably not desired in a configuration file.",
+                        value.id
+                    );
                 }
                 mode
             }
@@ -194,11 +197,26 @@ mod tests {
 
     #[test]
     fn test_materialize_mode_from_string() {
-        assert_eq!(MaterializeMode::from("table".to_string()), MaterializeMode::Table);
-        assert_eq!(MaterializeMode::from("TABLE".to_string()), MaterializeMode::Table);
-        assert_eq!(MaterializeMode::from("temp_table".to_string()), MaterializeMode::TempTable);
-        assert_eq!(MaterializeMode::from("view".to_string()), MaterializeMode::View);
-        assert_eq!(MaterializeMode::from("unknown".to_string()), MaterializeMode::View);
+        assert_eq!(
+            MaterializeMode::from("table".to_string()),
+            MaterializeMode::Table
+        );
+        assert_eq!(
+            MaterializeMode::from("TABLE".to_string()),
+            MaterializeMode::Table
+        );
+        assert_eq!(
+            MaterializeMode::from("temp_table".to_string()),
+            MaterializeMode::TempTable
+        );
+        assert_eq!(
+            MaterializeMode::from("view".to_string()),
+            MaterializeMode::View
+        );
+        assert_eq!(
+            MaterializeMode::from("unknown".to_string()),
+            MaterializeMode::View
+        );
     }
 
     #[test]
