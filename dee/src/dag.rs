@@ -88,14 +88,7 @@ impl From<DagFileNode> for TransformNode {
         // If materialize strategy isn't provided, default to view
         let materialize = match value.materialize {
             Some(s) => {
-                let mode = MaterializeMode::from(s);
-                if matches!(mode, MaterializeMode::TempTable) {
-                    log::warn!(
-                        "Encountered 'temp_table' materialize mode in DAG file for node '{}'. This is intended for internal use and is probably not desired in a configuration file.",
-                        value.id
-                    );
-                }
-                mode
+                MaterializeMode::from(s)
             }
             None => MaterializeMode::View,
         };
@@ -139,6 +132,16 @@ impl TryFrom<DagFile> for Dag {
         graph
             .check()
             .map_err(|e| FormatError::Parser(format!("bad graph - {}", e)))?;
+        for sink_id in graph.sinks() {
+            if let Some(node) = graph.get(sink_id.clone()) {
+                if matches!(node.materialize, MaterializeMode::TempTable) {
+                    log::warn!(
+                        "Node '{}' uses 'temp_table' materialization but has no dependents. Temp tables are intended as intermediate nodes and a sink temp_table is probably not desired.",
+                        sink_id
+                    );
+                }
+            }
+        }
         Ok(Self {
             db: dialect,
             nodes: graph,
