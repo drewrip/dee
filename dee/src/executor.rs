@@ -208,7 +208,9 @@ where
                 .filter(|n| !in_progress.contains(n))
                 .collect();
 
-            // pop off all nodes with no dependencies and run them
+            debug!("next_nodes = {}", next_nodes.len());
+
+            // queue all currently-runnable nodes
             for node_id in next_nodes.into_iter() {
                 let tn = dag.nodes.get(node_id.clone()).unwrap().clone();
                 let conn = Arc::clone(&self.conn);
@@ -265,8 +267,8 @@ where
                     ))
                 }));
             }
-            // wait for work_queue to empty
-            while let Some(item) = work_queue.next().await {
+            // wait for one node to finish, then loop back to queue any newly-runnable nodes
+            if let Some(item) = work_queue.next().await {
                 let (_, node_id, stats) =
                     item.map_err(|j| ExecutorError::Exec(format!("join error - {}", j)))??;
                 debug!("recv result for nidx={:?}", node_id);
@@ -321,7 +323,6 @@ where
         debug!("cleanup, {} relations dropped", num_deleted);
         Ok(num_deleted)
     }
-
 }
 
 #[derive(Clone, Debug)]
