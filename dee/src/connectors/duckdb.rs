@@ -5,7 +5,7 @@ use crate::{
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use duckdb::{Config, DuckdbConnectionManager, params};
-use log::debug;
+use log::info;
 use r2d2::Pool;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, process::Command, sync::Arc, time::Duration};
@@ -151,7 +151,7 @@ impl Connector for DuckDBConnection {
         query_text: String,
     ) -> Result<usize, ConnectorError> {
         let rel_type = materialize_mode_in_duckdb(relation_type);
-        //debug!("creating new_relation ({}, {})", rel_type, name);
+        info!("creating new_relation ({}, {})", rel_type, name);
         let tmpl_query = format!("CREATE {} {} AS ({})", rel_type, name, query_text);
         self.execute(tmpl_query).await
     }
@@ -251,13 +251,13 @@ impl Connector for DuckDBConnection {
         name: String,
     ) -> Result<usize, ConnectorError> {
         let rel_type = materialize_mode_in_duckdb(relation_type);
-        debug!("attempt drop_relation ({}, {})", rel_type, name);
+        info!("attempt drop_relation ({}, {})", rel_type, name);
         let tmpl_query = format!("DROP {} IF EXISTS {}", rel_type, name);
         self.execute(tmpl_query).await
     }
 
     async fn get_schema(&self, name: String) -> Option<Result<SchemaRef, ConnectorError>> {
-        debug!("attempt to fetch arrow schema for {}", name);
+        info!("attempt to fetch arrow schema for {}", name);
         let conn = self
             .pool
             .get()

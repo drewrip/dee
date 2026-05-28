@@ -2,7 +2,7 @@
   "duckdb_test": {
     "type": "duckdb",
     "database": "warehouse.duckdb",
-    "num_connections": 4
+    "num_connections": 16
   },
   "pg_test": {
     "type": "postgres",
@@ -11,6 +11,6 @@
     "user": "runner",
     "password": "password",
     "database": "benchmark",
-    "num_connections": 4
+    "num_connections": 16
   }
 }
