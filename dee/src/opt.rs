@@ -1,5 +1,6 @@
 pub mod hmp;
 pub mod omp;
+pub mod pushdown;
 
 use std::{collections::HashMap, sync::Arc};
 
