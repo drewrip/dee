@@ -258,15 +258,33 @@ impl Connector for DuckDBConnection {
 
     async fn get_schema(&self, name: String) -> Option<Result<SchemaRef, ConnectorError>> {
         info!("attempt to fetch arrow schema for {}", name);
-        let conn = self
-            .pool
-            .get()
-            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))
-            .unwrap();
-        let tmpl_query = format!("SELECT * FROM {}", name);
-        let stmt = conn.prepare(&tmpl_query).unwrap();
-        let schema = stmt.schema().clone();
-        Some(Ok(schema))
+        let conn = match self.pool.get() {
+            Ok(c) => c,
+            Err(e) => {
+                return Some(Err(ConnectorError::Execute(format!(
+                    "couldn't get connection from pool: {e}"
+                ))))
+            }
+        };
+        // Execute with LIMIT 0 via query_arrow so DuckDB populates the arrow
+        // schema pointer before we call get_schema().  A plain prepare() +
+        // schema() panics because the arrow array pointer is only set after
+        // execution.  LIMIT 0 returns zero rows so there is no data transfer.
+        let tmpl_query = format!("SELECT * FROM {} LIMIT 0", name);
+        let mut stmt = match conn.prepare(&tmpl_query) {
+            Ok(s) => s,
+            Err(e) => {
+                return Some(Err(ConnectorError::Execute(format!(
+                    "couldn't prepare schema query for {name}: {e}"
+                ))))
+            }
+        };
+        match stmt.query_arrow([]) {
+            Ok(arrow) => Some(Ok(arrow.get_schema())),
+            Err(e) => Some(Err(ConnectorError::Execute(format!(
+                "couldn't execute schema query for {name}: {e}"
+            )))),
+        }
     }
 
     async fn sample_system_memory_usage(&self) -> Result<Option<u64>, ConnectorError> {

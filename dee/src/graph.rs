@@ -27,11 +27,7 @@ fn build_children_map(g: &GraphType) -> HashMap<String, Vec<String>> {
     children
 }
 
-fn barycenter_predecessors(
-    node_id: &str,
-    g: &GraphType,
-    layer_pos: &HashMap<String, f64>,
-) -> f64 {
+fn barycenter_predecessors(node_id: &str, g: &GraphType, layer_pos: &HashMap<String, f64>) -> f64 {
     let node = match g.get(node_id) {
         Some(n) => n,
         None => return f64::MAX,
@@ -328,9 +324,8 @@ impl Graph {
 
         let max_rows = layer_nodes.iter().map(|v| v.len()).max().unwrap_or(1);
         let svg_w = MARGIN * 2.0 + (max_layer + 1) as f64 * NODE_W + max_layer as f64 * H_GAP;
-        let svg_h = MARGIN * 2.0
-            + max_rows as f64 * NODE_H
-            + (max_rows.saturating_sub(1)) as f64 * V_GAP;
+        let svg_h =
+            MARGIN * 2.0 + max_rows as f64 * NODE_H + (max_rows.saturating_sub(1)) as f64 * V_GAP;
 
         let mut out = String::new();
 
@@ -415,7 +410,10 @@ impl Graph {
             if let Some(&(x, y)) = pos.get(node_id) {
                 let (fill, stroke) = node_colors(node.materialize);
                 let label = if node_id.chars().count() > MAX_CHARS {
-                    format!("{}…", node_id.chars().take(MAX_CHARS - 1).collect::<String>())
+                    format!(
+                        "{}…",
+                        node_id.chars().take(MAX_CHARS - 1).collect::<String>()
+                    )
                 } else {
                     node_id.clone()
                 };
@@ -485,6 +483,143 @@ impl Graph {
         result
     }
 
+    /// Returns the set of node IDs reachable (downstream) from `start` that
+    /// satisfy `predicate`.  Traversal follows the direction of data flow:
+    /// from a node to every node whose `depends_on` set contains it.
+    pub fn reachable(
+        &self,
+        start: &str,
+        predicate: impl Fn(&TransformNode) -> bool,
+    ) -> HashSet<String> {
+        // Build a children map: parent_id → [child_id, ...]
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for (id, node) in &self.g {
+            for parent in &node.depends_on {
+                children.entry(parent.clone()).or_default().push(id.clone());
+            }
+        }
+
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = vec![start.to_string()];
+
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            if let Some(kids) = children.get(&current) {
+                for kid in kids {
+                    if !visited.contains(kid) {
+                        queue.push(kid.clone());
+                    }
+                }
+            }
+        }
+
+        // `visited` includes `start` itself; filter to only nodes matching the
+        // predicate (excluding the start node so callers get pure descendants).
+        visited
+            .into_iter()
+            .filter(|id| id != start)
+            .filter(|id| self.g.get(id).map(|n| predicate(n)).unwrap_or(false))
+            .collect()
+    }
+
+    /// Returns the set of `Table` node IDs reachable downstream from `start`.
+    pub fn reachable_tables(&self, start: &str) -> HashSet<String> {
+        self.reachable(start, |n| matches!(n.materialize, MaterializeMode::Table))
+    }
+
+    /// Returns the set of `TempTable` node IDs reachable downstream from `start`.
+    pub fn reachable_temps(&self, start: &str) -> HashSet<String> {
+        self.reachable(start, |n| {
+            matches!(n.materialize, MaterializeMode::TempTable)
+        })
+    }
+
+    /// Returns the set of `Table` or `TempTable` node IDs reachable downstream
+    /// from `start`.
+    pub fn reachable_materializes(&self, start: &str) -> HashSet<String> {
+        self.reachable(start, |n| {
+            matches!(
+                n.materialize,
+                MaterializeMode::Table | MaterializeMode::TempTable
+            )
+        })
+    }
+
+    /// Returns the *frontier* of nodes reachable downstream from `start` that
+    /// satisfy `predicate`.  Unlike [`reachable`], the search **stops** down a
+    /// given path as soon as it encounters a matching node — that node is
+    /// included in the result but its descendants are not explored further.
+    /// This gives the nearest matching nodes along every downstream path rather
+    /// than all matching nodes at any depth.
+    pub fn frontier(
+        &self,
+        start: &str,
+        predicate: impl Fn(&TransformNode) -> bool,
+    ) -> HashSet<String> {
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for (id, node) in &self.g {
+            for parent in &node.depends_on {
+                children.entry(parent.clone()).or_default().push(id.clone());
+            }
+        }
+
+        let mut result: HashSet<String> = HashSet::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = vec![start.to_string()];
+
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            // Skip the start node itself for the predicate check.
+            if current != start {
+                if let Some(node) = self.g.get(&current) {
+                    if predicate(node) {
+                        result.insert(current.clone());
+                        // Do not explore further down this path.
+                        continue;
+                    }
+                }
+            }
+            if let Some(kids) = children.get(&current) {
+                for kid in kids {
+                    if !visited.contains(kid) {
+                        queue.push(kid.clone());
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Returns the nearest `Table` nodes downstream from `start`, stopping
+    /// at the first `Table` found on each path.
+    pub fn frontier_tables(&self, start: &str) -> HashSet<String> {
+        self.frontier(start, |n| matches!(n.materialize, MaterializeMode::Table))
+    }
+
+    /// Returns the nearest `TempTable` nodes downstream from `start`, stopping
+    /// at the first `TempTable` found on each path.
+    pub fn frontier_temps(&self, start: &str) -> HashSet<String> {
+        self.frontier(start, |n| {
+            matches!(n.materialize, MaterializeMode::TempTable)
+        })
+    }
+
+    /// Returns the nearest `Table` or `TempTable` nodes downstream from
+    /// `start`, stopping at the first match found on each path.
+    pub fn frontier_materializes(&self, start: &str) -> HashSet<String> {
+        self.frontier(start, |n| {
+            matches!(
+                n.materialize,
+                MaterializeMode::Table | MaterializeMode::TempTable
+            )
+        })
+    }
+
     pub fn paths_to_sinks(&self, node: &String) -> usize {
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
         for n in self.g.values() {
@@ -528,5 +663,105 @@ impl Graph {
 
         memo.insert(node_id.clone(), count);
         count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dag::{MaterializeMode, TransformNode};
+
+    fn node(id: &str, mode: MaterializeMode, deps: &[&str]) -> TransformNode {
+        TransformNode {
+            id: id.to_string(),
+            query_text: String::new(),
+            materialize: mode,
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            schema: None,
+        }
+    }
+
+    fn make_graph(nodes: Vec<TransformNode>) -> Graph {
+        let mut g = Graph::new(HashMap::new());
+        for n in nodes {
+            g.add_node_unchecked(n);
+        }
+        g
+    }
+
+    // DAG layout:
+    //
+    //   source (View)
+    //       │
+    //   mid (TempTable)
+    //       │
+    //   final (Table)
+    //
+    // From `source`:
+    //   - `reachable_materializes` returns both `mid` and `final` because it
+    //     keeps walking past the TempTable to find all matches at any depth.
+    //   - `frontier_materializes` returns only `mid` because the search stops
+    //     at the first matching node on each path and does not continue to
+    //     `final`.
+    #[test]
+    fn test_reachable_vs_frontier_stops_at_first_match_on_path() {
+        let g = make_graph(vec![
+            node("source", MaterializeMode::View, &[]),
+            node("mid", MaterializeMode::TempTable, &["source"]),
+            node("final", MaterializeMode::Table, &["mid"]),
+        ]);
+
+        let reachable = g.reachable_materializes("source");
+        assert!(reachable.contains("mid"), "reachable must include mid");
+        assert!(reachable.contains("final"), "reachable must include final");
+
+        let frontier = g.frontier_materializes("source");
+        assert!(frontier.contains("mid"), "frontier must include mid");
+        assert!(
+            !frontier.contains("final"),
+            "frontier must NOT include final — path was stopped at mid"
+        );
+    }
+
+    // DAG layout:
+    //
+    //   source (View)
+    //     ├──► branch_a (TempTable) ──► sink_a (Table)
+    //     └──► branch_b (Table)
+    //
+    // From `source`:
+    //   - `reachable_materializes` returns branch_a, sink_a, and branch_b.
+    //   - `frontier_materializes` returns branch_a and branch_b only.
+    //     The path through branch_a stops there (TempTable matched first), so
+    //     sink_a is never reached.  branch_b is its own independent path and
+    //     matches immediately.
+    #[test]
+    fn test_frontier_stops_independently_on_each_path() {
+        let g = make_graph(vec![
+            node("source", MaterializeMode::View, &[]),
+            node("branch_a", MaterializeMode::TempTable, &["source"]),
+            node("sink_a", MaterializeMode::Table, &["branch_a"]),
+            node("branch_b", MaterializeMode::Table, &["source"]),
+        ]);
+
+        let reachable = g.reachable_materializes("source");
+        assert_eq!(
+            reachable,
+            ["branch_a", "sink_a", "branch_b"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<HashSet<_>>(),
+            "reachable must find all materializing nodes at any depth"
+        );
+
+        let frontier = g.frontier_materializes("source");
+        assert_eq!(
+            frontier,
+            ["branch_a", "branch_b"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<HashSet<_>>(),
+            "frontier must stop at branch_a (not continue to sink_a) and include branch_b"
+        );
     }
 }
