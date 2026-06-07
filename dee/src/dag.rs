@@ -81,15 +81,16 @@ pub struct TransformNode {
     pub query_text: String,
     pub materialize: MaterializeMode,
     pub depends_on: HashSet<String>,
+    /// Arrow schema of this node's output, populated by `Executor::resolve_schemas`.
+    /// `None` when parsed from a file or not yet resolved.
+    pub schema: Option<SchemaRef>,
 }
 
 impl From<DagFileNode> for TransformNode {
     fn from(value: DagFileNode) -> Self {
         // If materialize strategy isn't provided, default to view
         let materialize = match value.materialize {
-            Some(s) => {
-                MaterializeMode::from(s)
-            }
+            Some(s) => MaterializeMode::from(s),
             None => MaterializeMode::View,
         };
 
@@ -98,6 +99,7 @@ impl From<DagFileNode> for TransformNode {
             query_text: value.query_text,
             materialize,
             depends_on: HashSet::from_iter(value.depends_on),
+            schema: None,
         }
     }
 }

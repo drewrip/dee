@@ -141,10 +141,7 @@ where
                         continue;
                     }
                     Err(e) => {
-                        return Err(OptimizerError::Exec(format!(
-                            "test dag run failed - {}",
-                            e
-                        )));
+                        return Err(OptimizerError::Exec(format!("test dag run failed - {}", e)));
                     }
                 }
             } else {

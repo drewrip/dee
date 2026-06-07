@@ -16,6 +16,7 @@ use crate::{
     opt::{
         hmp::HMPPass,
         omp::{OMPCentrality, OMPPass},
+        pushdown::PushdownPass,
     },
 };
 
@@ -58,6 +59,8 @@ where
     omp_early_termination: bool,
     /// HMP no plan dups
     hmp_no_plan_dups: bool,
+    /// Pushdown pass
+    run_pushdown_pass: bool,
     /// Result stats
     stats_on_passes: bool,
 }
@@ -83,6 +86,7 @@ where
             omp_centrality: config.omp_centrality,
             omp_early_termination: config.omp_early_termination,
             hmp_no_plan_dups: config.hmp_no_plan_dups,
+            run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
         }
     }
@@ -129,6 +133,17 @@ where
         } else {
             debug!("skipping LR pass");
         }
+
+        if self.run_pushdown_pass {
+            let mut pass: PushdownPass<C, E> = PushdownPass::new(self.conn.clone(), self.engine.clone());
+            let res = pass.run(dag).await?;
+            if self.stats_on_passes {
+                stats.insert("PushdownPass".to_string(), Arc::new(res));
+            }
+        } else {
+            debug!("skipping Pushdown pass");
+        }
+
         Ok(stats)
     }
 }
@@ -142,6 +157,7 @@ pub struct OptimizerConfig {
     pub omp_centrality: OMPCentrality,
     pub omp_early_termination: bool,
     pub hmp_no_plan_dups: bool,
+    pub run_pushdown_pass: bool,
 }
 
 impl Default for OptimizerConfig {
@@ -154,6 +170,7 @@ impl Default for OptimizerConfig {
             omp_centrality: OMPCentrality::default(),
             omp_early_termination: true,
             hmp_no_plan_dups: false,
+            run_pushdown_pass: false,
         }
     }
 }
@@ -180,6 +197,7 @@ impl OptimizerConfig {
         match name.to_lowercase().as_str() {
             "omp" => self.run_omp_pass = enabled,
             "hmp" => self.run_hmp_pass = enabled,
+            "pushdown" => self.run_pushdown_pass = enabled,
             _ => warn!("Unknown optimizer pass: {}", name),
         }
     }
@@ -216,6 +234,11 @@ impl OptimizerConfig {
 
     pub fn with_hmp_no_plan_dups(mut self, no_dups: bool) -> Self {
         self.hmp_no_plan_dups = no_dups;
+        self
+    }
+
+    pub fn with_pushdown_pass(mut self) -> Self {
+        self.run_pushdown_pass = true;
         self
     }
 }

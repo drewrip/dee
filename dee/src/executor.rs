@@ -37,6 +37,23 @@ where
     async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError>;
     async fn cleanup(&self, dag: &Dag) -> Result<usize, ExecutorError>;
     fn cancel_sender(&self) -> Arc<watch::Sender<bool>>;
+
+    /// Resolve the Arrow output schema for every node in `dag` and store it in
+    /// `TransformNode::schema`.
+    ///
+    /// Strategy:
+    /// 1. Walk nodes in topological order and create each as a **VIEW**
+    ///    (regardless of its configured `materialize` mode).  Because the DB
+    ///    engine resolves the SQL itself, this works for any SQL dialect —
+    ///    including dialect-specific functions that DataFusion cannot plan.
+    /// 2. Walk nodes in topological order again and call `get_schema` on each
+    ///    to retrieve the output Arrow schema from the live DB.
+    /// 3. Store the resolved schema on the corresponding `TransformNode`.
+    /// 4. Clean up all views created in step 1.
+    ///
+    /// Fails if any view cannot be created, any schema cannot be fetched, or
+    /// cleanup fails.
+    async fn resolve_schemas(&self, dag: &mut Dag) -> Result<(), ExecutorError>;
 }
 
 #[derive(Debug)]
@@ -322,6 +339,69 @@ where
         }
         debug!("cleanup, {} relations dropped", num_deleted);
         Ok(num_deleted)
+    }
+
+    async fn resolve_schemas(&self, dag: &mut Dag) -> Result<(), ExecutorError> {
+        let topo = dag.nodes.topological_sort();
+
+        // Step 1 — create every node as a VIEW so the DB engine can resolve
+        // the SQL (including any dialect-specific functions).
+        debug!("resolve_schemas: creating {} node(s) as views", topo.len());
+        for node_id in &topo {
+            let node = dag
+                .nodes
+                .get(node_id.clone())
+                .ok_or_else(|| ExecutorError::Exec(format!("node '{node_id}' not found")))?;
+
+            self.conn
+                .new_relation(MaterializeMode::View, node.id.clone(), node.query_text.clone())
+                .await
+                .map_err(|e| {
+                    ExecutorError::Exec(format!(
+                        "resolve_schemas: failed to create view for '{node_id}': {e}"
+                    ))
+                })?;
+        }
+
+        // Step 2 — fetch the Arrow schema for each node from the live DB.
+        debug!("resolve_schemas: fetching schemas for {} node(s)", topo.len());
+        let mut resolved: Vec<(String, datafusion::arrow::datatypes::SchemaRef)> = Vec::new();
+        for node_id in &topo {
+            match self.conn.get_schema(node_id.clone()).await {
+                Some(Ok(schema)) => {
+                    debug!("resolve_schemas: resolved schema for '{node_id}'");
+                    resolved.push((node_id.clone(), schema));
+                }
+                Some(Err(e)) => {
+                    // Cleanup before returning the error.
+                    let _ = self.cleanup(dag).await;
+                    return Err(ExecutorError::Exec(format!(
+                        "resolve_schemas: get_schema failed for '{node_id}': {e}"
+                    )));
+                }
+                None => {
+                    let _ = self.cleanup(dag).await;
+                    return Err(ExecutorError::Exec(format!(
+                        "resolve_schemas: no schema available for '{node_id}'"
+                    )));
+                }
+            }
+        }
+
+        // Step 3 — store the schemas on the nodes.
+        for (node_id, schema) in resolved {
+            if let Some(node) = dag.nodes.get_mut(node_id.clone()) {
+                node.schema = Some(schema);
+            }
+        }
+
+        // Step 4 — clean up all temporary views.
+        self.cleanup(dag).await.map_err(|e| {
+            ExecutorError::Exec(format!("resolve_schemas: cleanup failed: {e}"))
+        })?;
+
+        debug!("resolve_schemas: complete");
+        Ok(())
     }
 }
 
