@@ -1,20 +1,20 @@
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef,
-    catalog::{MemoryCatalogProvider, Session},
     catalog::memory::MemorySchemaProvider,
+    catalog::{MemoryCatalogProvider, Session},
     common::{
         Column, TableReference,
         tree_node::{Transformed, TreeNode},
     },
     datasource::{TableProvider, empty::EmptyTable, view::ViewTable},
     logical_expr::{
-        Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
+        Expr, LogicalPlan, TableProviderFilterPushDown, TableType,
         utils::{conjunction, disjunction},
     },
     physical_plan::ExecutionPlan,
     prelude::SessionContext,
-    sql::unparser::{expr_to_sql, plan_to_sql},
+    sql::unparser::expr_to_sql,
 };
 use log::{debug, trace};
 use std::{
@@ -307,7 +307,11 @@ fn build_opaque_context(
 
     // Register the opaque node using OpaqueScanTable so DataFusion pushes both
     // filters and projections directly into the TableScan node.
-    register_table_any(&ctx, opaque_id, Arc::new(OpaqueScanTable::new(opaque_schema)))?;
+    register_table_any(
+        &ctx,
+        opaque_id,
+        Arc::new(OpaqueScanTable::new(opaque_schema)),
+    )?;
 
     // Register every other transitive dep of target_id as EmptyTable using
     // its pre-resolved schema.  This avoids any SQL planning and works for
@@ -333,11 +337,7 @@ fn build_opaque_context(
             ))
         })?;
 
-        register_table_any(
-            &ctx,
-            node_id,
-            Arc::new(EmptyTable::new(Arc::clone(schema))),
-        )?;
+        register_table_any(&ctx, node_id, Arc::new(EmptyTable::new(Arc::clone(schema))))?;
     }
 
     Ok(ctx)
@@ -354,19 +354,14 @@ fn build_opaque_context(
 ///
 /// Returns `Some((filters, projected_column_names))` when the scan is found,
 /// `None` otherwise.
-fn extract_pushdowns(
-    plan: &LogicalPlan,
-    source_id: &str,
-) -> Option<(Vec<Expr>, Vec<String>)> {
+fn extract_pushdowns(plan: &LogicalPlan, source_id: &str) -> Option<(Vec<Expr>, Vec<String>)> {
     match plan {
         // Target scan found — read filters and projection directly from it.
         // Use resolved_eq so that a fully-qualified node ID like
         // `"warehouse"."main"."account_health"` matches a TableScan whose
         // table_name was parsed as Full { catalog, schema, table }.
         LogicalPlan::TableScan(ts)
-            if ts
-                .table_name
-                .resolved_eq(&TableReference::from(source_id)) =>
+            if ts.table_name.resolved_eq(&TableReference::from(source_id)) =>
         {
             let filters: Vec<Expr> = ts
                 .filters
@@ -498,16 +493,16 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<String, OptimizerError>
                 ))
             })?;
 
-        let opt_plan = ctx
-            .state()
-            .optimize(&raw_plan)
-            .map_err(|e| {
-                OptimizerError::Exec(format!(
-                    "pushdown: failed to optimize frontier node '{n_id}': {e}"
-                ))
-            })?;
+        let opt_plan = ctx.state().optimize(&raw_plan).map_err(|e| {
+            OptimizerError::Exec(format!(
+                "pushdown: failed to optimize frontier node '{n_id}': {e}"
+            ))
+        })?;
 
-        trace!("  frontier '{n_id}': optimized plan =\n{}", opt_plan.display_indent());
+        trace!(
+            "  frontier '{n_id}': optimized plan =\n{}",
+            opt_plan.display_indent()
+        );
 
         match extract_pushdowns(&opt_plan, source) {
             Some((filters, cols)) => {
@@ -519,13 +514,19 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<String, OptimizerError>
                 if filter_strs.is_empty() {
                     trace!("  frontier '{n_id}': no filter predicates found");
                 } else {
-                    trace!("  frontier '{n_id}': predicates = [{}]", filter_strs.join(", "));
+                    trace!(
+                        "  frontier '{n_id}': predicates = [{}]",
+                        filter_strs.join(", ")
+                    );
                 }
                 if cols.is_empty() {
                     trace!("  frontier '{n_id}': needs all columns");
                     any_node_needs_all_cols = true;
                 } else {
-                    trace!("  frontier '{n_id}': projected columns = [{}]", cols.join(", "));
+                    trace!(
+                        "  frontier '{n_id}': projected columns = [{}]",
+                        cols.join(", ")
+                    );
                     required_cols.extend(cols);
                 }
                 if !filters.is_empty() {
@@ -535,7 +536,9 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<String, OptimizerError>
             // Scan for source not found in this frontier node's plan — treat
             // conservatively: assume all columns needed, no filter extractable.
             None => {
-                trace!("  frontier '{n_id}': source scan not found in plan, assuming all columns needed");
+                trace!(
+                    "  frontier '{n_id}': source scan not found in plan, assuming all columns needed"
+                );
                 any_node_needs_all_cols = true;
             }
         }
@@ -587,14 +590,11 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<String, OptimizerError>
 
     let where_clause = match combined_filter {
         Some(expr) => {
-            let sql_expr = expr_to_sql(&strip_table_qualifier(expr))
-                .map_err(|e| {
-                    OptimizerError::Exec(format!("pushdown: expr_to_sql for '{source}': {e}"))
-                })?;
+            let sql_expr = expr_to_sql(&strip_table_qualifier(expr)).map_err(|e| {
+                OptimizerError::Exec(format!("pushdown: expr_to_sql for '{source}': {e}"))
+            })?;
             let filter_str = sql_expr.to_string();
-            debug!(
-                "pushdown '{source}': pushing filter  → {filter_str}"
-            );
+            debug!("pushdown '{source}': pushing filter  → {filter_str}");
             format!(" WHERE {filter_str}")
         }
         None => {
@@ -605,7 +605,10 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<String, OptimizerError>
 
     match &projection_cols {
         Some(cols) if !cols.is_empty() => {
-            debug!("pushdown '{source}': pushing projection → [{}]", cols.join(", "));
+            debug!(
+                "pushdown '{source}': pushing projection → [{}]",
+                cols.join(", ")
+            );
         }
         _ => {
             debug!("pushdown '{source}': no projection pruning (all columns needed)");
@@ -631,10 +634,7 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<String, OptimizerError>
 /// 3. Any `View` that has become a sink (nothing depends on it any more) is
 ///    removed from the graph together with all of its in-edges.
 /// 4. Repeat until no `View` nodes are left.
-pub async fn graph_minor<C>(dag: &Dag, conn: &C) -> Result<Dag, OptimizerError>
-where
-    C: Connector + Send + Sync,
-{
+pub async fn graph_minor(dag: &Dag) -> Result<Dag, OptimizerError> {
     let mut minor = dag.clone();
 
     loop {
@@ -675,14 +675,18 @@ where
             let view_sql = minor
                 .nodes
                 .get(view_id.clone())
-                .ok_or_else(|| OptimizerError::Exec(format!("graph_minor: view node '{view_id}' not found")))?
+                .ok_or_else(|| {
+                    OptimizerError::Exec(format!("graph_minor: view node '{view_id}' not found"))
+                })?
                 .query_text
                 .clone();
             let alias = bare_table_name(view_id);
             let current_table_sql = minor
                 .nodes
                 .get(table_id.clone())
-                .ok_or_else(|| OptimizerError::Exec(format!("graph_minor: table node '{table_id}' not found")))?
+                .ok_or_else(|| {
+                    OptimizerError::Exec(format!("graph_minor: table node '{table_id}' not found"))
+                })?
                 .query_text
                 .clone();
 
@@ -700,8 +704,7 @@ where
             // giving `FROM (view_sql) a`.  Adding an extra `AS "view_name"`
             // would create two consecutive aliases, which is invalid SQL.
             let _ = alias; // alias derived but not used in substitution
-            let new_sql = current_table_sql
-                .replace(view_id.as_str(), &format!("({view_sql})"));
+            let new_sql = current_table_sql.replace(view_id.as_str(), &format!("({view_sql})"));
 
             // 2a. Update the table's query text.
             {
@@ -811,13 +814,15 @@ where
         self.engine
             .resolve_schemas(&mut resolved_dag)
             .await
-            .map_err(|e| OptimizerError::Exec(format!("PushdownPass: resolve_schemas failed: {e}")))?;
+            .map_err(|e| {
+                OptimizerError::Exec(format!("PushdownPass: resolve_schemas failed: {e}"))
+            })?;
         debug!("PushdownPass: schemas resolved for all nodes");
 
         // Step 1 — compute the graph minor (all Views inlined into their
         // downstream Tables/TempTables) and work on that copy.
         debug!("PushdownPass: computing graph minor");
-        let minor = graph_minor(&resolved_dag, &*self._conn).await?;
+        let minor = graph_minor(&resolved_dag).await?;
         debug!(
             "PushdownPass: graph minor has {} nodes",
             minor.nodes.num_nodes()
@@ -883,7 +888,10 @@ where
                 continue;
             }
 
-            debug!("PushdownPass: '{node_id}' rewritten ({} chars)", new_sql.len());
+            debug!(
+                "PushdownPass: '{node_id}' rewritten ({} chars)",
+                new_sql.len()
+            );
 
             dag.nodes
                 .get_mut(node_id.clone())
@@ -987,7 +995,7 @@ mod tests {
         async fn resolve_schemas(&self, dag: &mut Dag) -> Result<(), ExecutorError> {
             // In tests we use DataFusion to derive schemas (no live DB).
             // Walk nodes in topological order, building a SessionContext as we go.
-            use crate::opt::pushdown::{register_table_any, is_transitive_dep as _itp};
+            use crate::opt::pushdown::register_table_any;
             use datafusion::datasource::empty::EmptyTable;
             use datafusion::datasource::view::ViewTable;
             use datafusion::prelude::SessionContext;
@@ -1391,7 +1399,9 @@ mod tests {
         let outer_proj = rewritten.split("FROM (").next().unwrap_or("");
         assert!(
             !outer_proj.contains("\"id\"")
-                && !outer_proj.split_whitespace().any(|t| t.trim_matches(',') == "id"),
+                && !outer_proj
+                    .split_whitespace()
+                    .any(|t| t.trim_matches(',') == "id"),
             "column `id` must not appear in the outer SELECT projection; got: {}",
             rewritten
         );
@@ -1444,9 +1454,7 @@ mod tests {
         let mut dag = make_dag(vec![cleaned, summary]);
         dag.sources = vec![source];
 
-        let minor = graph_minor(&dag, &StubConnector)
-            .await
-            .expect("graph_minor should succeed");
+        let minor = graph_minor(&dag).await.expect("graph_minor should succeed");
 
         // No views should remain.
         let view_count = minor
@@ -1535,9 +1543,7 @@ mod tests {
         let mut dag = make_dag(vec![step_one, step_two, output]);
         dag.sources = vec![source];
 
-        let minor = graph_minor(&dag, &StubConnector)
-            .await
-            .expect("graph_minor should succeed");
+        let minor = graph_minor(&dag).await.expect("graph_minor should succeed");
 
         let view_count = minor
             .nodes

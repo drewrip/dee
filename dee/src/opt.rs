@@ -49,8 +49,6 @@ where
     run_omp_pass: bool,
     /// Heuristic materialization plan
     run_hmp_pass: bool,
-    /// Logical rewriting
-    run_lr_pass: bool,
     /// OMP top N
     omp_top: Option<usize>,
     /// OMP node centrality metric
@@ -81,7 +79,6 @@ where
             engine,
             run_omp_pass: config.run_omp_pass,
             run_hmp_pass: config.run_hmp_pass,
-            run_lr_pass: config.run_lr_pass,
             omp_top: config.omp_top,
             omp_centrality: config.omp_centrality,
             omp_early_termination: config.omp_early_termination,
@@ -128,14 +125,9 @@ where
             debug!("skipping OMP pass");
         }
 
-        if self.run_lr_pass {
-            return Err(OptimizerError::NotImplemented("LR".to_string()));
-        } else {
-            debug!("skipping LR pass");
-        }
-
         if self.run_pushdown_pass {
-            let mut pass: PushdownPass<C, E> = PushdownPass::new(self.conn.clone(), self.engine.clone());
+            let mut pass: PushdownPass<C, E> =
+                PushdownPass::new(self.conn.clone(), self.engine.clone());
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
                 stats.insert("PushdownPass".to_string(), Arc::new(res));
@@ -152,7 +144,6 @@ where
 pub struct OptimizerConfig {
     pub run_omp_pass: bool,
     pub run_hmp_pass: bool,
-    pub run_lr_pass: bool,
     pub omp_top: Option<usize>,
     pub omp_centrality: OMPCentrality,
     pub omp_early_termination: bool,
@@ -165,7 +156,6 @@ impl Default for OptimizerConfig {
         OptimizerConfig {
             run_omp_pass: true,
             run_hmp_pass: true,
-            run_lr_pass: false,
             omp_top: None,
             omp_centrality: OMPCentrality::default(),
             omp_early_termination: true,
@@ -182,14 +172,12 @@ impl OptimizerConfig {
     pub fn with_all_disabled(mut self) -> Self {
         self.run_omp_pass = false;
         self.run_hmp_pass = false;
-        self.run_lr_pass = false;
         self
     }
 
     pub fn with_all_enabled(mut self) -> Self {
         self.run_omp_pass = true;
         self.run_hmp_pass = true;
-        self.run_lr_pass = false; // LR is still not implemented
         self
     }
 
@@ -209,11 +197,6 @@ impl OptimizerConfig {
 
     pub fn with_hmp_pass(mut self) -> Self {
         self.run_hmp_pass = true;
-        self
-    }
-
-    pub fn with_lr_pass(mut self) -> Self {
-        self.run_lr_pass = true;
         self
     }
 
