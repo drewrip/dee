@@ -26,8 +26,8 @@ def plot_data(results, output_path):
         attempts = []
         for key, value in omp_stats.items():
             if key.startswith("attempt_"):
-                # Skip cancelled attempts — they have no measurable runtime.
-                if value.startswith("cancelled("):
+                # Skip attempts with no measurable runtime (cancelled or baseline).
+                if value.startswith("cancelled(") or value.startswith("baseline("):
                     continue
                 attempt_runtime = float(value)
                 # Calculate percent reduction: (baseline - attempt) / baseline * 100
