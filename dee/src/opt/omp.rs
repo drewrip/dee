@@ -66,23 +66,21 @@ where
     async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError> {
         debug!("Running OMPPass with centrality: {:?}", self.centrality);
         let mut stats = HashMap::new();
-        let _ = self.engine.cleanup(dag).await.unwrap();
 
+        // Run the baseline using the DAG's current materialization configuration.
+        self.engine.cleanup(dag).await.unwrap();
         let baseline_cost = self
             .engine
             .run(dag)
             .await
             .map(|r| r.duration.num_milliseconds() as f32)
-            .map_err(|e| OptimizerError::Exec(format!("couldn't get baseline runtime: {e}")))?;
+            .map_err(|e| OptimizerError::Exec(format!("baseline run failed: {e}")))?;
 
-        let mut best_cost = baseline_cost;
-        let mut best_dag = dag.clone();
-
+        // Rank nodes by the chosen centrality metric. Only nodes with more than
+        // one downstream consumer benefit from materialization (out-degree > 1).
         let mut candidates: Vec<(String, usize)> = dag
             .nodes
             .nodes()
-            .filter(|n| matches!(n.materialize, MaterializeMode::View))
-            .cloned()
             .map(|n| {
                 let rank = match self.centrality {
                     OMPCentrality::OutDegree => dag.nodes.out_degree(&n.id),
@@ -93,13 +91,29 @@ where
             .filter(|(_, d)| *d > 1)
             .collect();
 
-        candidates.sort_by_key(|k| k.1);
-        let top_candidates: Vec<_> = if let Some(n) = self.top_n {
-            candidates.iter().rev().take(n).collect()
-        } else {
-            candidates.iter().rev().collect()
+        candidates.sort_by_key(|(_, rank)| *rank);
+
+        let top_candidates: Vec<String> = {
+            let iter = candidates.iter().rev();
+            match self.top_n {
+                Some(n) => iter.take(n).map(|(id, _)| id.clone()).collect(),
+                None => iter.map(|(id, _)| id.clone()).collect(),
+            }
         };
 
+        debug!("OMPPass: {} candidate node(s): {:?}", top_candidates.len(), top_candidates);
+
+        // Record the baseline materialization modes for the selected candidates
+        // so we can skip re-running that combination.
+        let baseline_modes: Vec<MaterializeMode> = top_candidates
+            .iter()
+            .map(|id| dag.nodes.get(id.clone()).unwrap().materialize.clone())
+            .collect();
+
+        let mut best_cost = baseline_cost;
+        let mut best_dag = dag.clone();
+
+        // Enumerate all 2^N combinations of View / TempTable for the candidates.
         let plans: Vec<Vec<MaterializeMode>> = repeat_n(
             [MaterializeMode::View, MaterializeMode::TempTable].into_iter(),
             top_candidates.len(),
@@ -107,31 +121,37 @@ where
         .multi_cartesian_product()
         .collect();
 
-        for (i, plan) in plans.iter().enumerate() {
-            debug!("OMPPass: iter {}", i + 1);
-            let _ = self.engine.cleanup(dag).await.unwrap();
+        debug!("OMPPass: {} plan(s) to evaluate (baseline excluded)", plans.len().saturating_sub(1));
 
+        for (i, plan) in plans.iter().enumerate() {
+            // The baseline combination was already measured above — skip it.
+            if *plan == baseline_modes {
+                debug!("OMPPass: plan {} is the baseline, skipping", i + 1);
+                stats.insert(format!("attempt_{}", i + 1), "baseline(skipped)".to_string());
+                continue;
+            }
+
+            self.engine.cleanup(dag).await.unwrap();
+
+            // Build the candidate DAG for this combination.
             let mut work_dag = dag.clone();
             for (pos, mode) in plan.iter().enumerate() {
-                let node_id = top_candidates.get(pos).unwrap().0.clone();
                 work_dag
                     .nodes
-                    .get_mut(node_id)
-                    .ok_or(OptimizerError::Exec("missing node".to_string()))?
+                    .get_mut(top_candidates[pos].clone())
+                    .ok_or_else(|| OptimizerError::Exec("missing node".to_string()))?
                     .materialize = mode.clone();
             }
 
             if self.use_pushdown {
-                let mut pushdown_pass =
-                    PushdownPass::new(self.conn.clone(), self.engine.clone());
+                let mut pushdown_pass = PushdownPass::new(self.conn.clone(), self.engine.clone());
                 if let Err(e) = pushdown_pass.run(&mut work_dag).await {
-                    debug!("OMPPass: pushdown failed for plan {}, skipping: {e}", i + 1);
+                    debug!("OMPPass: pushdown failed for plan {}, continuing without it: {e}", i + 1);
                 }
             }
 
             let current_cost = if self.early_termination {
                 let cancel_tx = self.engine.cancel_sender();
-                // Reset any prior cancellation before starting the run.
                 cancel_tx.send(false).ok();
                 let budget_ms = best_cost as u64;
                 let cancel_tx_timer = Arc::clone(&cancel_tx);
@@ -144,7 +164,7 @@ where
                 match result {
                     Ok(r) => r.duration.num_milliseconds() as f32,
                     Err(ExecutorError::Cancelled) => {
-                        debug!("OMPPass: plan {} cancelled after {}ms", i + 1, budget_ms);
+                        debug!("OMPPass: plan {} cancelled after {}ms budget", i + 1, budget_ms);
                         stats.insert(
                             format!("attempt_{}", i + 1),
                             format!("cancelled({})", budget_ms),
@@ -152,7 +172,7 @@ where
                         continue;
                     }
                     Err(e) => {
-                        return Err(OptimizerError::Exec(format!("test dag run failed - {}", e)));
+                        return Err(OptimizerError::Exec(format!("plan {} run failed: {e}", i + 1)));
                     }
                 }
             } else {
@@ -160,38 +180,42 @@ where
                     .run(&work_dag)
                     .await
                     .map(|r| r.duration.num_milliseconds() as f32)
-                    .map_err(|e| OptimizerError::Exec(format!("test dag run failed - {}", e)))?
+                    .map_err(|e| OptimizerError::Exec(format!("plan {} run failed: {e}", i + 1)))?
             };
 
             stats.insert(format!("attempt_{}", i + 1), current_cost.to_string());
-            if self.early_termination {
-                // Completed within the timeout window — it's the new best by definition
-                best_cost = current_cost;
-                best_dag = work_dag;
-            } else if current_cost < best_cost {
+
+            if current_cost < best_cost {
+                debug!(
+                    "OMPPass: plan {} is new best: {:.2}ms (was {:.2}ms)",
+                    i + 1,
+                    current_cost,
+                    best_cost
+                );
                 best_cost = current_cost;
                 best_dag = work_dag;
             }
         }
 
-        stats.insert("baseline_value".into(), baseline_cost.to_string());
-        stats.insert("best_value".into(), best_cost.to_string());
-        let change = (best_cost - baseline_cost) / (baseline_cost);
-        stats.insert("opt_change".into(), change.to_string());
+        let change = (best_cost - baseline_cost) / baseline_cost;
         debug!(
-            "OMPPass change: {:.2} -> {:.2} ({:.2}%)",
+            "OMPPass: {:.2}ms -> {:.2}ms ({:.2}%)",
             baseline_cost,
             best_cost,
             change * 100.0,
         );
 
-        let new_mats: Vec<String> = best_dag
+        stats.insert("baseline_value".into(), baseline_cost.to_string());
+        stats.insert("best_value".into(), best_cost.to_string());
+        stats.insert("opt_change".into(), change.to_string());
+
+        let best_plan: Vec<String> = best_dag
             .nodes
             .nodes()
             .filter(|n| matches!(n.materialize, MaterializeMode::TempTable))
             .map(|n| n.id.clone())
             .collect();
-        stats.insert("best_plan".into(), format!("{:?}", new_mats));
+        stats.insert("best_plan".into(), format!("{:?}", best_plan));
 
         *dag = best_dag;
         Ok(stats)

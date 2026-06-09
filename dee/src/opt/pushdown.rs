@@ -385,11 +385,23 @@ fn extract_pushdowns(plan: &LogicalPlan, source_id: &str) -> Option<(Vec<Expr>, 
             Some((filters, cols))
         }
 
-        // Recurse into every input branch until the scan is found.
-        other => other
-            .inputs()
-            .into_iter()
-            .find_map(|child| extract_pushdowns(child, source_id)),
+        // Recurse into every input branch, accumulating across all matches.
+        // A single query can reference the same table more than once (self-join,
+        // UNION, CTE expanded twice), producing multiple TableScan nodes for
+        // the same source_id.  find_map would silently drop all but the first.
+        other => {
+            let mut all_filters: Vec<Expr> = vec![];
+            let mut all_cols: Vec<String> = vec![];
+            let mut found = false;
+            for child in other.inputs() {
+                if let Some((filters, cols)) = extract_pushdowns(child, source_id) {
+                    all_filters.extend(filters);
+                    all_cols.extend(cols);
+                    found = true;
+                }
+            }
+            if found { Some((all_filters, all_cols)) } else { None }
+        }
     }
 }
 
@@ -440,7 +452,7 @@ fn strip_table_qualifier(expr: Expr) -> Expr {
 /// uses dialect-specific functions DataFusion cannot plan (e.g. DuckDB's
 /// `date_diff`), the wrapper is constructed directly as a SQL string so the
 /// original query is preserved verbatim.
-pub async fn pushdown(dag: &Dag, source: &str) -> Result<String, OptimizerError> {
+pub async fn pushdown(dag: &Dag, source: &str) -> Result<(String, SchemaRef), OptimizerError> {
     let source_node = dag
         .nodes
         .get(source.to_string())
@@ -574,7 +586,7 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<String, OptimizerError>
     // If there is nothing to push down, return the original query unchanged.
     if combined_filter.is_none() && projection_cols.is_none() {
         debug!("pushdown '{source}': nothing to push down");
-        return Ok(source_node.query_text.clone());
+        return Ok((source_node.query_text.clone(), Arc::clone(&source_schema)));
     }
 
     // Construct the final SQL by wrapping the original query as a subquery and
@@ -615,9 +627,32 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<String, OptimizerError>
         }
     }
 
-    Ok(format!(
-        "SELECT {col_list} FROM ({inner}) AS \"{alias}\"{where_clause}",
-        inner = source_node.query_text,
+    // Compute the output schema for the rewritten node.  When columns were
+    // pruned, the new schema is the projection subset (in original field order);
+    // otherwise it is identical to the pre-rewrite schema.
+    let new_schema: SchemaRef = match &projection_cols {
+        Some(cols) if !cols.is_empty() => {
+            use datafusion::arrow::datatypes::Schema;
+            let fields: Vec<_> = cols
+                .iter()
+                .filter_map(|name| {
+                    source_schema
+                        .field_with_name(name)
+                        .ok()
+                        .cloned()
+                })
+                .collect();
+            Arc::new(Schema::new(fields))
+        }
+        _ => Arc::clone(&source_schema),
+    };
+
+    Ok((
+        format!(
+            "SELECT {col_list} FROM ({inner}) AS \"{alias}\"{where_clause}",
+            inner = source_node.query_text,
+        ),
+        new_schema,
     ))
 }
 
@@ -869,8 +904,8 @@ where
             // If pushdown or unparsing fails for this node (e.g. the SQL uses
             // dialect-specific constructs DataFusion cannot plan), skip it and
             // leave its query_text unchanged.  The pass is best-effort.
-            let new_sql = match pushdown(&minor, node_id).await {
-                Ok(sql) => sql,
+            let (new_sql, new_schema) = match pushdown(&minor, node_id).await {
+                Ok(result) => result,
                 Err(e) => {
                     debug!("PushdownPass: skipping '{node_id}', pushdown failed: {e}");
                     continue;
@@ -893,14 +928,13 @@ where
                 new_sql.len()
             );
 
-            dag.nodes
-                .get_mut(node_id.clone())
-                .ok_or_else(|| {
-                    OptimizerError::Exec(format!(
-                        "PushdownPass: node '{node_id}' missing from original DAG"
-                    ))
-                })?
-                .query_text = new_sql;
+            let node = dag.nodes.get_mut(node_id.clone()).ok_or_else(|| {
+                OptimizerError::Exec(format!(
+                    "PushdownPass: node '{node_id}' missing from original DAG"
+                ))
+            })?;
+            node.query_text = new_sql;
+            node.schema = Some(new_schema);
 
             rewrites += 1;
         }
@@ -1654,7 +1688,7 @@ mod tests {
         )
         .await;
 
-        let sql = pushdown(&dag, "staging")
+        let (sql, _schema) = pushdown(&dag, "staging")
             .await
             .expect("pushdown should succeed");
 
@@ -1701,7 +1735,7 @@ mod tests {
         )
         .await;
 
-        let sql = pushdown(&dag, "staging")
+        let (sql, _schema) = pushdown(&dag, "staging")
             .await
             .expect("pushdown should succeed");
 
