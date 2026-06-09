@@ -7,7 +7,7 @@ use crate::{
     connectors::Connector,
     dag::MaterializeMode,
     executor::{Executor, ExecutorError},
-    opt::{Dag, OptimizerError, OptimizerPass},
+    opt::{Dag, OptimizerError, OptimizerPass, pushdown::PushdownPass},
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -23,10 +23,12 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
+    conn: Arc<C>,
     engine: Arc<E>,
     top_n: Option<usize>,
     centrality: OMPCentrality,
     early_termination: bool,
+    use_pushdown: bool,
     _phantom: PhantomData<C>,
 }
 
@@ -36,17 +38,20 @@ where
     E: Executor<C> + Send + Sync,
 {
     pub fn new(
-        _conn: Arc<C>,
+        conn: Arc<C>,
         engine: Arc<E>,
         top_n: Option<usize>,
         centrality: OMPCentrality,
         early_termination: bool,
+        use_pushdown: bool,
     ) -> Self {
         Self {
+            conn,
             engine,
             top_n,
             centrality,
             early_termination,
+            use_pushdown,
             _phantom: PhantomData,
         }
     }
@@ -71,6 +76,8 @@ where
             .map_err(|e| OptimizerError::Exec(format!("couldn't get baseline runtime: {e}")))?;
 
         let mut best_cost = baseline_cost;
+        let mut best_dag = dag.clone();
+
         let mut candidates: Vec<(String, usize)> = dag
             .nodes
             .nodes()
@@ -100,22 +107,26 @@ where
         .multi_cartesian_product()
         .collect();
 
-        let mut work_dag = dag.clone();
-        let mut best_plan: Vec<MaterializeMode> = top_candidates
-            .iter()
-            .map(|c| dag.nodes.get(c.0.clone()).unwrap().materialize)
-            .collect();
         for (i, plan) in plans.iter().enumerate() {
             debug!("OMPPass: iter {}", i + 1);
             let _ = self.engine.cleanup(dag).await.unwrap();
 
-            for node in plan.iter().enumerate() {
-                let node_id = top_candidates.get(node.0).unwrap().0.clone();
+            let mut work_dag = dag.clone();
+            for (pos, mode) in plan.iter().enumerate() {
+                let node_id = top_candidates.get(pos).unwrap().0.clone();
                 work_dag
                     .nodes
-                    .get_mut(node_id.clone())
+                    .get_mut(node_id)
                     .ok_or(OptimizerError::Exec("missing node".to_string()))?
-                    .materialize = node.1.clone();
+                    .materialize = mode.clone();
+            }
+
+            if self.use_pushdown {
+                let mut pushdown_pass =
+                    PushdownPass::new(self.conn.clone(), self.engine.clone());
+                if let Err(e) = pushdown_pass.run(&mut work_dag).await {
+                    debug!("OMPPass: pushdown failed for plan {}, skipping: {e}", i + 1);
+                }
             }
 
             let current_cost = if self.early_termination {
@@ -156,10 +167,10 @@ where
             if self.early_termination {
                 // Completed within the timeout window — it's the new best by definition
                 best_cost = current_cost;
-                best_plan = plan.clone();
+                best_dag = work_dag;
             } else if current_cost < best_cost {
                 best_cost = current_cost;
-                best_plan = plan.clone();
+                best_dag = work_dag;
             }
         }
 
@@ -174,19 +185,15 @@ where
             change * 100.0,
         );
 
-        let mut new_mats = vec![];
-        for node in best_plan.clone().into_iter().enumerate() {
-            let node_id = top_candidates.get(node.0).unwrap().0.clone();
-            if matches!(node.1, MaterializeMode::TempTable) {
-                new_mats.push(node_id.clone());
-            }
-            dag.nodes
-                .get_mut(node_id)
-                .ok_or(OptimizerError::Exec("missing node".to_string()))?
-                .materialize = node.1.clone();
-        }
-
+        let new_mats: Vec<String> = best_dag
+            .nodes
+            .nodes()
+            .filter(|n| matches!(n.materialize, MaterializeMode::TempTable))
+            .map(|n| n.id.clone())
+            .collect();
         stats.insert("best_plan".into(), format!("{:?}", new_mats));
+
+        *dag = best_dag;
         Ok(stats)
     }
 }

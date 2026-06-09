@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
-use futures::{StreamExt, stream::FuturesUnordered};
+use tokio::task::JoinSet;
 use log::{debug, warn};
 
 use std::{
@@ -188,7 +188,8 @@ where
 
     async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError> {
         let mut work_graph = dag.nodes.clone();
-        let mut work_queue = FuturesUnordered::new();
+        let mut work_queue: JoinSet<Result<(usize, String, NodeStats), ExecutorError>> =
+            JoinSet::new();
         let initial_size = work_graph.num_nodes();
         let mut finished = 0;
         let mut in_progress = HashSet::new();
@@ -212,7 +213,14 @@ where
         while work_graph.num_nodes() > 0 {
             if *self.cancel_rx.borrow() {
                 debug!("SimpleEngine: cancellation requested, stopping execution");
-                drop(work_queue);
+                // Abort all queued tasks and wait for them to finish before
+                // cleaning up.  Simply dropping a JoinHandle detaches the task
+                // rather than cancelling it, so in-flight CREATE TABLE/VIEW
+                // statements would race against the cleanup that follows.
+                // abort_all() + drain guarantees no tasks are still modifying
+                // the database when cleanup runs.
+                work_queue.abort_all();
+                while work_queue.join_next().await.is_some() {}
                 if let Some(ref stop) = sampler_stop {
                     let _ = stop.send(true);
                 }
@@ -236,7 +244,7 @@ where
                 debug!("running node tidx={}", node_id);
                 debug!("work_queue.len()={}", work_queue.len());
                 in_progress.insert(node_id.clone());
-                work_queue.push(tokio::spawn(async move {
+                work_queue.spawn(async move {
                     let node_start = Utc::now();
                     let (res, plan) = if plans_dir.is_some() || collect_plans {
                         let (res, plan) = conn
@@ -282,10 +290,10 @@ where
                             plan,
                         },
                     ))
-                }));
+                });
             }
             // wait for one node to finish, then loop back to queue any newly-runnable nodes
-            if let Some(item) = work_queue.next().await {
+            if let Some(item) = work_queue.join_next().await {
                 let (_, node_id, stats) =
                     item.map_err(|j| ExecutorError::Exec(format!("join error - {}", j)))??;
                 debug!("recv result for nidx={:?}", node_id);

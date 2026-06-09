@@ -115,8 +115,9 @@ def benchmark(
     max_mem=None,
     threads=None,
     omp_top=None,
-    omp_cost=None,
     omp_node_centrality=None,
+    omp_exhaust=False,
+    omp_use_pushdown=False,
     enable=None,
     disable=None,
     hmp_no_plan_dups=False,
@@ -190,10 +191,12 @@ def benchmark(
         ]
         if omp_top:
             opt_cmd.extend(["--omp-top", str(omp_top)])
-        if omp_cost:
-            opt_cmd.extend(["--omp-cost", omp_cost])
         if omp_node_centrality:
             opt_cmd.extend(["--omp-node-centrality", omp_node_centrality])
+        if omp_exhaust:
+            opt_cmd.append("--omp-exhaust")
+        if omp_use_pushdown:
+            opt_cmd.append("--omp-use-pushdown")
         if enable:
             opt_cmd.extend(["--enable", enable])
         if disable:
@@ -331,14 +334,19 @@ def main():
         help="Number of top views to consider for materialization in OMPPass",
     )
     parser.add_argument(
-        "--omp-cost",
-        choices=["actual", "estimate"],
-        help="Cost metric for OMPPass (actual or estimate)",
-    )
-    parser.add_argument(
         "--omp-node-centrality",
         choices=["outdegree", "paths"],
         help="Node centrality metric for OMPPass (outdegree or paths)",
+    )
+    parser.add_argument(
+        "--omp-exhaust",
+        action="store_true",
+        help="Disable early termination in OMPPass and evaluate all candidate plans",
+    )
+    parser.add_argument(
+        "--omp-use-pushdown",
+        action="store_true",
+        help="Run the pushdown pass on each OMP candidate DAG before benchmarking it",
     )
     parser.add_argument(
         "--enable",
@@ -386,8 +394,9 @@ def main():
         max_mem=args.max_mem,
         threads=args.threads,
         omp_top=args.omp_top,
-        omp_cost=args.omp_cost,
         omp_node_centrality=args.omp_node_centrality,
+        omp_exhaust=args.omp_exhaust,
+        omp_use_pushdown=args.omp_use_pushdown,
         enable=args.enable,
         disable=args.disable,
         hmp_no_plan_dups=args.hmp_no_plan_dups,
