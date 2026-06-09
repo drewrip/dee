@@ -80,6 +80,8 @@ pub struct OptCommand {
     hmp_no_plan_dups: bool,
     #[arg(long, action)]
     omp_exhaust: bool,
+    #[arg(long, action)]
+    omp_use_pushdown: bool,
 
     dag_file: String,
 }

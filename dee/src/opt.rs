@@ -55,6 +55,8 @@ where
     omp_centrality: OMPCentrality,
     /// OMP early termination
     omp_early_termination: bool,
+    /// OMP use pushdown before each candidate evaluation
+    omp_use_pushdown: bool,
     /// HMP no plan dups
     hmp_no_plan_dups: bool,
     /// Pushdown pass
@@ -82,6 +84,7 @@ where
             omp_top: config.omp_top,
             omp_centrality: config.omp_centrality,
             omp_early_termination: config.omp_early_termination,
+            omp_use_pushdown: config.omp_use_pushdown,
             hmp_no_plan_dups: config.hmp_no_plan_dups,
             run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
@@ -116,6 +119,7 @@ where
                 self.omp_top,
                 self.omp_centrality,
                 self.omp_early_termination,
+                self.omp_use_pushdown,
             );
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
@@ -147,6 +151,7 @@ pub struct OptimizerConfig {
     pub omp_top: Option<usize>,
     pub omp_centrality: OMPCentrality,
     pub omp_early_termination: bool,
+    pub omp_use_pushdown: bool,
     pub hmp_no_plan_dups: bool,
     pub run_pushdown_pass: bool,
 }
@@ -159,6 +164,7 @@ impl Default for OptimizerConfig {
             omp_top: None,
             omp_centrality: OMPCentrality::default(),
             omp_early_termination: true,
+            omp_use_pushdown: false,
             hmp_no_plan_dups: false,
             run_pushdown_pass: false,
         }
@@ -212,6 +218,11 @@ impl OptimizerConfig {
 
     pub fn with_omp_early_termination(mut self, early_termination: bool) -> Self {
         self.omp_early_termination = early_termination;
+        self
+    }
+
+    pub fn with_omp_use_pushdown(mut self, use_pushdown: bool) -> Self {
+        self.omp_use_pushdown = use_pushdown;
         self
     }
 
