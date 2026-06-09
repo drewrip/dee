@@ -7,7 +7,7 @@ use crate::{
     connectors::Connector,
     dag::MaterializeMode,
     executor::{Executor, ExecutorError},
-    opt::{Dag, OptimizerError, OptimizerPass, pushdown::PushdownPass},
+    opt::{Dag, OptimizerError, OptimizerPass, common::make_temp, pushdown::PushdownPass},
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -135,12 +135,20 @@ where
 
             // Build the candidate DAG for this combination.
             let mut work_dag = dag.clone();
+            let mut lp_counter = 0;
             for (pos, mode) in plan.iter().enumerate() {
-                work_dag
-                    .nodes
-                    .get_mut(top_candidates[pos].clone())
-                    .ok_or_else(|| OptimizerError::Exec("missing node".to_string()))?
-                    .materialize = mode.clone();
+                match mode {
+                    MaterializeMode::TempTable => {
+                        make_temp(&mut work_dag, &top_candidates[pos], &mut lp_counter)?;
+                    }
+                    other => {
+                        work_dag
+                            .nodes
+                            .get_mut(top_candidates[pos].clone())
+                            .ok_or_else(|| OptimizerError::Exec("missing node".to_string()))?
+                            .materialize = *other;
+                    }
+                }
             }
 
             if self.use_pushdown {

@@ -11,7 +11,7 @@ use crate::{
     connectors::Connector,
     dag::MaterializeMode,
     executor::{Executor, ProfilingConfig, SimpleEngine},
-    opt::{Dag, OptimizerError, OptimizerPass},
+    opt::{Dag, OptimizerError, OptimizerPass, common::make_temp},
 };
 
 #[derive(Debug, Clone)]
@@ -294,7 +294,8 @@ where
                 node_id
             );
             stats.insert("new_materialization".into(), node_id.clone());
-            dag.nodes.get_mut(node_id).unwrap().materialize = MaterializeMode::TempTable;
+            let mut lp_counter = 0;
+            make_temp(dag, &node_id, &mut lp_counter)?;
         } else {
             debug!("Heuristic complete: no suitable node found to materialize");
             stats.insert("new_materialization".into(), "none".into());
