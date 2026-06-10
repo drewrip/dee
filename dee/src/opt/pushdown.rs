@@ -787,6 +787,31 @@ pub async fn graph_minor(dag: &Dag) -> Result<Dag, OptimizerError> {
         }
     }
 
+    // Final sweep: remove any zombie view islands — views that are only
+    // referenced by other views (no Table/TempTable consumer anywhere in their
+    // downstream).  These arise when make_temp rebases a frontier node onto an
+    // lp_* TempTable, leaving the original view chain (and its upstream nodes)
+    // with no non-view consumer.  Iteratively remove out-degree-0 views until
+    // none remain; each removal cascades to upstream views whose out-degree may
+    // now also drop to 0.
+    loop {
+        let dead: Vec<String> = minor
+            .nodes
+            .nodes()
+            .filter(|n| {
+                matches!(n.materialize, MaterializeMode::View)
+                    && minor.nodes.out_degree(&n.id) == 0
+            })
+            .map(|n| n.id.clone())
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        for view_id in dead {
+            minor.nodes.remove(view_id);
+        }
+    }
+
     // Sanity check: no View nodes should remain.
     let remaining_views: Vec<_> = minor
         .nodes
