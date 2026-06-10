@@ -69,6 +69,35 @@ where
 
         // Run the baseline using the DAG's current materialization configuration.
         self.engine.cleanup(dag).await.unwrap();
+
+        // Pre-flight: drop any lp_* landing-pad artifacts left over from a
+        // previous process invocation.  OMP adds lp_N nodes during evaluation
+        // and cleans them up at the end, but an interrupted prior run may have
+        // left stale TABLE entries in the DB.  Try dropping lp_0..lp_99 as
+        // both TABLE and VIEW.  Missing entries are silently ignored.
+        if let Some(prefix) = dag.nodes.nodes().next().map(|n| {
+            let id = &n.id;
+            id.rfind("\".\"")
+                .map(|pos| format!("{}\".", &id[..pos]))
+                .unwrap_or_default()
+        }) {
+            for i in 0..100 {
+                let lp = if prefix.is_empty() {
+                    format!("lp_{i}")
+                } else {
+                    format!("{prefix}\"lp_{i}\"")
+                };
+                self.conn
+                    .drop_relation(MaterializeMode::Table, lp.clone())
+                    .await
+                    .ok();
+                self.conn
+                    .drop_relation(MaterializeMode::View, lp)
+                    .await
+                    .ok();
+            }
+        }
+
         let baseline_cost = self
             .engine
             .run(dag)
@@ -123,6 +152,12 @@ where
 
         debug!("OMPPass: {} plan(s) to evaluate (baseline excluded)", plans.len().saturating_sub(1));
 
+        // Track the DAG that ran most recently so cleanup covers any landing-pad
+        // nodes (lp_*) that make_temp adds to work_dag but that are absent from
+        // the original dag.  Starts as dag.clone() because the baseline run used
+        // the original dag.
+        let mut last_run_dag = dag.clone();
+
         for (i, plan) in plans.iter().enumerate() {
             // The baseline combination was already measured above — skip it.
             if *plan == baseline_modes {
@@ -131,7 +166,9 @@ where
                 continue;
             }
 
-            self.engine.cleanup(dag).await.unwrap();
+            // Clean up whatever the previous trial materialized, including any
+            // lp_* nodes that make_temp inserted into last_run_dag.
+            self.engine.cleanup(&last_run_dag).await.unwrap();
 
             // Build the candidate DAG for this combination.
             let mut work_dag = dag.clone();
@@ -177,6 +214,7 @@ where
                             format!("attempt_{}", i + 1),
                             format!("cancelled({})", budget_ms),
                         );
+                        last_run_dag = work_dag;
                         continue;
                     }
                     Err(e) => {
@@ -201,9 +239,16 @@ where
                     best_cost
                 );
                 best_cost = current_cost;
-                best_dag = work_dag;
+                best_dag = work_dag.clone();
             }
+
+            last_run_dag = work_dag;
         }
+
+        // Drop whatever the last trial materialized (including any lp_* landing
+        // pads).  Without this, those tables would persist in the DB across
+        // process invocations and cause "already exists" errors on the next run.
+        self.engine.cleanup(&last_run_dag).await.unwrap();
 
         let change = (best_cost - baseline_cost) / baseline_cost;
         debug!(

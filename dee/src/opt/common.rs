@@ -36,7 +36,15 @@ pub fn make_temp(
     let frontier: HashSet<String> = dag.nodes.frontier_materializes(view_name);
 
     // 1. Create the landing-pad TempTable.
-    let lp_name = format!("lp_{}", *counter);
+    // Use the same schema prefix as view_name so the executor places the
+    // landing pad in the same catalog/schema (e.g. "warehouse"."main"."lp_0").
+    // schema_prefix("warehouse"."main"."foo") → "warehouse"."main".
+    let prefix = schema_prefix(view_name);
+    let lp_name = if prefix.is_empty() {
+        format!("lp_{counter}")
+    } else {
+        format!("{prefix}\"lp_{counter}\"")
+    };
     *counter += 1;
 
     let mut lp_deps = HashSet::new();
@@ -123,6 +131,25 @@ pub fn make_temp(
     }
 
     Ok(lp_name)
+}
+
+/// Extract the schema prefix from a qualified node ID.
+///
+/// Examples:
+///   `"warehouse"."main"."foo"` → `"warehouse"."main".`
+///   `"foo"`                    → `` (empty — no prefix)
+///
+/// The landing pad inherits this prefix so it lands in the same catalog/schema.
+fn schema_prefix(node_id: &str) -> String {
+    // Qualified identifiers join segments with `"."`.  Find the last occurrence
+    // of that separator and return everything up to and including it.
+    if let Some(pos) = node_id.rfind("\".\"") {
+        // pos is the index of `"` before the last `.`
+        // include the closing `"` and the `.`: advance by 2 to end after `".`
+        format!("{}\".", &node_id[..pos])
+    } else {
+        String::new()
+    }
 }
 
 /// Returns `true` if `dep` appears in the transitive dependency set of `node_id`.
