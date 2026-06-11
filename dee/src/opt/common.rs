@@ -1,9 +1,347 @@
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::Arc,
+};
+
+use datafusion::{
+    arrow::{
+        array::{ArrayRef, new_null_array},
+        datatypes::{DataType, FieldRef, SchemaRef},
+    },
+    catalog::memory::MemorySchemaProvider,
+    catalog::MemoryCatalogProvider,
+    common::TableReference,
+    datasource::{TableProvider, empty::EmptyTable},
+    logical_expr::{
+        AggregateUDF, AggregateUDFImpl, Accumulator, PartitionEvaluator, ScalarUDF, ScalarUDFImpl,
+        Signature, Volatility, WindowUDF, WindowUDFImpl,
+        function::{AccumulatorArgs, PartitionEvaluatorArgs, StateFieldsArgs, WindowUDFFieldArgs},
+    },
+    physical_plan::ColumnarValue,
+    prelude::SessionContext,
+    scalar::ScalarValue,
+};
 
 use crate::{
     dag::{Dag, MaterializeMode, TransformNode},
     opt::OptimizerError,
 };
+
+// ---------------------------------------------------------------------------
+// Stub UDF/UDAF/UDWF — planning-only, never executed
+//
+// Registering these stubs on a SessionContext lets DataFusion plan queries
+// that contain dialect-specific functions (e.g. DuckDB's `date_diff`) which
+// have no built-in DataFusion implementation.  We don't care what the
+// functions *do* — only what columns/filters they depend on — so returning
+// DataType::Null for every call is safe for our planning-only usage.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StubScalar {
+    name: String,
+    sig: Signature,
+}
+
+impl StubScalar {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            sig: Signature::variadic_any(Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for StubScalar {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str { &self.name }
+    fn signature(&self) -> &Signature { &self.sig }
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
+        Ok(DataType::Null)
+    }
+    fn invoke_with_args(
+        &self,
+        _args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> datafusion::common::Result<ColumnarValue> {
+        datafusion::common::internal_err!("planning-only stub '{}' was executed", self.name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StubAggregate {
+    name: String,
+    sig: Signature,
+}
+
+impl StubAggregate {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            sig: Signature::variadic_any(Volatility::Immutable),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StubAccumulator;
+
+impl Accumulator for StubAccumulator {
+    fn update_batch(&mut self, _values: &[ArrayRef]) -> datafusion::common::Result<()> {
+        datafusion::common::internal_err!("planning-only stub accumulator used")
+    }
+    fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
+        datafusion::common::internal_err!("planning-only stub accumulator used")
+    }
+    fn size(&self) -> usize { 0 }
+    fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
+        datafusion::common::internal_err!("planning-only stub accumulator used")
+    }
+    fn merge_batch(&mut self, _states: &[ArrayRef]) -> datafusion::common::Result<()> {
+        datafusion::common::internal_err!("planning-only stub accumulator used")
+    }
+}
+
+impl AggregateUDFImpl for StubAggregate {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str { &self.name }
+    fn signature(&self) -> &Signature { &self.sig }
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
+        Ok(DataType::Null)
+    }
+    fn accumulator(&self, _acc_args: AccumulatorArgs) -> datafusion::common::Result<Box<dyn Accumulator>> {
+        Ok(Box::new(StubAccumulator))
+    }
+    fn state_fields(&self, _args: StateFieldsArgs) -> datafusion::common::Result<Vec<FieldRef>> {
+        Ok(vec![Arc::new(datafusion::arrow::datatypes::Field::new(
+            "stub_state",
+            DataType::Null,
+            true,
+        ))])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StubWindow {
+    name: String,
+    sig: Signature,
+}
+
+impl StubWindow {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            sig: Signature::variadic_any(Volatility::Immutable),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StubPartitionEvaluator;
+
+impl PartitionEvaluator for StubPartitionEvaluator {
+    fn evaluate_all(&mut self, _values: &[ArrayRef], num_rows: usize) -> datafusion::common::Result<ArrayRef> {
+        Ok(new_null_array(&DataType::Null, num_rows))
+    }
+}
+
+impl WindowUDFImpl for StubWindow {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str { &self.name }
+    fn signature(&self) -> &Signature { &self.sig }
+    fn field(&self, _field_args: WindowUDFFieldArgs) -> datafusion::common::Result<FieldRef> {
+        Ok(Arc::new(datafusion::arrow::datatypes::Field::new(
+            self.name(),
+            DataType::Null,
+            true,
+        )))
+    }
+    fn partition_evaluator(&self, _args: PartitionEvaluatorArgs) -> datafusion::common::Result<Box<dyn PartitionEvaluator>> {
+        Ok(Box::new(StubPartitionEvaluator))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub-aware SQL planner
+// ---------------------------------------------------------------------------
+
+/// Extract an unknown function name from a DataFusion planning error.
+///
+/// DataFusion 53 reports unknown functions as `Invalid function 'name'`.
+/// We also handle the older `There is no UDF/UDAF/UDWF named "name"` messages
+/// for forward-compatibility.  When the newer single-quote format is detected
+/// we cannot tell whether the function is scalar/aggregate/window from the
+/// error alone, so we register stubs for all three kinds and let DataFusion's
+/// context-driven dispatch select the correct one.
+fn extract_unknown_fn_name(err: &datafusion::common::DataFusionError) -> Option<String> {
+    let msg = err.to_string();
+
+    // DF 53+ format: Invalid function 'name'
+    if let Some(start) = msg.find("Invalid function '") {
+        let rest = &msg[start + "Invalid function '".len()..];
+        if let Some(end) = rest.find('\'') {
+            return Some(rest[..end].to_string());
+        }
+    }
+
+    // Legacy format (kept for robustness): There is no UDF/UDAF/UDWF named "name"
+    for prefix in &[
+        "There is no UDF named \"",
+        "There is no UDAF named \"",
+        "There is no UDWF named \"",
+    ] {
+        if let Some(start) = msg.find(prefix) {
+            let rest = &msg[start + prefix.len()..];
+            if let Some(end) = rest.find('"') {
+                return Some(rest[..end].to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Plan `sql` on `ctx`, automatically registering planning-only stub functions
+/// for any unknown scalar/aggregate/window function.
+///
+/// When DataFusion cannot resolve a function name it raises an error.  We
+/// catch those errors, register stubs for the unknown function as all three
+/// kinds (scalar, aggregate, window), and retry.  DataFusion's context-driven
+/// resolution picks the correct kind based on where the call appears in the
+/// query.  Retries up to 64 times to guard against infinite loops.
+pub async fn create_logical_plan_with_stubs(
+    ctx: &SessionContext,
+    sql: &str,
+) -> datafusion::common::Result<datafusion::logical_expr::LogicalPlan> {
+    for _ in 0..64u32 {
+        match ctx.state().create_logical_plan(sql).await {
+            Ok(plan) => return Ok(plan),
+            Err(e) => match extract_unknown_fn_name(&e) {
+                Some(name) => {
+                    // Register the function as all three stub kinds.  DataFusion
+                    // resolves which one to use from the call site context.
+                    ctx.register_udf(ScalarUDF::new_from_impl(StubScalar::new(&name)));
+                    ctx.register_udaf(AggregateUDF::new_from_impl(StubAggregate::new(&name)));
+                    ctx.register_udwf(WindowUDF::new_from_impl(StubWindow::new(&name)));
+                }
+                None => return Err(e),
+            },
+        }
+    }
+    datafusion::common::internal_err!("create_logical_plan_with_stubs: exceeded retry limit")
+}
+
+// ---------------------------------------------------------------------------
+// register_table_any — shared catalog/schema creation helper
+// ---------------------------------------------------------------------------
+
+/// Register `provider` in `ctx` under `name`, which may be an unqualified,
+/// two-part (`schema.table`), or three-part (`catalog.schema.table`) name.
+///
+/// DataFusion's default [`SessionContext`] only contains a `datafusion`
+/// catalog.  When node IDs carry fully-qualified names the catalog and schema
+/// must be created first.  This helper ensures they exist before delegating to
+/// [`SessionContext::register_table`].
+pub fn register_table_any(
+    ctx: &SessionContext,
+    name: &str,
+    provider: Arc<dyn TableProvider>,
+) -> Result<(), OptimizerError> {
+    let table_ref = TableReference::from(name);
+
+    if let TableReference::Full { catalog, schema, .. } = &table_ref {
+        if ctx.catalog(catalog.as_ref()).is_none() {
+            ctx.register_catalog(catalog.as_ref(), Arc::new(MemoryCatalogProvider::new()));
+        }
+        let cat = ctx
+            .catalog(catalog.as_ref())
+            .ok_or_else(|| OptimizerError::Exec(format!("failed to create catalog '{catalog}'")))?;
+
+        if cat.schema(schema.as_ref()).is_none() {
+            cat.register_schema(schema.as_ref(), Arc::new(MemorySchemaProvider::new()))
+                .map_err(|e| {
+                    OptimizerError::Exec(format!(
+                        "failed to create schema '{catalog}.{schema}': {e}"
+                    ))
+                })?;
+        }
+    }
+
+    ctx.register_table(table_ref, provider)
+        .map(|_| ())
+        .map_err(|e| OptimizerError::Exec(format!("failed to register table '{name}': {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// build_opaque_context — shared by PushdownPass and other passes
+// ---------------------------------------------------------------------------
+
+use crate::opt::pushdown::OpaqueScanTable;
+
+/// Build a [`SessionContext`] in which every transitive dependency of
+/// `target_id` is registered, with one special rule: `opaque_id` (the
+/// TempTable under analysis) is always registered as an [`OpaqueScanTable`]
+/// backed by `opaque_schema`, so the DataFusion optimizer surfaces pushed-down
+/// predicates and projections in the resulting [`LogicalPlan`] tree.
+///
+/// All other nodes use their pre-resolved `TransformNode::schema` (populated
+/// by `Executor::resolve_schemas`).  No SQL planning or connector calls are
+/// made here — only schema registration.
+///
+/// Unknown dialect-specific functions in any registered node's SQL are handled
+/// transparently via [`create_logical_plan_with_stubs`]; callers do not need
+/// to worry about this.
+pub fn build_opaque_context(
+    dag: &Dag,
+    target_id: &str,
+    opaque_id: &str,
+    opaque_schema: SchemaRef,
+) -> Result<SessionContext, OptimizerError> {
+    let ctx = SessionContext::new();
+
+    for src in &dag.sources {
+        register_table_any(
+            &ctx,
+            &src.name,
+            Arc::new(EmptyTable::new(Arc::clone(&src.schema))),
+        )?;
+    }
+
+    register_table_any(
+        &ctx,
+        opaque_id,
+        Arc::new(OpaqueScanTable::new(opaque_schema)),
+    )?;
+
+    let topo = dag.nodes.topological_sort();
+    for node_id in &topo {
+        if node_id == target_id || node_id == opaque_id {
+            continue;
+        }
+        if !is_transitive_dep(dag, target_id, node_id) {
+            continue;
+        }
+
+        let node = match dag.nodes.get(node_id.clone()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let schema = node.schema.as_ref().ok_or_else(|| {
+            OptimizerError::Exec(format!(
+                "build_opaque_context: node '{node_id}' has no resolved schema; \
+                 call resolve_schemas before running PushdownPass"
+            ))
+        })?;
+
+        register_table_any(&ctx, node_id, Arc::new(EmptyTable::new(Arc::clone(schema))))?;
+    }
+
+    Ok(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// make_temp
+// ---------------------------------------------------------------------------
 
 /// Safely rewrite `dag` so that `view_name` can be backed by a TempTable
 /// without creating any `TempTable → View` edges.
@@ -153,7 +491,7 @@ fn schema_prefix(node_id: &str) -> String {
 }
 
 /// Returns `true` if `dep` appears in the transitive dependency set of `node_id`.
-fn is_transitive_dep(dag: &Dag, node_id: &str, dep: &str) -> bool {
+pub(crate) fn is_transitive_dep(dag: &Dag, node_id: &str, dep: &str) -> bool {
     let node = match dag.nodes.get(node_id.to_string()) {
         Some(n) => n,
         None => return false,
@@ -290,5 +628,96 @@ mod tests {
         let m2 = dag.nodes.get("m2".to_string()).unwrap();
         assert!(m2.depends_on.contains("lp_0"));
         assert!(!m2.depends_on.contains("n"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests: create_logical_plan_with_stubs handles unknown dialect functions
+    // ---------------------------------------------------------------------------
+
+    // Verify that a query using an unknown scalar function (e.g. DuckDB's
+    // `date_diff`) can be planned without error.
+    #[tokio::test]
+    async fn test_stub_unknown_scalar_function() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::empty::EmptyTable;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Date32, false),
+            Field::new("b", DataType::Date32, false),
+        ]));
+        ctx.register_table("t", Arc::new(EmptyTable::new(schema))).unwrap();
+
+        let plan = create_logical_plan_with_stubs(
+            &ctx,
+            "SELECT date_diff('day', a, b) AS diff FROM t",
+        )
+        .await
+        .expect("planning with unknown scalar function should succeed via stub");
+
+        // The plan must mention our table.
+        assert!(
+            plan.display_indent().to_string().contains('t'),
+            "plan should reference table t"
+        );
+    }
+
+    // Verify that a query using an unknown aggregate-like function can be planned.
+    //
+    // Because DataFusion resolves scalar UDFs before aggregate UDFs, the stub is
+    // registered as scalar and the call is treated as a per-row scalar expression.
+    // This is sufficient for pushdown planning purposes — we only need to know
+    // which columns are referenced, not the exact evaluation semantics.
+    #[tokio::test]
+    async fn test_stub_unknown_aggregate_function() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::empty::EmptyTable;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("grp", DataType::Utf8, false),
+            Field::new("val", DataType::Float64, false),
+        ]));
+        ctx.register_table("t", Arc::new(EmptyTable::new(schema))).unwrap();
+
+        // Use the unknown function without GROUP BY to avoid group-by validation;
+        // planning succeeds because the stub accepts any arguments.
+        let plan = create_logical_plan_with_stubs(
+            &ctx,
+            "SELECT custom_agg(val) AS agg FROM t",
+        )
+        .await
+        .expect("planning with unknown aggregate-like function should succeed via stub");
+
+        assert!(
+            plan.display_indent().to_string().contains('t'),
+            "plan should reference table t"
+        );
+    }
+
+    // Verify that a query using an unknown window function can be planned.
+    #[tokio::test]
+    async fn test_stub_unknown_window_function() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::empty::EmptyTable;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Float64, false),
+        ]));
+        ctx.register_table("t", Arc::new(EmptyTable::new(schema))).unwrap();
+
+        let plan = create_logical_plan_with_stubs(
+            &ctx,
+            "SELECT id, custom_win(val) OVER (ORDER BY id) AS w FROM t",
+        )
+        .await
+        .expect("planning with unknown window function should succeed via stub");
+
+        assert!(
+            plan.display_indent().to_string().contains('t'),
+            "plan should reference table t"
+        );
     }
 }

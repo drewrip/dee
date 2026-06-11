@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef,
-    catalog::memory::MemorySchemaProvider,
-    catalog::{MemoryCatalogProvider, Session},
+    catalog::Session,
     common::{
         Column, TableReference,
         tree_node::{Transformed, TreeNode},
@@ -27,6 +26,9 @@ use crate::{
     connectors::Connector,
     dag::MaterializeMode,
     executor::Executor,
+    opt::common::{
+        build_opaque_context, create_logical_plan_with_stubs, is_transitive_dep, register_table_any,
+    },
     opt::{Dag, OptimizerError, OptimizerPass},
 };
 
@@ -40,12 +42,12 @@ use crate::{
 /// can then read `TableScan.filters` and `TableScan.projection` to recover
 /// exactly what would be pushed down to the TempTable.
 #[derive(Debug)]
-struct OpaqueScanTable {
+pub(crate) struct OpaqueScanTable {
     schema: SchemaRef,
 }
 
 impl OpaqueScanTable {
-    fn new(schema: SchemaRef) -> Self {
+    pub(crate) fn new(schema: SchemaRef) -> Self {
         Self { schema }
     }
 }
@@ -85,50 +87,6 @@ impl TableProvider for OpaqueScanTable {
             .scan(_state, projection, _filters, _limit)
             .await
     }
-}
-
-/// Register `provider` in `ctx` under `name`, which may be an unqualified,
-/// two-part (`schema.table`), or three-part (`catalog.schema.table`) name.
-///
-/// DataFusion's default [`SessionContext`] only contains a `datafusion`
-/// catalog.  When the DAG sources carry fully-qualified names (e.g.
-/// `"warehouse"."main"."subscriptions"`) the catalog and schema must be
-/// created before the table can be registered.  This helper ensures the
-/// required catalog and schema exist before delegating to
-/// [`SessionContext::register_table`].
-fn register_table_any(
-    ctx: &SessionContext,
-    name: &str,
-    provider: Arc<dyn TableProvider>,
-) -> Result<(), OptimizerError> {
-    let table_ref = TableReference::from(name);
-
-    if let TableReference::Full {
-        catalog, schema, ..
-    } = &table_ref
-    {
-        // Ensure the catalog exists.
-        if ctx.catalog(catalog.as_ref()).is_none() {
-            ctx.register_catalog(catalog.as_ref(), Arc::new(MemoryCatalogProvider::new()));
-        }
-        let cat = ctx
-            .catalog(catalog.as_ref())
-            .ok_or_else(|| OptimizerError::Exec(format!("failed to create catalog '{catalog}'")))?;
-
-        // Ensure the schema exists inside that catalog.
-        if cat.schema(schema.as_ref()).is_none() {
-            cat.register_schema(schema.as_ref(), Arc::new(MemorySchemaProvider::new()))
-                .map_err(|e| {
-                    OptimizerError::Exec(format!(
-                        "failed to create schema '{catalog}.{schema}': {e}"
-                    ))
-                })?;
-        }
-    }
-
-    ctx.register_table(table_ref, provider)
-        .map(|_| ())
-        .map_err(|e| OptimizerError::Exec(format!("failed to register table '{name}': {e}")))
 }
 
 /// Inline the SQL query of `source` (a View node) into `target` (a Table or
@@ -213,16 +171,14 @@ where
                 register_table_any(&ctx, node_id, Arc::new(EmptyTable::new(schema)))?;
                 continue;
             } else {
-                ctx.state()
-                    .create_logical_plan(&node.query_text)
+                create_logical_plan_with_stubs(&ctx, &node.query_text)
                     .await
                     .map_err(|e| {
                         OptimizerError::Exec(format!("failed to plan node '{node_id}': {e}"))
                     })?
             }
         } else {
-            ctx.state()
-                .create_logical_plan(&node.query_text)
+            create_logical_plan_with_stubs(&ctx, &node.query_text)
                 .await
                 .map_err(|e| {
                     OptimizerError::Exec(format!("failed to plan node '{node_id}': {e}"))
@@ -238,8 +194,7 @@ where
 
     // Plan `target`'s query.  DataFusion resolves the `source` reference
     // through the catalog and folds the view definition inline automatically.
-    ctx.state()
-        .create_logical_plan(&target_node.query_text)
+    create_logical_plan_with_stubs(&ctx, &target_node.query_text)
         .await
         .map_err(|e| OptimizerError::Exec(format!("failed to plan target '{target}': {e}")))
 }
@@ -260,88 +215,9 @@ fn bare_table_name(node_id: &str) -> String {
         .to_string()
 }
 
-/// Returns `true` if `dep` is in the transitive dependency set of `node_id`.
-fn is_transitive_dep(dag: &Dag, node_id: &str, dep: &str) -> bool {
-    let node = match dag.nodes.get(node_id.to_string()) {
-        Some(n) => n,
-        None => return false,
-    };
-    if node.depends_on.contains(dep) {
-        return true;
-    }
-    node.depends_on
-        .iter()
-        .any(|parent| is_transitive_dep(dag, parent, dep))
-}
-
 // ---------------------------------------------------------------------------
 // pushdown helpers
 // ---------------------------------------------------------------------------
-
-/// Build a [`SessionContext`] in which every transitive dependency of
-/// `target_id` is registered, with one special rule: `opaque_id` (the
-/// TempTable we are analysing) is always registered as a plain
-/// [`EmptyTable`] backed by `opaque_schema`, so the DataFusion optimizer
-/// sees it as an opaque scan and surfaces pushed-down predicates and
-/// projections in the resulting [`LogicalPlan`] tree.
-///
-/// All nodes are registered as [`EmptyTable`] using their pre-resolved
-/// `TransformNode::schema` (populated by `Executor::resolve_schemas`).
-/// No SQL planning or connector calls are made here.
-fn build_opaque_context(
-    dag: &Dag,
-    target_id: &str,
-    opaque_id: &str,
-    opaque_schema: SchemaRef,
-) -> Result<SessionContext, OptimizerError> {
-    let ctx = SessionContext::new();
-
-    // Raw DAG sources → EmptyTable with their resolved Arrow schemas.
-    for src in &dag.sources {
-        register_table_any(
-            &ctx,
-            &src.name,
-            Arc::new(EmptyTable::new(Arc::clone(&src.schema))),
-        )?;
-    }
-
-    // Register the opaque node using OpaqueScanTable so DataFusion pushes both
-    // filters and projections directly into the TableScan node.
-    register_table_any(
-        &ctx,
-        opaque_id,
-        Arc::new(OpaqueScanTable::new(opaque_schema)),
-    )?;
-
-    // Register every other transitive dep of target_id as EmptyTable using
-    // its pre-resolved schema.  This avoids any SQL planning and works for
-    // any SQL dialect.
-    let topo = dag.nodes.topological_sort();
-    for node_id in &topo {
-        if node_id == target_id || node_id == opaque_id {
-            continue;
-        }
-        if !is_transitive_dep(dag, target_id, node_id) {
-            continue;
-        }
-
-        let node = match dag.nodes.get(node_id.clone()) {
-            Some(n) => n,
-            None => continue,
-        };
-
-        let schema = node.schema.as_ref().ok_or_else(|| {
-            OptimizerError::Exec(format!(
-                "build_opaque_context: node '{node_id}' has no resolved schema; \
-                 call resolve_schemas before running PushdownPass"
-            ))
-        })?;
-
-        register_table_any(&ctx, node_id, Arc::new(EmptyTable::new(Arc::clone(schema))))?;
-    }
-
-    Ok(ctx)
-}
 
 /// Walk an optimized [`LogicalPlan`] tree and extract the filter predicates and
 /// projected-column names from the [`TableScan`] node for `source_id`.
@@ -491,18 +367,27 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<(String, SchemaRef), Op
     let mut required_cols: HashSet<String> = HashSet::new();
     let mut any_node_needs_all_cols = false;
 
+    trace!(
+        "  source '{}' query text =\n{}",
+        source_node.id, source_node.query_text,
+    );
+
     for n_id in &frontier {
         trace!("trying to pushdown frontier node {} into {}", n_id, source);
+
         let n_node = match dag.nodes.get(n_id.clone()) {
             Some(n) => n,
             None => continue,
         };
 
+        trace!(
+            "  frontier node '{}' query text =\n{}",
+            n_node.id, n_node.query_text,
+        );
+
         let ctx = build_opaque_context(dag, n_id, source, Arc::clone(&source_schema))?;
 
-        let raw_plan = ctx
-            .state()
-            .create_logical_plan(&n_node.query_text)
+        let raw_plan = create_logical_plan_with_stubs(&ctx, &n_node.query_text)
             .await
             .map_err(|e| {
                 OptimizerError::Exec(format!(
@@ -1060,7 +945,7 @@ mod tests {
         async fn resolve_schemas(&self, dag: &mut Dag) -> Result<(), ExecutorError> {
             // In tests we use DataFusion to derive schemas (no live DB).
             // Walk nodes in topological order, building a SessionContext as we go.
-            use crate::opt::pushdown::register_table_any;
+            use crate::opt::common::{create_logical_plan_with_stubs, register_table_any};
             use datafusion::datasource::empty::EmptyTable;
             use datafusion::datasource::view::ViewTable;
             use datafusion::prelude::SessionContext;
@@ -1079,9 +964,7 @@ mod tests {
             let mut planned: Vec<(String, datafusion::arrow::datatypes::SchemaRef)> = Vec::new();
             for node_id in &topo {
                 let node = dag.nodes.get(node_id.clone()).unwrap();
-                let plan = ctx
-                    .state()
-                    .create_logical_plan(&node.query_text)
+                let plan = create_logical_plan_with_stubs(&ctx, &node.query_text)
                     .await
                     .map_err(|e| ExecutorError::Exec(format!("resolve_schemas test stub: {e}")))?;
                 let schema = Arc::new(plan.schema().as_arrow().clone());
