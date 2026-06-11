@@ -5,7 +5,7 @@ use crate::{
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use duckdb::{Config, DuckdbConnectionManager, params};
-use log::info;
+use log::{info, trace};
 use r2d2::Pool;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, process::Command, sync::Arc, time::Duration};
@@ -151,7 +151,7 @@ impl Connector for DuckDBConnection {
         query_text: String,
     ) -> Result<usize, ConnectorError> {
         let rel_type = materialize_mode_in_duckdb(relation_type);
-        info!("creating new_relation ({}, {})", rel_type, name);
+        trace!("creating new_relation ({}, {})", rel_type, name);
         let tmpl_query = format!("CREATE {} {} AS ({})", rel_type, name, query_text);
         self.execute(tmpl_query).await
     }
@@ -251,7 +251,7 @@ impl Connector for DuckDBConnection {
         name: String,
     ) -> Result<usize, ConnectorError> {
         let rel_type = materialize_mode_in_duckdb(relation_type);
-        info!("attempt drop_relation ({}, {})", rel_type, name);
+        trace!("attempt drop_relation ({}, {})", rel_type, name);
         let tmpl_query = format!("DROP {} IF EXISTS {}", rel_type, name);
         self.execute(tmpl_query).await
     }
@@ -263,7 +263,7 @@ impl Connector for DuckDBConnection {
             Err(e) => {
                 return Some(Err(ConnectorError::Execute(format!(
                     "couldn't get connection from pool: {e}"
-                ))))
+                ))));
             }
         };
         // Execute with LIMIT 0 via query_arrow so DuckDB populates the arrow
@@ -276,7 +276,7 @@ impl Connector for DuckDBConnection {
             Err(e) => {
                 return Some(Err(ConnectorError::Execute(format!(
                     "couldn't prepare schema query for {name}: {e}"
-                ))))
+                ))));
             }
         };
         match stmt.query_arrow([]) {

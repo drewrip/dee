@@ -16,7 +16,7 @@ use datafusion::{
     prelude::SessionContext,
     sql::unparser::expr_to_sql,
 };
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use std::{
     collections::{HashMap, HashSet},
     marker::PhantomData,
@@ -400,7 +400,11 @@ fn extract_pushdowns(plan: &LogicalPlan, source_id: &str) -> Option<(Vec<Expr>, 
                     found = true;
                 }
             }
-            if found { Some((all_filters, all_cols)) } else { None }
+            if found {
+                Some((all_filters, all_cols))
+            } else {
+                None
+            }
         }
     }
 }
@@ -488,6 +492,7 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<(String, SchemaRef), Op
     let mut any_node_needs_all_cols = false;
 
     for n_id in &frontier {
+        trace!("trying to pushdown frontier node {} into {}", n_id, source);
         let n_node = match dag.nodes.get(n_id.clone()) {
             Some(n) => n,
             None => continue,
@@ -635,12 +640,7 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<(String, SchemaRef), Op
             use datafusion::arrow::datatypes::Schema;
             let fields: Vec<_> = cols
                 .iter()
-                .filter_map(|name| {
-                    source_schema
-                        .field_with_name(name)
-                        .ok()
-                        .cloned()
-                })
+                .filter_map(|name| source_schema.field_with_name(name).ok().cloned())
                 .collect();
             Arc::new(Schema::new(fields))
         }
@@ -799,8 +799,7 @@ pub async fn graph_minor(dag: &Dag) -> Result<Dag, OptimizerError> {
             .nodes
             .nodes()
             .filter(|n| {
-                matches!(n.materialize, MaterializeMode::View)
-                    && minor.nodes.out_degree(&n.id) == 0
+                matches!(n.materialize, MaterializeMode::View) && minor.nodes.out_degree(&n.id) == 0
             })
             .map(|n| n.id.clone())
             .collect();
@@ -882,7 +881,14 @@ where
         // Step 1 — compute the graph minor (all Views inlined into their
         // downstream Tables/TempTables) and work on that copy.
         debug!("PushdownPass: computing graph minor");
-        let minor = graph_minor(&resolved_dag).await?;
+        let mut minor = graph_minor(&resolved_dag).await?;
+        debug!("PushdownPass: running resolve_schemas for the graph minor");
+        self.engine.resolve_schemas(&mut minor).await.map_err(|e| {
+            OptimizerError::Exec(format!(
+                "PushdownPass: resolve_schemas failed for the graph minor: {e}"
+            ))
+        })?;
+        debug!("PushdownPass: schemas resolved for all nodes in the graph minor");
         debug!(
             "PushdownPass: graph minor has {} nodes",
             minor.nodes.num_nodes()
@@ -932,7 +938,7 @@ where
             let (new_sql, new_schema) = match pushdown(&minor, node_id).await {
                 Ok(result) => result,
                 Err(e) => {
-                    debug!("PushdownPass: skipping '{node_id}', pushdown failed: {e}");
+                    warn!("PushdownPass: skipping '{node_id}', pushdown failed: {e}");
                     continue;
                 }
             };
