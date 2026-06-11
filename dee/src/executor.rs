@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
-use tokio::task::JoinSet;
 use log::{debug, warn};
+use tokio::task::JoinSet;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -14,7 +14,8 @@ use tokio::sync::{Mutex, watch};
 
 use crate::{
     connectors::Connector,
-    dag::{Dag, MaterializeMode},
+    dag::{Dag, MaterializeMode, TransformNode},
+    graph::Graph,
     profile::SystemUsageSample,
 };
 
@@ -352,40 +353,44 @@ where
     async fn resolve_schemas(&self, dag: &mut Dag) -> Result<(), ExecutorError> {
         const PREFIX: &str = "dee_tmp_";
 
+        // Use DataFusion's TableReference parser to handle any quoting style,
+        // then re-quote every part with double quotes so the result is always a
+        // valid DuckDB qualified identifier.
+        let prefixed_name = |id: &str| -> String {
+            use datafusion::common::TableReference;
+            match TableReference::from(id) {
+                TableReference::Full { catalog, schema, table } => {
+                    format!("\"{catalog}\".\"{schema}\".\"{PREFIX}{table}\"")
+                }
+                TableReference::Partial { schema, table } => {
+                    format!("\"{schema}\".\"{PREFIX}{table}\"")
+                }
+                TableReference::Bare { table } => {
+                    format!("{PREFIX}{table}")
+                }
+            }
+        };
+
         let topo = dag.nodes.topological_sort();
 
         // Build a mapping from original node ID → prefixed node ID so we can
         // rename every reference inside query_text and depends_on.  The prefix
         // keeps these short-lived views from colliding with any relation the
         // real DAG execution has already materialised.
-        let rename_map: std::collections::HashMap<String, String> = topo
+        let rename_map: HashMap<String, String> = topo
             .iter()
-            .map(|id| {
-                // Strip any schema prefix before inserting the dee_tmp_ tag so
-                // the final name stays valid SQL.
-                // e.g. "warehouse"."main"."foo" → "warehouse"."main"."dee_tmp_foo"
-                let prefixed = if let Some(pos) = id.rfind("\".\"") {
-                    let schema_part = &id[..pos + 2]; // up to and including the last `".`
-                    let bare = id[pos + 3..].trim_matches('"');
-                    format!("{schema_part}\"{PREFIX}{bare}\"")
-                } else {
-                    format!("{PREFIX}{id}")
-                };
-                (id.clone(), prefixed)
-            })
+            .map(|id| (id.clone(), prefixed_name(id)))
             .collect();
 
         // Clone the DAG and apply renames so every node ID, depends_on entry,
         // and query_text reference uses the prefixed name.
         let mut tmp_dag = dag.clone();
-        // Replace node IDs and their query text / deps in the cloned graph.
-        // We rebuild the node map entirely to avoid borrow conflicts.
         let original_nodes: Vec<_> = topo
             .iter()
             .filter_map(|id| tmp_dag.nodes.get(id.clone()))
             .collect();
 
-        let mut renamed_nodes: Vec<crate::dag::TransformNode> = original_nodes
+        let mut renamed_nodes: Vec<TransformNode> = original_nodes
             .into_iter()
             .map(|n| {
                 let new_id = rename_map[&n.id].clone();
@@ -406,7 +411,7 @@ where
                     .map(|dep| rename_map.get(dep).cloned().unwrap_or_else(|| dep.clone()))
                     .collect();
 
-                crate::dag::TransformNode {
+                TransformNode {
                     id: new_id,
                     query_text: new_query,
                     materialize: n.materialize.clone(),
@@ -416,8 +421,7 @@ where
             })
             .collect();
 
-        // Replace tmp_dag's graph with the renamed nodes.
-        let mut new_graph = crate::graph::Graph::new(std::collections::HashMap::new());
+        let mut new_graph = Graph::new(HashMap::new());
         for node in renamed_nodes.drain(..) {
             new_graph
                 .add_node(node)
@@ -425,10 +429,25 @@ where
         }
         tmp_dag.nodes = new_graph;
 
-        // Step 1 — create every renamed node as a VIEW in the DB.
-        // Walk in the original topological order (sources first) using rename_map
-        // to look up each prefixed ID — this avoids relying on tmp_dag's sort order,
-        // which can differ due to HashMap non-determinism.
+        // Build prefixed names for DAG source tables.  These are created as
+        // temporary views so we can get up-to-date schemas directly from the DB
+        // rather than relying on whatever was serialised in the DAG file.
+        let source_tmp_names: Vec<String> = dag.sources.iter()
+            .map(|src| prefixed_name(&src.name))
+            .collect();
+
+        // Helper: drop all source temp views (best-effort, used in error paths).
+        let drop_source_tmps = |conn: &Arc<C>, names: &[String]| {
+            let conn = Arc::clone(conn);
+            let names = names.to_vec();
+            async move {
+                for name in names {
+                    conn.drop_relation(MaterializeMode::View, name).await.ok();
+                }
+            }
+        };
+
+        // Step 1 — create all node temp views in topological order.
         debug!("resolve_schemas: creating {} node(s) as views", topo.len());
         for orig_id in &topo {
             let tmp_id = &rename_map[orig_id];
@@ -440,34 +459,46 @@ where
             self.conn
                 .new_relation(MaterializeMode::View, node.id.clone(), node.query_text.clone())
                 .await
-                .map_err(|e| {
-                    ExecutorError::Exec(format!(
-                        "resolve_schemas: failed to create view for '{tmp_id}': {e}"
-                    ))
-                })?;
+                .map_err(|e| ExecutorError::Exec(format!(
+                    "resolve_schemas: failed to create view for '{tmp_id}': {e}"
+                )))?;
         }
 
-        // Step 2 — fetch schemas using the prefixed names; map results back to
-        // the original node IDs so they can be stored on `dag`.
-        // Iterate over `topo` (the original order) and look up the prefixed name
-        // via rename_map — never zip with tmp_topo, whose order may differ because
-        // the rebuilt HashMap has non-deterministic iteration order.
+        // Step 1b — create one temp VIEW per source using SELECT * FROM <name> LIMIT 0
+        // so the DB engine resolves the live schema for us.
+        debug!("resolve_schemas: creating {} source view(s)", dag.sources.len());
+        for (src, tmp_name) in dag.sources.iter().zip(source_tmp_names.iter()) {
+            let query = format!("SELECT * FROM {} LIMIT 0", src.name);
+            if let Err(e) = self.conn
+                .new_relation(MaterializeMode::View, tmp_name.clone(), query)
+                .await
+            {
+                let _ = self.cleanup(&tmp_dag).await;
+                return Err(ExecutorError::Exec(format!(
+                    "resolve_schemas: failed to create view for source '{}': {e}", src.name
+                )));
+            }
+        }
+
+        // Step 2 — fetch schemas for all nodes.
         debug!("resolve_schemas: fetching schemas for {} node(s)", topo.len());
-        let mut resolved: Vec<(String, datafusion::arrow::datatypes::SchemaRef)> = Vec::new();
+        let mut resolved_nodes: Vec<(String, datafusion::arrow::datatypes::SchemaRef)> = Vec::new();
         for orig_id in &topo {
             let tmp_id = &rename_map[orig_id];
             match self.conn.get_schema(tmp_id.clone()).await {
                 Some(Ok(schema)) => {
                     debug!("resolve_schemas: resolved schema for '{orig_id}' (via '{tmp_id}')");
-                    resolved.push((orig_id.clone(), schema));
+                    resolved_nodes.push((orig_id.clone(), schema));
                 }
                 Some(Err(e)) => {
+                    drop_source_tmps(&self.conn, &source_tmp_names).await;
                     let _ = self.cleanup(&tmp_dag).await;
                     return Err(ExecutorError::Exec(format!(
                         "resolve_schemas: get_schema failed for '{orig_id}': {e}"
                     )));
                 }
                 None => {
+                    drop_source_tmps(&self.conn, &source_tmp_names).await;
                     let _ = self.cleanup(&tmp_dag).await;
                     return Err(ExecutorError::Exec(format!(
                         "resolve_schemas: no schema available for '{orig_id}'"
@@ -476,18 +507,47 @@ where
             }
         }
 
-        // Step 3 — store the schemas on the original DAG nodes.
-        for (node_id, schema) in resolved {
+        // Step 2b — fetch schemas for all sources.
+        debug!("resolve_schemas: fetching schemas for {} source(s)", dag.sources.len());
+        let mut resolved_sources: Vec<datafusion::arrow::datatypes::SchemaRef> = Vec::new();
+        for (src, tmp_name) in dag.sources.iter().zip(source_tmp_names.iter()) {
+            match self.conn.get_schema(tmp_name.clone()).await {
+                Some(Ok(schema)) => {
+                    debug!("resolve_schemas: resolved schema for source '{}' (via '{tmp_name}')", src.name);
+                    resolved_sources.push(schema);
+                }
+                Some(Err(e)) => {
+                    drop_source_tmps(&self.conn, &source_tmp_names).await;
+                    let _ = self.cleanup(&tmp_dag).await;
+                    return Err(ExecutorError::Exec(format!(
+                        "resolve_schemas: get_schema failed for source '{}': {e}", src.name
+                    )));
+                }
+                None => {
+                    drop_source_tmps(&self.conn, &source_tmp_names).await;
+                    let _ = self.cleanup(&tmp_dag).await;
+                    return Err(ExecutorError::Exec(format!(
+                        "resolve_schemas: no schema available for source '{}'", src.name
+                    )));
+                }
+            }
+        }
+
+        // Step 3 — store resolved schemas on nodes and sources.
+        for (node_id, schema) in resolved_nodes {
             if let Some(node) = dag.nodes.get_mut(node_id.clone()) {
                 node.schema = Some(schema);
             }
         }
+        for (src, schema) in dag.sources.iter_mut().zip(resolved_sources) {
+            src.schema = schema;
+        }
 
-        // Step 4 — clean up the prefixed temporary views; never touches the
-        // real DAG's relations.
-        self.cleanup(&tmp_dag).await.map_err(|e| {
-            ExecutorError::Exec(format!("resolve_schemas: cleanup failed: {e}"))
-        })?;
+        // Step 4 — clean up all temporary views.
+        drop_source_tmps(&self.conn, &source_tmp_names).await;
+        self.cleanup(&tmp_dag)
+            .await
+            .map_err(|e| ExecutorError::Exec(format!("resolve_schemas: cleanup failed: {e}")))?;
 
         debug!("resolve_schemas: complete");
         Ok(())
