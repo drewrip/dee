@@ -13,7 +13,7 @@ use datafusion::{
     },
     physical_plan::ExecutionPlan,
     prelude::SessionContext,
-    sql::unparser::expr_to_sql,
+    sql::unparser::{expr_to_sql, plan_to_sql},
 };
 use log::{debug, trace, warn};
 use std::{
@@ -332,7 +332,18 @@ fn strip_table_qualifier(expr: Expr) -> Expr {
 /// uses dialect-specific functions DataFusion cannot plan (e.g. DuckDB's
 /// `date_diff`), the wrapper is constructed directly as a SQL string so the
 /// original query is preserved verbatim.
-pub async fn pushdown(dag: &Dag, source: &str) -> Result<(String, SchemaRef), OptimizerError> {
+/// Return type for [`pushdown`]: the rewritten source SQL and schema, plus
+/// the optimizer-regenerated SQL for each frontier node that was successfully
+/// unparsed (keyed by node ID).
+pub struct PushdownResult {
+    pub source_sql: String,
+    pub source_schema: SchemaRef,
+    /// Optimizer-regenerated SQL for each frontier node, keyed by node ID.
+    /// Only entries where `plan_to_sql` succeeded are included.
+    pub frontier_sql: HashMap<String, String>,
+}
+
+pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, OptimizerError> {
     let source_node = dag
         .nodes
         .get(source.to_string())
@@ -366,6 +377,8 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<(String, SchemaRef), Op
     // union of projected columns across all frontier nodes
     let mut required_cols: HashSet<String> = HashSet::new();
     let mut any_node_needs_all_cols = false;
+    // optimizer-regenerated SQL for each frontier node (best-effort)
+    let mut frontier_sql: HashMap<String, String> = HashMap::new();
 
     trace!(
         "  source '{}' query text =\n{}",
@@ -405,6 +418,20 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<(String, SchemaRef), Op
             "  frontier '{n_id}': optimized plan =\n{}",
             opt_plan.display_indent()
         );
+
+        // Regenerate the frontier node's SQL from the optimized plan while we
+        // already have it in hand.  Failure is non-fatal — we simply omit this
+        // node from the returned map and leave its query_text unchanged.
+        match plan_to_sql(&opt_plan) {
+            Ok(stmt) => {
+                frontier_sql.insert(n_id.clone(), stmt.to_string());
+            }
+            Err(e) => {
+                warn!(
+                    "pushdown: could not regenerate SQL for frontier '{n_id}': {e}"
+                );
+            }
+        }
 
         match extract_pushdowns(&opt_plan, source) {
             Some((filters, cols)) => {
@@ -476,7 +503,11 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<(String, SchemaRef), Op
     // If there is nothing to push down, return the original query unchanged.
     if combined_filter.is_none() && projection_cols.is_none() {
         debug!("pushdown '{source}': nothing to push down");
-        return Ok((source_node.query_text.clone(), Arc::clone(&source_schema)));
+        return Ok(PushdownResult {
+            source_sql: source_node.query_text.clone(),
+            source_schema: Arc::clone(&source_schema),
+            frontier_sql,
+        });
     }
 
     // Construct the final SQL by wrapping the original query as a subquery and
@@ -532,13 +563,14 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<(String, SchemaRef), Op
         _ => Arc::clone(&source_schema),
     };
 
-    Ok((
-        format!(
+    Ok(PushdownResult {
+        source_sql: format!(
             "SELECT {col_list} FROM ({inner}) AS \"{alias}\"{where_clause}",
             inner = source_node.query_text,
         ),
-        new_schema,
-    ))
+        source_schema: new_schema,
+        frontier_sql,
+    })
 }
 
 /// Produces a copy of `dag` with every `View` node eliminated by inlining
@@ -714,6 +746,7 @@ pub async fn graph_minor(dag: &Dag) -> Result<Dag, OptimizerError> {
     Ok(minor)
 }
 
+
 #[derive(Debug, Clone)]
 pub struct PushdownPass<C, E>
 where
@@ -804,12 +837,13 @@ where
         );
         stats.insert("temp_tables_count".into(), temp_table_ids.len().to_string());
 
-        // Step 3+4 — for each TempTable, run pushdown on the minor DAG and
-        // write the resulting SQL back to the *original* DAG.
+        // Step 3+4 — for each TempTable, run pushdown on the minor DAG.
+        // pushdown() returns the rewritten source SQL *and* the
+        // optimizer-regenerated SQL for each frontier node (computed from the
+        // same optimized LogicalPlans used for filter/projection extraction).
+        // Apply all of them to both the working minor and the original DAG.
         let mut rewrites: usize = 0;
         for node_id in &temp_table_ids {
-            // If no materializing nodes sit downstream of this TempTable there
-            // is nothing to push down — skip it entirely.
             if minor.nodes.frontier_materializes(node_id).is_empty() {
                 debug!("PushdownPass: '{node_id}' has no materializing frontier, skipping");
                 continue;
@@ -817,16 +851,28 @@ where
 
             debug!("PushdownPass: running pushdown on '{node_id}'");
 
-            // If pushdown or unparsing fails for this node (e.g. the SQL uses
-            // dialect-specific constructs DataFusion cannot plan), skip it and
-            // leave its query_text unchanged.  The pass is best-effort.
-            let (new_sql, new_schema) = match pushdown(&minor, node_id).await {
-                Ok(result) => result,
+            let result = match pushdown(&minor, node_id).await {
+                Ok(r) => r,
                 Err(e) => {
                     warn!("PushdownPass: skipping '{node_id}', pushdown failed: {e}");
                     continue;
                 }
             };
+
+            // Apply optimizer-regenerated SQL for frontier nodes first so that
+            // both DAGs reflect the clean, canonical SQL before the source node
+            // is updated.
+            for (frontier_id, reopt_sql) in &result.frontier_sql {
+                debug!(
+                    "PushdownPass: updating frontier '{frontier_id}' with regenerated SQL"
+                );
+                if let Some(n) = dag.nodes.get_mut(frontier_id.clone()) {
+                    n.query_text = reopt_sql.clone();
+                }
+                if let Some(n) = minor.nodes.get_mut(frontier_id.clone()) {
+                    n.query_text = reopt_sql.clone();
+                }
+            }
 
             let original_sql = minor
                 .nodes
@@ -834,23 +880,29 @@ where
                 .map(|n| n.query_text.as_str())
                 .unwrap_or("");
 
-            if new_sql == original_sql {
+            if result.source_sql == original_sql {
                 debug!("PushdownPass: '{node_id}' unchanged (nothing pushed down)");
                 continue;
             }
 
             debug!(
                 "PushdownPass: '{node_id}' rewritten ({} chars)",
-                new_sql.len()
+                result.source_sql.len()
             );
 
-            let node = dag.nodes.get_mut(node_id.clone()).ok_or_else(|| {
-                OptimizerError::Exec(format!(
-                    "PushdownPass: node '{node_id}' missing from original DAG"
-                ))
-            })?;
-            node.query_text = new_sql;
-            node.schema = Some(new_schema);
+            {
+                let node = dag.nodes.get_mut(node_id.clone()).ok_or_else(|| {
+                    OptimizerError::Exec(format!(
+                        "PushdownPass: node '{node_id}' missing from original DAG"
+                    ))
+                })?;
+                node.query_text = result.source_sql.clone();
+                node.schema = Some(Arc::clone(&result.source_schema));
+            }
+            if let Some(n) = minor.nodes.get_mut(node_id.clone()) {
+                n.query_text = result.source_sql;
+                n.schema = Some(result.source_schema);
+            }
 
             rewrites += 1;
         }
@@ -1602,7 +1654,7 @@ mod tests {
         )
         .await;
 
-        let (sql, _schema) = pushdown(&dag, "staging")
+        let PushdownResult { source_sql: sql, .. } = pushdown(&dag, "staging")
             .await
             .expect("pushdown should succeed");
 
@@ -1649,7 +1701,7 @@ mod tests {
         )
         .await;
 
-        let (sql, _schema) = pushdown(&dag, "staging")
+        let PushdownResult { source_sql: sql, .. } = pushdown(&dag, "staging")
             .await
             .expect("pushdown should succeed");
 
