@@ -12,11 +12,13 @@ use datafusion::{
     catalog::MemoryCatalogProvider,
     common::TableReference,
     datasource::{TableProvider, empty::EmptyTable},
+    execution::session_state::SessionStateBuilder,
     logical_expr::{
         AggregateUDF, AggregateUDFImpl, Accumulator, PartitionEvaluator, ScalarUDF, ScalarUDFImpl,
         Signature, Volatility, WindowUDF, WindowUDFImpl,
         function::{AccumulatorArgs, PartitionEvaluatorArgs, StateFieldsArgs, WindowUDFFieldArgs},
     },
+    optimizer::{OptimizerRule, common_subexpr_eliminate::CommonSubexprEliminate},
     physical_plan::ColumnarValue,
     prelude::SessionContext,
     scalar::ScalarValue,
@@ -296,7 +298,24 @@ pub fn build_opaque_context(
     opaque_id: &str,
     opaque_schema: SchemaRef,
 ) -> Result<SessionContext, OptimizerError> {
-    let ctx = SessionContext::new();
+    // Build a session state with CommonSubexprEliminate removed.  CSE rewrites
+    // the plan in ways that break filter/projection extraction from TableScan
+    // nodes (it introduces shared `__common_expr_N` aliases that obscure the
+    // original predicates).
+    let cse_name = CommonSubexprEliminate::new().name().to_string();
+    let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> =
+        SessionStateBuilder::new_with_default_features()
+            .build()
+            .optimizer()
+            .rules
+            .iter()
+            .filter(|r| r.name() != cse_name)
+            .cloned()
+            .collect();
+    let state = SessionStateBuilder::new_with_default_features()
+        .with_optimizer_rules(rules)
+        .build();
+    let ctx = SessionContext::new_with_state(state);
 
     for src in &dag.sources {
         register_table_any(
