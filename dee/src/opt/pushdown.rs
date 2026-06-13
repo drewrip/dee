@@ -27,7 +27,8 @@ use crate::{
     dag::MaterializeMode,
     executor::Executor,
     opt::common::{
-        build_opaque_context, create_logical_plan_with_stubs, is_transitive_dep, register_table_any,
+        build_opaque_context, create_logical_plan_with_stubs, is_transitive_dep,
+        register_table_any, validate,
     },
     opt::{Dag, OptimizerError, OptimizerPass},
 };
@@ -419,17 +420,27 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
             opt_plan.display_indent()
         );
 
-        // Regenerate the frontier node's SQL from the optimized plan while we
-        // already have it in hand.  Failure is non-fatal — we simply omit this
-        // node from the returned map and leave its query_text unchanged.
-        match plan_to_sql(&opt_plan) {
-            Ok(stmt) => {
-                frontier_sql.insert(n_id.clone(), stmt.to_string());
-            }
-            Err(e) => {
-                warn!(
-                    "pushdown: could not regenerate SQL for frontier '{n_id}': {e}"
-                );
+        // Validate the optimized plan before converting it to SQL.  If the
+        // physical planner rejects it the regenerated SQL would be invalid;
+        // skip this frontier node's SQL update and leave query_text unchanged.
+        if let Err(e) = validate(&ctx, &opt_plan).await {
+            warn!(
+                "pushdown: skipping SQL regeneration for frontier '{n_id}', \
+                 optimized plan failed validation: {e}"
+            );
+        } else {
+            // Regenerate the frontier node's SQL from the optimized plan.
+            // Failure is non-fatal — we simply omit this node from the
+            // returned map and leave its query_text unchanged.
+            match plan_to_sql(&opt_plan) {
+                Ok(stmt) => {
+                    frontier_sql.insert(n_id.clone(), stmt.to_string());
+                }
+                Err(e) => {
+                    warn!(
+                        "pushdown: could not regenerate SQL for frontier '{n_id}': {e}"
+                    );
+                }
             }
         }
 
