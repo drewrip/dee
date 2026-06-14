@@ -6,7 +6,7 @@ pub mod pushdown;
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use log::{debug, warn};
+use log::{debug, error, warn};
 
 use thiserror::Error;
 
@@ -103,6 +103,10 @@ where
         dag: &mut Dag,
     ) -> Result<HashMap<String, Arc<HashMap<String, String>>>, OptimizerError> {
         let mut stats = HashMap::new();
+
+        if let Err(e) = self.engine.resolve_schemas(dag).await {
+            error!("couldn't resolve_schemas: {e}")
+        }
 
         if self.run_hmp_pass {
             let mut pass: HMPPass<C, E> = HMPPass::new(self.conn.clone(), self.hmp_no_plan_dups);

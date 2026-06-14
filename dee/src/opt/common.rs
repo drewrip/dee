@@ -27,6 +27,7 @@ use datafusion::{
         SqliteDialect,
     },
 };
+use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
@@ -313,6 +314,7 @@ pub async fn validate(ctx: &SessionContext, plan: &LogicalPlan) -> Result<(), Va
 pub async fn validate_dag(dag: &Dag) -> Result<(), ValidationError> {
     let ctx = SessionContext::new();
 
+    debug!("beginning dag validation...");
     for src in &dag.sources {
         register_table_any(
             &ctx,
@@ -324,6 +326,7 @@ pub async fn validate_dag(dag: &Dag) -> Result<(), ValidationError> {
             reason: e.to_string(),
         })?;
     }
+    debug!("registered {} sources", dag.sources.len());
 
     let topo = dag.nodes.topological_sort();
     for node_id in &topo {
@@ -331,7 +334,10 @@ pub async fn validate_dag(dag: &Dag) -> Result<(), ValidationError> {
             Some(n) => n,
             None => continue,
         };
-
+        trace!(
+            "checking node={}, with query_text = \n{}",
+            node_id, node.query_text
+        );
         let plan = create_logical_plan_with_stubs(&ctx, &node.query_text)
             .await
             .map_err(|e| ValidationError::Node {
@@ -339,12 +345,16 @@ pub async fn validate_dag(dag: &Dag) -> Result<(), ValidationError> {
                 reason: format!("logical planning: {e}"),
             })?;
 
+        trace!("node ({}), plan:\n{}", node_id, plan.display_indent());
+
         validate(&ctx, &plan)
             .await
             .map_err(|e| ValidationError::Node {
                 node: node_id.clone(),
                 reason: e.to_string(),
             })?;
+
+        trace!("node validated");
 
         register_table_any(&ctx, node_id, Arc::new(ViewTable::new(plan, None))).map_err(|e| {
             ValidationError::Node {
@@ -354,6 +364,7 @@ pub async fn validate_dag(dag: &Dag) -> Result<(), ValidationError> {
         })?;
     }
 
+    debug!("finished and passed validation");
     Ok(())
 }
 
