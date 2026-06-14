@@ -1,27 +1,31 @@
-use std::{
-    collections::HashSet,
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
 use datafusion::{
     arrow::{
         array::{ArrayRef, new_null_array},
         datatypes::{DataType, FieldRef, SchemaRef},
     },
-    catalog::memory::MemorySchemaProvider,
     catalog::MemoryCatalogProvider,
+    catalog::memory::MemorySchemaProvider,
     common::TableReference,
     datasource::{TableProvider, empty::EmptyTable, view::ViewTable},
     execution::session_state::SessionStateBuilder,
     logical_expr::{
-        AggregateUDF, AggregateUDFImpl, Accumulator, LogicalPlan, PartitionEvaluator, ScalarUDF,
+        Accumulator, AggregateUDF, AggregateUDFImpl, LogicalPlan, PartitionEvaluator, ScalarUDF,
         ScalarUDFImpl, Signature, Volatility, WindowUDF, WindowUDFImpl,
         function::{AccumulatorArgs, PartitionEvaluatorArgs, StateFieldsArgs, WindowUDFFieldArgs},
     },
-    optimizer::{OptimizerRule, common_subexpr_eliminate::CommonSubexprEliminate},
+    optimizer::{
+        OptimizerRule, common_subexpr_eliminate::CommonSubexprEliminate,
+        single_distinct_to_groupby::SingleDistinctToGroupBy,
+    },
     physical_plan::ColumnarValue,
     prelude::SessionContext,
     scalar::ScalarValue,
+    sql::unparser::dialect::{
+        BigQueryDialect, DefaultDialect, DuckDBDialect, MySqlDialect, PostgreSqlDialect,
+        SqliteDialect,
+    },
 };
 use thiserror::Error;
 
@@ -68,9 +72,15 @@ impl StubScalar {
 }
 
 impl ScalarUDFImpl for StubScalar {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { &self.name }
-    fn signature(&self) -> &Signature { &self.sig }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.sig
+    }
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
         Ok(DataType::Null)
     }
@@ -107,7 +117,9 @@ impl Accumulator for StubAccumulator {
     fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
         datafusion::common::internal_err!("planning-only stub accumulator used")
     }
-    fn size(&self) -> usize { 0 }
+    fn size(&self) -> usize {
+        0
+    }
     fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
         datafusion::common::internal_err!("planning-only stub accumulator used")
     }
@@ -117,13 +129,22 @@ impl Accumulator for StubAccumulator {
 }
 
 impl AggregateUDFImpl for StubAggregate {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { &self.name }
-    fn signature(&self) -> &Signature { &self.sig }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.sig
+    }
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
         Ok(DataType::Null)
     }
-    fn accumulator(&self, _acc_args: AccumulatorArgs) -> datafusion::common::Result<Box<dyn Accumulator>> {
+    fn accumulator(
+        &self,
+        _acc_args: AccumulatorArgs,
+    ) -> datafusion::common::Result<Box<dyn Accumulator>> {
         Ok(Box::new(StubAccumulator))
     }
     fn state_fields(&self, _args: StateFieldsArgs) -> datafusion::common::Result<Vec<FieldRef>> {
@@ -154,15 +175,25 @@ impl StubWindow {
 struct StubPartitionEvaluator;
 
 impl PartitionEvaluator for StubPartitionEvaluator {
-    fn evaluate_all(&mut self, _values: &[ArrayRef], num_rows: usize) -> datafusion::common::Result<ArrayRef> {
+    fn evaluate_all(
+        &mut self,
+        _values: &[ArrayRef],
+        num_rows: usize,
+    ) -> datafusion::common::Result<ArrayRef> {
         Ok(new_null_array(&DataType::Null, num_rows))
     }
 }
 
 impl WindowUDFImpl for StubWindow {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { &self.name }
-    fn signature(&self) -> &Signature { &self.sig }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.sig
+    }
     fn field(&self, _field_args: WindowUDFFieldArgs) -> datafusion::common::Result<FieldRef> {
         Ok(Arc::new(datafusion::arrow::datatypes::Field::new(
             self.name(),
@@ -170,7 +201,10 @@ impl WindowUDFImpl for StubWindow {
             true,
         )))
     }
-    fn partition_evaluator(&self, _args: PartitionEvaluatorArgs) -> datafusion::common::Result<Box<dyn PartitionEvaluator>> {
+    fn partition_evaluator(
+        &self,
+        _args: PartitionEvaluatorArgs,
+    ) -> datafusion::common::Result<Box<dyn PartitionEvaluator>> {
         Ok(Box::new(StubPartitionEvaluator))
     }
 }
@@ -257,10 +291,7 @@ pub async fn create_logical_plan_with_stubs(
 /// call is cheap and purely structural.
 ///
 /// Returns `Err(ValidationError::PhysicalPlan)` if physical planning fails.
-pub async fn validate(
-    ctx: &SessionContext,
-    plan: &LogicalPlan,
-) -> Result<(), ValidationError> {
+pub async fn validate(ctx: &SessionContext, plan: &LogicalPlan) -> Result<(), ValidationError> {
     ctx.state()
         .create_physical_plan(plan)
         .await
@@ -315,14 +346,36 @@ pub async fn validate_dag(dag: &Dag) -> Result<(), ValidationError> {
                 reason: e.to_string(),
             })?;
 
-        register_table_any(&ctx, node_id, Arc::new(ViewTable::new(plan, None)))
-            .map_err(|e| ValidationError::Node {
+        register_table_any(&ctx, node_id, Arc::new(ViewTable::new(plan, None))).map_err(|e| {
+            ValidationError::Node {
                 node: node_id.clone(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// dialect_for_db — map a DAG sql_dialect string to a DataFusion unparser dialect
+// ---------------------------------------------------------------------------
+
+/// Return a boxed DataFusion unparser [`Dialect`] for `db`.
+///
+/// Matches common dialect names case-insensitively.  Defaults to
+/// [`DuckDBDialect`] when the dialect is unknown or empty, because DuckDB is
+/// the primary target engine and its dialect is the safest default.
+pub fn dialect_for_db(db: &str) -> Box<dyn datafusion::sql::unparser::dialect::Dialect> {
+    match db.to_lowercase().as_str() {
+        "duckdb" => Box::new(DuckDBDialect::new()),
+        "postgresql" | "postgres" => Box::new(PostgreSqlDialect {}),
+        "mysql" => Box::new(MySqlDialect {}),
+        "sqlite" => Box::new(SqliteDialect {}),
+        "bigquery" => Box::new(BigQueryDialect {}),
+        "default" => Box::new(DefaultDialect {}),
+        _ => Box::new(DuckDBDialect::new()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +396,10 @@ pub fn register_table_any(
 ) -> Result<(), OptimizerError> {
     let table_ref = TableReference::from(name);
 
-    if let TableReference::Full { catalog, schema, .. } = &table_ref {
+    if let TableReference::Full {
+        catalog, schema, ..
+    } = &table_ref
+    {
         if ctx.catalog(catalog.as_ref()).is_none() {
             ctx.register_catalog(catalog.as_ref(), Arc::new(MemoryCatalogProvider::new()));
         }
@@ -396,13 +452,15 @@ pub fn build_opaque_context(
     // nodes (it introduces shared `__common_expr_N` aliases that obscure the
     // original predicates).
     let cse_name = CommonSubexprEliminate::new().name().to_string();
+    let sdgb_name = SingleDistinctToGroupBy::new().name().to_string();
+    let exclude_rules: HashSet<String> = HashSet::from_iter([cse_name, sdgb_name]);
     let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> =
         SessionStateBuilder::new_with_default_features()
             .build()
             .optimizer()
             .rules
             .iter()
-            .filter(|r| r.name() != cse_name)
+            .filter(|r| !exclude_rules.contains(r.name()))
             .cloned()
             .collect();
     let state = SessionStateBuilder::new_with_default_features()
@@ -513,26 +571,23 @@ pub fn make_temp(
         // view_name as a transitive dependency (i.e., sits between view_name
         // and m on the data-flow path).
         loop {
-            let view_dep: Option<String> = dag
-                .nodes
-                .get(m_id.clone())
-                .and_then(|m_node| {
-                    m_node
-                        .depends_on
-                        .iter()
-                        .find(|dep| {
-                            if *dep == view_name {
-                                return false; // handled in step 4–5
-                            }
-                            let is_view = dag
-                                .nodes
-                                .get((*dep).clone())
-                                .map(|d| matches!(d.materialize, MaterializeMode::View))
-                                .unwrap_or(false);
-                            is_view && is_transitive_dep(dag, dep, view_name)
-                        })
-                        .cloned()
-                });
+            let view_dep: Option<String> = dag.nodes.get(m_id.clone()).and_then(|m_node| {
+                m_node
+                    .depends_on
+                    .iter()
+                    .find(|dep| {
+                        if *dep == view_name {
+                            return false; // handled in step 4–5
+                        }
+                        let is_view = dag
+                            .nodes
+                            .get((*dep).clone())
+                            .map(|d| matches!(d.materialize, MaterializeMode::View))
+                            .unwrap_or(false);
+                        is_view && is_transitive_dep(dag, dep, view_name)
+                    })
+                    .cloned()
+            });
 
             match view_dep {
                 None => break,
@@ -559,8 +614,9 @@ pub fn make_temp(
                     })?;
 
                     // Substitute the view name with an inline subquery.
-                    m_node.query_text =
-                        m_node.query_text.replace(v_id.as_str(), &format!("({view_sql})"));
+                    m_node.query_text = m_node
+                        .query_text
+                        .replace(v_id.as_str(), &format!("({view_sql})"));
                     m_node.depends_on.remove(&v_id);
                     for dep in view_deps {
                         m_node.depends_on.insert(dep);
@@ -570,9 +626,10 @@ pub fn make_temp(
         }
 
         // 4 & 5. Replace view_name with lp and rebase the dependency.
-        let m_node = dag.nodes.get_mut(m_id.clone()).ok_or_else(|| {
-            OptimizerError::Exec(format!("make_temp: node '{m_id}' not found"))
-        })?;
+        let m_node = dag
+            .nodes
+            .get_mut(m_id.clone())
+            .ok_or_else(|| OptimizerError::Exec(format!("make_temp: node '{m_id}' not found")))?;
 
         m_node.query_text = m_node.query_text.replace(view_name, &lp_name);
         if m_node.depends_on.remove(view_name) {
@@ -672,7 +729,10 @@ mod tests {
         // m now references lp_0, not n
         let m = dag.nodes.get("m".to_string()).unwrap();
         assert!(m.query_text.contains("lp_0"), "m must reference lp_0");
-        assert!(!m.query_text.contains(" n"), "m must not reference n directly");
+        assert!(
+            !m.query_text.contains(" n"),
+            "m must not reference n directly"
+        );
         assert!(m.depends_on.contains("lp_0"));
         assert!(!m.depends_on.contains("n"));
 
@@ -690,7 +750,12 @@ mod tests {
     fn test_make_temp_intermediate_view_inlined() {
         let mut dag = make_dag(vec![
             node("n", MaterializeMode::View, &[], "SELECT 1 AS x"),
-            node("v1", MaterializeMode::View, &["n"], "SELECT x FROM n WHERE x > 0"),
+            node(
+                "v1",
+                MaterializeMode::View,
+                &["n"],
+                "SELECT x FROM n WHERE x > 0",
+            ),
             node("m", MaterializeMode::Table, &["v1"], "SELECT x FROM v1"),
         ]);
 
@@ -758,14 +823,13 @@ mod tests {
             Field::new("a", DataType::Date32, false),
             Field::new("b", DataType::Date32, false),
         ]));
-        ctx.register_table("t", Arc::new(EmptyTable::new(schema))).unwrap();
+        ctx.register_table("t", Arc::new(EmptyTable::new(schema)))
+            .unwrap();
 
-        let plan = create_logical_plan_with_stubs(
-            &ctx,
-            "SELECT date_diff('day', a, b) AS diff FROM t",
-        )
-        .await
-        .expect("planning with unknown scalar function should succeed via stub");
+        let plan =
+            create_logical_plan_with_stubs(&ctx, "SELECT date_diff('day', a, b) AS diff FROM t")
+                .await
+                .expect("planning with unknown scalar function should succeed via stub");
 
         // The plan must mention our table.
         assert!(
@@ -790,16 +854,14 @@ mod tests {
             Field::new("grp", DataType::Utf8, false),
             Field::new("val", DataType::Float64, false),
         ]));
-        ctx.register_table("t", Arc::new(EmptyTable::new(schema))).unwrap();
+        ctx.register_table("t", Arc::new(EmptyTable::new(schema)))
+            .unwrap();
 
         // Use the unknown function without GROUP BY to avoid group-by validation;
         // planning succeeds because the stub accepts any arguments.
-        let plan = create_logical_plan_with_stubs(
-            &ctx,
-            "SELECT custom_agg(val) AS agg FROM t",
-        )
-        .await
-        .expect("planning with unknown aggregate-like function should succeed via stub");
+        let plan = create_logical_plan_with_stubs(&ctx, "SELECT custom_agg(val) AS agg FROM t")
+            .await
+            .expect("planning with unknown aggregate-like function should succeed via stub");
 
         assert!(
             plan.display_indent().to_string().contains('t'),
@@ -818,7 +880,8 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("val", DataType::Float64, false),
         ]));
-        ctx.register_table("t", Arc::new(EmptyTable::new(schema))).unwrap();
+        ctx.register_table("t", Arc::new(EmptyTable::new(schema)))
+            .unwrap();
 
         let plan = create_logical_plan_with_stubs(
             &ctx,
@@ -848,7 +911,8 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("val", DataType::Float64, false),
         ]));
-        ctx.register_table("t", Arc::new(EmptyTable::new(schema))).unwrap();
+        ctx.register_table("t", Arc::new(EmptyTable::new(schema)))
+            .unwrap();
 
         let plan = create_logical_plan_with_stubs(&ctx, "SELECT id, val FROM t WHERE val > 0.0")
             .await
@@ -871,14 +935,18 @@ mod tests {
         use crate::dag::SourceNode;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
-        let mut dag = make_dag(vec![
-            node("t1", MaterializeMode::TempTable, &[], "SELECT nonexistent_col FROM src"),
-        ]);
-        dag.sources = vec![SourceNode { name: "src".to_string(), schema }];
+        let mut dag = make_dag(vec![node(
+            "t1",
+            MaterializeMode::TempTable,
+            &[],
+            "SELECT nonexistent_col FROM src",
+        )]);
+        dag.sources = vec![SourceNode {
+            name: "src".to_string(),
+            schema,
+        }];
 
         let err = validate_dag(&dag)
             .await
@@ -903,10 +971,23 @@ mod tests {
         ]));
 
         let mut dag = make_dag(vec![
-            node("staging", MaterializeMode::TempTable, &[], "SELECT id, amount FROM raw"),
-            node("final", MaterializeMode::Table, &["staging"], "SELECT id FROM staging WHERE amount > 0.0"),
+            node(
+                "staging",
+                MaterializeMode::TempTable,
+                &[],
+                "SELECT id, amount FROM raw",
+            ),
+            node(
+                "final",
+                MaterializeMode::Table,
+                &["staging"],
+                "SELECT id FROM staging WHERE amount > 0.0",
+            ),
         ]);
-        dag.sources = vec![SourceNode { name: "raw".to_string(), schema }];
+        dag.sources = vec![SourceNode {
+            name: "raw".to_string(),
+            schema,
+        }];
 
         validate_dag(&dag)
             .await
