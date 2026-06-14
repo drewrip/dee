@@ -13,7 +13,7 @@ use datafusion::{
     },
     physical_plan::ExecutionPlan,
     prelude::SessionContext,
-    sql::unparser::{expr_to_sql, plan_to_sql},
+    sql::unparser::Unparser,
 };
 use log::{debug, trace, warn};
 use std::{
@@ -27,7 +27,7 @@ use crate::{
     dag::MaterializeMode,
     executor::Executor,
     opt::common::{
-        build_opaque_context, create_logical_plan_with_stubs, is_transitive_dep,
+        build_opaque_context, create_logical_plan_with_stubs, dialect_for_db, is_transitive_dep,
         register_table_any, validate,
     },
     opt::{Dag, OptimizerError, OptimizerPass},
@@ -369,6 +369,11 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
         })?
         .clone();
 
+    // Build a dialect-aware unparser for this DAG's SQL dialect.
+    // `Unparser` is not `Send`, so we hold only the dialect (which is Send+Sync)
+    // and create short-lived `Unparser` instances at each use site.
+    let dialect = dialect_for_db(&dag.db);
+
     // Collect filter predicates (one list per frontier node) and the union of
     // required columns across all frontier nodes.
     let frontier: HashSet<String> = dag.nodes.frontier_materializes(source);
@@ -432,7 +437,7 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
             // Regenerate the frontier node's SQL from the optimized plan.
             // Failure is non-fatal — we simply omit this node from the
             // returned map and leave its query_text unchanged.
-            match plan_to_sql(&opt_plan) {
+            match Unparser::new(dialect.as_ref()).plan_to_sql(&opt_plan) {
                 Ok(stmt) => {
                     frontier_sql.insert(n_id.clone(), stmt.to_string());
                 }
@@ -446,9 +451,10 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
 
         match extract_pushdowns(&opt_plan, source) {
             Some((filters, cols)) => {
+                let unparser = Unparser::new(dialect.as_ref());
                 let filter_strs: Vec<String> = filters
                     .iter()
-                    .filter_map(|f| expr_to_sql(&strip_table_qualifier(f.clone())).ok())
+                    .filter_map(|f| unparser.expr_to_sql(&strip_table_qualifier(f.clone())).ok())
                     .map(|e| e.to_string())
                     .collect();
                 if filter_strs.is_empty() {
@@ -534,9 +540,11 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
 
     let where_clause = match combined_filter {
         Some(expr) => {
-            let sql_expr = expr_to_sql(&strip_table_qualifier(expr)).map_err(|e| {
-                OptimizerError::Exec(format!("pushdown: expr_to_sql for '{source}': {e}"))
-            })?;
+            let sql_expr = Unparser::new(dialect.as_ref())
+                .expr_to_sql(&strip_table_qualifier(expr))
+                .map_err(|e| {
+                    OptimizerError::Exec(format!("pushdown: expr_to_sql for '{source}': {e}"))
+                })?;
             let filter_str = sql_expr.to_string();
             debug!("pushdown '{source}': pushing filter  → {filter_str}");
             format!(" WHERE {filter_str}")
