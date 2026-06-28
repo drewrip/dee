@@ -15,10 +15,6 @@ use datafusion::{
         ScalarUDFImpl, Signature, Volatility, WindowUDF, WindowUDFImpl,
         function::{AccumulatorArgs, PartitionEvaluatorArgs, StateFieldsArgs, WindowUDFFieldArgs},
     },
-    optimizer::{
-        OptimizerRule, common_subexpr_eliminate::CommonSubexprEliminate,
-        single_distinct_to_groupby::SingleDistinctToGroupBy,
-    },
     physical_plan::ColumnarValue,
     prelude::SessionContext,
     scalar::ScalarValue,
@@ -458,25 +454,7 @@ pub fn build_opaque_context(
     opaque_id: &str,
     opaque_schema: SchemaRef,
 ) -> Result<SessionContext, OptimizerError> {
-    // Build a session state with CommonSubexprEliminate removed.  CSE rewrites
-    // the plan in ways that break filter/projection extraction from TableScan
-    // nodes (it introduces shared `__common_expr_N` aliases that obscure the
-    // original predicates).
-    let cse_name = CommonSubexprEliminate::new().name().to_string();
-    let sdgb_name = SingleDistinctToGroupBy::new().name().to_string();
-    let exclude_rules: HashSet<String> = HashSet::from_iter([cse_name, sdgb_name]);
-    let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> =
-        SessionStateBuilder::new_with_default_features()
-            .build()
-            .optimizer()
-            .rules
-            .iter()
-            .filter(|r| !exclude_rules.contains(r.name()))
-            .cloned()
-            .collect();
-    let state = SessionStateBuilder::new_with_default_features()
-        .with_optimizer_rules(rules)
-        .build();
+    let state = SessionStateBuilder::new_with_default_features().build();
     let ctx = SessionContext::new_with_state(state);
 
     for src in &dag.sources {
