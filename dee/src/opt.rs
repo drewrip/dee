@@ -1,4 +1,5 @@
 pub mod common;
+pub mod cspe;
 pub mod hmp;
 pub mod omp;
 pub mod pushdown;
@@ -16,6 +17,7 @@ use crate::{
     executor::Executor,
     opt::{
         common::validate_dag,
+        cspe::CSPEPass,
         hmp::HMPPass,
         omp::{OMPCentrality, OMPPass},
         pushdown::PushdownPass,
@@ -63,6 +65,7 @@ where
     hmp_no_plan_dups: bool,
     /// Pushdown pass
     run_pushdown_pass: bool,
+    pub run_cspe_pass: bool,
     /// Result stats
     stats_on_passes: bool,
 }
@@ -89,6 +92,7 @@ where
             omp_use_pushdown: config.omp_use_pushdown,
             hmp_no_plan_dups: config.hmp_no_plan_dups,
             run_pushdown_pass: config.run_pushdown_pass,
+            run_cspe_pass: config.run_cspe_pass,
             stats_on_passes: false,
         }
     }
@@ -154,6 +158,18 @@ where
         } else {
             debug!("skipping Pushdown pass");
         }
+        if self.run_cspe_pass {
+            let mut pass: CSPEPass<C, E> = CSPEPass::new(self.conn.clone(), self.engine.clone());
+            let res = pass.run(dag).await?;
+            if self.stats_on_passes {
+                stats.insert("CSPEPass".to_string(), Arc::new(res));
+            }
+            if let Err(e) = validate_dag(dag).await {
+                warn!("CSPEPass produced an invalid DAG: {e}");
+            }
+        } else {
+            debug!("skipping CSP pass");
+        }
 
         Ok(stats)
     }
@@ -169,6 +185,7 @@ pub struct OptimizerConfig {
     pub omp_use_pushdown: bool,
     pub hmp_no_plan_dups: bool,
     pub run_pushdown_pass: bool,
+    pub run_cspe_pass: bool,
 }
 
 impl Default for OptimizerConfig {
@@ -182,6 +199,7 @@ impl Default for OptimizerConfig {
             omp_use_pushdown: false,
             hmp_no_plan_dups: false,
             run_pushdown_pass: false,
+            run_cspe_pass: false,
         }
     }
 }
@@ -207,6 +225,7 @@ impl OptimizerConfig {
             "omp" => self.run_omp_pass = enabled,
             "hmp" => self.run_hmp_pass = enabled,
             "pushdown" => self.run_pushdown_pass = enabled,
+            "cspe" => self.run_cspe_pass = enabled,
             _ => warn!("Unknown optimizer pass: {}", name),
         }
     }
@@ -248,6 +267,10 @@ impl OptimizerConfig {
 
     pub fn with_pushdown_pass(mut self) -> Self {
         self.run_pushdown_pass = true;
+        self
+    }
+    pub fn with_cspe_pass(mut self) -> Self {
+        self.run_cspe_pass = true;
         self
     }
 }

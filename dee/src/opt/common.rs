@@ -365,6 +365,63 @@ pub async fn validate_dag(dag: &Dag) -> Result<(), ValidationError> {
 }
 
 // ---------------------------------------------------------------------------
+// build_ctx_for_node / optimized_plan
+// ---------------------------------------------------------------------------
+
+/// Build a [`SessionContext`] suitable for planning `node_id` in `dag`.
+///
+/// DAG sources are registered as `EmptyTable` (schema-only).  Every node that
+/// precedes `node_id` in topological order is registered as a `ViewTable` so
+/// the planner can resolve column types without requiring pre-resolved schemas.
+pub async fn build_ctx_for_node(dag: &Dag, node_id: &str) -> Result<SessionContext, OptimizerError> {
+    let ctx = SessionContext::new();
+
+    for src in &dag.sources {
+        register_table_any(
+            &ctx,
+            &src.name,
+            Arc::new(EmptyTable::new(Arc::clone(&src.schema))),
+        )?;
+    }
+
+    let topo = dag.nodes.topological_sort();
+    for dep_id in &topo {
+        if dep_id == node_id {
+            break;
+        }
+        let node = match dag.nodes.get(dep_id.clone()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let plan = create_logical_plan_with_stubs(&ctx, &node.query_text)
+            .await
+            .map_err(|e| {
+                OptimizerError::Exec(format!("build_ctx_for_node: failed to plan dep '{dep_id}': {e}"))
+            })?;
+        register_table_any(&ctx, dep_id, Arc::new(ViewTable::new(plan, None)))?;
+    }
+
+    Ok(ctx)
+}
+
+/// Return the DataFusion-optimized [`LogicalPlan`] for `node_id` in `dag`.
+pub async fn optimized_plan(dag: &Dag, node_id: &str) -> Result<LogicalPlan, OptimizerError> {
+    let ctx = build_ctx_for_node(dag, node_id).await?;
+    let node = dag
+        .nodes
+        .get(node_id.to_string())
+        .ok_or_else(|| OptimizerError::Exec(format!("optimized_plan: node '{node_id}' not found")))?;
+
+    let plan = create_logical_plan_with_stubs(&ctx, &node.query_text)
+        .await
+        .map_err(|e| OptimizerError::Exec(format!("optimized_plan: failed to plan '{node_id}': {e}")))?;
+
+    ctx.state()
+        .optimize(&plan)
+        .map_err(|e| OptimizerError::Exec(format!("optimized_plan: failed to optimize '{node_id}': {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // dialect_for_db — map a DAG sql_dialect string to a DataFusion unparser dialect
 // ---------------------------------------------------------------------------
 
