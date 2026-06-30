@@ -1,7 +1,7 @@
 use chrono::Utc;
 use dee::{
     connections::Connection,
-    connectors::{Connector, duckdb::DuckDBConnection, postgres::PostgresConnection},
+    connectors::Connector,
     dag::Dag,
     executor::{Executor, ProfilingConfig, SimpleEngine},
     file::DagFile,
@@ -9,6 +9,7 @@ use dee::{
         DagRunProfile, ProfileReport, build_dag_run_profile, render_profile_html,
         render_profile_summary,
     },
+    registry::ConnectionRegistry,
 };
 use log::info;
 
@@ -29,13 +30,26 @@ pub async fn run(run_cmd: RunCommand) -> Result<(), Box<dyn std::error::Error>> 
     let profiling_enabled =
         run_cmd.profile || run_cmd.profile_dump.is_some() || run_cmd.profile_viz.is_some();
 
+    // Build registry and register available connectors
+    let mut registry = ConnectionRegistry::new();
+    registry.register::<dee::connectors::duckdb::DuckDBConnection>("duckdb");
+    registry.register::<dee::connectors::postgres::PostgresConnection>("postgres");
+
     let runs = match &target_connection {
         Connection::DuckDB(config) => {
-            let conn = DuckDBConnection::new(config.clone()).await?;
+            let conn = registry.create::<dee::connectors::duckdb::DuckDBConnection>(
+                "duckdb",
+                config.clone(),
+            )
+            .await?;
             run_with_connector(conn, &run_cmd, profiling_enabled).await?
         }
         Connection::Postgres(config) => {
-            let conn = PostgresConnection::new(config.clone()).await?;
+            let conn = registry.create::<dee::connectors::postgres::PostgresConnection>(
+                "postgres",
+                config.clone(),
+            )
+            .await?;
             run_with_connector(conn, &run_cmd, profiling_enabled).await?
         }
     };

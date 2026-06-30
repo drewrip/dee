@@ -1,10 +1,10 @@
 use dee::{
     connections::Connection,
-    connectors::{Connector, duckdb::DuckDBConnection, postgres::PostgresConnection},
     dag::Dag,
     executor::{Executor, SimpleEngine},
     file::DagFile,
     opt::{Optimizer, OptimizerConfig},
+    registry::ConnectionRegistry,
 };
 use log::info;
 use serde::Serialize;
@@ -52,9 +52,18 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
     };
     config = config.with_omp_centrality(centrality);
 
+    // Build registry and register available connectors
+    let mut registry = ConnectionRegistry::new();
+    registry.register::<dee::connectors::duckdb::DuckDBConnection>("duckdb");
+    registry.register::<dee::connectors::postgres::PostgresConnection>("postgres");
+
     let opt_stats = match &target_connection {
         Connection::DuckDB(config_conn) => {
-            let conn = DuckDBConnection::new(config_conn.clone()).await?;
+            let conn = registry.create::<dee::connectors::duckdb::DuckDBConnection>(
+                "duckdb",
+                config_conn.clone(),
+            )
+            .await?;
             let engine = SimpleEngine::new(conn.clone())?;
             engine.cleanup(&dag).await?;
             let mut optimizer =
@@ -62,7 +71,11 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
             optimizer.run(&mut dag).await?
         }
         Connection::Postgres(config_conn) => {
-            let conn = PostgresConnection::new(config_conn.clone()).await?;
+            let conn = registry.create::<dee::connectors::postgres::PostgresConnection>(
+                "postgres",
+                config_conn.clone(),
+            )
+            .await?;
             let engine = SimpleEngine::new(conn.clone())?;
             engine.cleanup(&dag).await?;
             let mut optimizer =

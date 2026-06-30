@@ -1,5 +1,8 @@
 use crate::{
-    connectors::{Connector, ConnectorError},
+    connectors::{
+        Connector, ConnectorError, ExplainSupport, ProfilingSupport,
+        RelationOps, SchemaSupport, SystemMetrics,
+    },
     dag::MaterializeMode,
 };
 use async_trait::async_trait;
@@ -76,21 +79,185 @@ fn sample_process_cpu_usage(pid: u32) -> Result<Option<f64>, ConnectorError> {
     let output = Command::new("ps")
         .args(["-o", "%cpu=", "-p", &pid.to_string()])
         .output()
-        .map_err(|e| ConnectorError::Execute(format!("Failed to run ps for cpu usage: {}", e)))?;
+        .map_err(|e| ConnectorError::Execute { err: e.to_string(), query: "ps".to_string() })?;
 
     if !output.status.success() {
-        return Err(ConnectorError::Execute(format!(
-            "ps exited with status {} while sampling cpu usage",
-            output.status
-        )));
+        return Err(ConnectorError::Execute { err: format!("ps exited with status {}", output.status), query: "ps".to_string() });
     }
 
     let stdout = String::from_utf8(output.stdout).map_err(|e| {
-        ConnectorError::Execute(format!("Failed to decode ps cpu usage output: {}", e))
+        ConnectorError::Execute { err: e.to_string(), query: "ps".to_string() }
     })?;
 
     Ok(stdout.trim().parse::<f64>().ok())
 }
+
+// ---------------------------------------------------------------------------
+// Capability trait implementations
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl SchemaSupport for DuckDBConnection {
+    async fn get_schema(&self, name: &str) -> Result<SchemaRef, ConnectorError> {
+        info!("attempt to fetch arrow schema for {}", name);
+        let conn = self.pool.get().map_err(|e| {
+            ConnectorError::Execute { err: e.to_string(), query: "".to_string() }
+        })?;
+
+        // Execute with LIMIT 0 via query_arrow so DuckDB populates the arrow
+        // schema pointer before we call get_schema().  A plain prepare() +
+        // schema() panics because the arrow array pointer is only set after
+        // execution.  LIMIT 0 returns zero rows so there is no data transfer.
+        let tmpl_query = format!("SELECT * FROM {} LIMIT 0", name);
+        let mut stmt = conn.prepare(&tmpl_query).map_err(|e| {
+            ConnectorError::Execute { err: e.to_string(), query: tmpl_query.clone() }
+        })?;
+
+        stmt.query_arrow([])
+            .map_err(|e| ConnectorError::Execute { err: e.to_string(), query: tmpl_query })
+            .map(|arrow| arrow.get_schema())
+    }
+}
+
+#[async_trait]
+impl ExplainSupport for DuckDBConnection {
+    async fn explain(&self, query: &str) -> Result<String, ConnectorError> {
+        let conn = self.pool.get().map_err(|_| {
+            ConnectorError::Execute { err: "didn't get connection from pool".to_string(), query: query.to_string() }
+        })?;
+
+        let explain_query = format!("EXPLAIN (FORMAT JSON) {}", query);
+        let mut stmt = conn.prepare(&explain_query).map_err(|e| {
+            ConnectorError::Execute { err: e.to_string(), query: explain_query.clone() }
+        })?;
+
+        let json_str: String = stmt
+            .query_row([], |row| {
+                let col_count = row.as_ref().column_count();
+                if col_count >= 2 {
+                    row.get(1)
+                } else {
+                    row.get(0)
+                }
+            })
+            .map_err(|e| {
+                ConnectorError::Execute { err: e.to_string(), query: query.to_string() }
+            })?;
+
+        Ok(json_str)
+    }
+}
+
+#[async_trait]
+impl ProfilingSupport for DuckDBConnection {
+    type PlanData = String;
+
+    async fn execute_with_profile(
+        &self,
+        query: &str,
+    ) -> Result<(usize, Option<Self::PlanData>), ConnectorError> {
+        let conn = self.pool.get().map_err(|_| {
+            ConnectorError::Execute { err: "didn't get connection from pool".to_string(), query: query.to_string() }
+        })?;
+
+        let temp_file = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .map_err(|e| {
+                ConnectorError::Execute { err: e.to_string(), query: "".to_string() }
+            })?;
+        let temp_path = temp_file
+            .path()
+            .to_str()
+            .ok_or(ConnectorError::Execute { err: "Invalid temp path".to_string(), query: "".to_string() })?;
+
+        conn.execute("SET enable_profiling = 'json';", [])
+            .map_err(|e| {
+                ConnectorError::Execute { err: e.to_string(), query: "SET enable_profiling = 'json';".to_string() }
+            })?;
+        conn.execute(&format!("SET profiling_output = '{}';", temp_path), [])
+            .map_err(|e| {
+                ConnectorError::Execute { err: e.to_string(), query: format!("SET profiling_output = '{}';", temp_path) }
+            })?;
+
+        let res = conn.execute(query, params![]).map_err(|e| {
+            ConnectorError::Execute { err: e.to_string(), query: query.to_string() }
+        })?;
+
+        conn.execute("RESET enable_profiling;", []).map_err(|e| {
+            ConnectorError::Execute { err: e.to_string(), query: "RESET enable_profiling;".to_string() }
+        })?;
+        conn.execute("RESET profiling_output;", []).map_err(|e| {
+            ConnectorError::Execute { err: e.to_string(), query: "RESET profiling_output;".to_string() }
+        })?;
+
+        let json_str = std::fs::read_to_string(temp_path).map_err(|e| {
+            ConnectorError::Execute { err: e.to_string(), query: "".to_string() }
+        })?;
+
+        Ok((res, Some(json_str)))
+    }
+}
+
+#[async_trait]
+impl RelationOps for DuckDBConnection {
+    async fn create_relation(
+        &self,
+        relation_type: MaterializeMode,
+        name: String,
+        query: String,
+    ) -> Result<usize, ConnectorError> {
+        let rel_type = materialize_mode_in_duckdb(relation_type);
+        trace!("creating new_relation ({}, {})", rel_type, name);
+        let tmpl_query = format!(
+            "CREATE OR REPLACE {} {} AS ({})",
+            rel_type, name, query
+        );
+        self.execute(tmpl_query).await
+    }
+
+    async fn drop_relation(
+        &self,
+        relation_type: MaterializeMode,
+        name: String,
+    ) -> Result<usize, ConnectorError> {
+        let rel_type = materialize_mode_in_duckdb(relation_type);
+        trace!("attempt drop_relation ({}, {})", rel_type, name);
+        let tmpl_query = format!("DROP {} IF EXISTS {}", rel_type, name);
+        self.execute(tmpl_query).await
+    }
+}
+
+#[async_trait]
+impl SystemMetrics for DuckDBConnection {
+    async fn sample_cpu(&self) -> Result<Option<f64>, ConnectorError> {
+        sample_process_cpu_usage(std::process::id())
+    }
+
+    async fn sample_memory(&self) -> Result<Option<u64>, ConnectorError> {
+        let conn = self.pool.get().map_err(|_| {
+            ConnectorError::Execute { err: "didn't get connection from pool".to_string(), query: "".to_string() }
+        })?;
+
+        let mut stmt = conn
+            .prepare("SELECT memory_usage FROM pragma_database_size()")
+            .map_err(|e| {
+                ConnectorError::Execute { err: e.to_string(), query: "SELECT memory_usage FROM pragma_database_size()".to_string() }
+            })?;
+
+        let memory_usage: String = stmt
+            .query_row([], |row| row.get(0))
+            .map_err(|e| {
+                ConnectorError::Execute { err: e.to_string(), query: "SELECT memory_usage FROM pragma_database_size()".to_string() }
+            })?;
+
+        Ok(parse_duckdb_size_bytes(&memory_usage))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connector impl (keeps backward-compatible method names)
+// ---------------------------------------------------------------------------
 
 #[async_trait]
 impl Connector for DuckDBConnection {
@@ -138,114 +305,24 @@ impl Connector for DuckDBConnection {
         let conn = self
             .pool
             .get()
-            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
+            .map_err(|_| ConnectorError::Execute { err: "didn't get connection from pool".to_string(), query: query_text.clone() })?;
         conn.execute(&query_text.clone(), params![]).map_err(|e| {
-            ConnectorError::Execute(format!("{} - query_text:\n{}", e.to_string(), query_text))
+            ConnectorError::Execute { err: e.to_string(), query: query_text }
         })
     }
 
+    async fn dialect(&self) -> &'static str {
+        "duckdb"
+    }
+
+    // Delegate deprecated Connector methods to capability traits
     async fn new_relation(
         &self,
         relation_type: MaterializeMode,
         name: String,
         query_text: String,
     ) -> Result<usize, ConnectorError> {
-        let rel_type = materialize_mode_in_duckdb(relation_type);
-        trace!("creating new_relation ({}, {})", rel_type, name);
-        let tmpl_query = format!(
-            "CREATE OR REPLACE {} {} AS ({})",
-            rel_type, name, query_text
-        );
-        self.execute(tmpl_query).await
-    }
-
-    async fn new_relation_and_explain(
-        &self,
-        relation_type: MaterializeMode,
-        name: String,
-        query_text: String,
-    ) -> Result<(usize, Option<String>), ConnectorError> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
-
-        match relation_type {
-            MaterializeMode::View => {
-                let explain_query = format!("EXPLAIN (FORMAT JSON) {}", query_text);
-                let mut stmt = conn.prepare(&explain_query).map_err(|e| {
-                    ConnectorError::Execute(format!("Failed to prepare explain: {}", e))
-                })?;
-
-                let json_str: String = stmt
-                    .query_row([], |row| {
-                        let col_count = row.as_ref().column_count();
-                        if col_count >= 2 {
-                            row.get(1)
-                        } else {
-                            row.get(0)
-                        }
-                    })
-                    .map_err(|e| {
-                        ConnectorError::Execute(format!("Failed to execute explain: {}", e))
-                    })?;
-
-                let rel_type = materialize_mode_in_duckdb(relation_type);
-                let tmpl_query = format!("CREATE {} {} AS ({})", rel_type, name, query_text);
-                let res = conn.execute(&tmpl_query, params![]).map_err(|e| {
-                    ConnectorError::Execute(format!(
-                        "{} - query_text:\n{}",
-                        e.to_string(),
-                        tmpl_query
-                    ))
-                })?;
-                Ok((res, Some(json_str)))
-            }
-            MaterializeMode::Table | MaterializeMode::TempTable => {
-                let temp_file = tempfile::Builder::new()
-                    .suffix(".json")
-                    .tempfile()
-                    .map_err(|e| {
-                        ConnectorError::Execute(format!("Failed to create temp file: {}", e))
-                    })?;
-                let temp_path = temp_file
-                    .path()
-                    .to_str()
-                    .ok_or(ConnectorError::Execute("Invalid temp path".to_string()))?;
-
-                conn.execute("SET enable_profiling = 'json';", [])
-                    .map_err(|e| {
-                        ConnectorError::Execute(format!("Failed to enable profiling: {}", e))
-                    })?;
-                conn.execute(&format!("SET profiling_output = '{}';", temp_path), [])
-                    .map_err(|e| {
-                        ConnectorError::Execute(format!("Failed to set profiling output: {}", e))
-                    })?;
-
-                let rel_type = materialize_mode_in_duckdb(relation_type);
-                let tmpl_query = format!("CREATE {} {} AS ({})", rel_type, name, query_text);
-                let res = conn.execute(&tmpl_query, params![]).map_err(|e| {
-                    ConnectorError::Execute(format!(
-                        "{} - query_text:\n{}",
-                        e.to_string(),
-                        tmpl_query
-                    ))
-                })?;
-
-                conn.execute("RESET enable_profiling;", []).map_err(|e| {
-                    ConnectorError::Execute(format!("Failed to disable profiling: {}", e))
-                })?;
-                conn.execute("RESET profiling_output;", []).map_err(|e| {
-                    ConnectorError::Execute(format!("Failed to reset profiling output: {}", e))
-                })?;
-
-                let json_str = std::fs::read_to_string(temp_path).map_err(|e| {
-                    ConnectorError::Execute(format!("Failed to read profiling output: {}", e))
-                })?;
-
-                Ok((res, Some(json_str)))
-            }
-        }
+        RelationOps::create_relation(self, relation_type, name, query_text).await
     }
 
     async fn drop_relation(
@@ -253,64 +330,14 @@ impl Connector for DuckDBConnection {
         relation_type: MaterializeMode,
         name: String,
     ) -> Result<usize, ConnectorError> {
-        let rel_type = materialize_mode_in_duckdb(relation_type);
-        trace!("attempt drop_relation ({}, {})", rel_type, name);
-        let tmpl_query = format!("DROP {} IF EXISTS {}", rel_type, name);
-        self.execute(tmpl_query).await
+        RelationOps::drop_relation(self, relation_type, name).await
     }
 
-    async fn get_schema(&self, name: String) -> Option<Result<SchemaRef, ConnectorError>> {
-        info!("attempt to fetch arrow schema for {}", name);
-        let conn = match self.pool.get() {
-            Ok(c) => c,
-            Err(e) => {
-                return Some(Err(ConnectorError::Execute(format!(
-                    "couldn't get connection from pool: {e}"
-                ))));
-            }
-        };
-        // Execute with LIMIT 0 via query_arrow so DuckDB populates the arrow
-        // schema pointer before we call get_schema().  A plain prepare() +
-        // schema() panics because the arrow array pointer is only set after
-        // execution.  LIMIT 0 returns zero rows so there is no data transfer.
-        let tmpl_query = format!("SELECT * FROM {} LIMIT 0", name);
-        let mut stmt = match conn.prepare(&tmpl_query) {
-            Ok(s) => s,
-            Err(e) => {
-                return Some(Err(ConnectorError::Execute(format!(
-                    "couldn't prepare schema query for {name}: {e}"
-                ))));
-            }
-        };
-        match stmt.query_arrow([]) {
-            Ok(arrow) => Some(Ok(arrow.get_schema())),
-            Err(e) => Some(Err(ConnectorError::Execute(format!(
-                "couldn't execute schema query for {name}: {e}"
-            )))),
-        }
-    }
-
-    async fn sample_system_memory_usage(&self) -> Result<Option<u64>, ConnectorError> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
-
-        let mut stmt = conn
-            .prepare("SELECT memory_usage FROM pragma_database_size()")
-            .map_err(|e| {
-                ConnectorError::Execute(format!("Failed to prepare memory usage sample: {}", e))
-            })?;
-
-        let memory_usage: String = stmt
-            .query_row([], |row| row.get(0))
-            .map_err(|e| ConnectorError::Execute(format!("Failed to query memory usage: {}", e)))?;
-
-        Ok(parse_duckdb_size_bytes(&memory_usage))
-    }
-
-    async fn sample_system_cpu_usage(&self) -> Result<Option<f64>, ConnectorError> {
-        sample_process_cpu_usage(std::process::id())
+    async fn get_schema(
+        &self,
+        name: String,
+    ) -> Option<Result<SchemaRef, ConnectorError>> {
+        Some(SchemaSupport::get_schema(self, &name).await)
     }
 }
 

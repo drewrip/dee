@@ -87,14 +87,10 @@ where
                 } else {
                     format!("{prefix}\"lp_{i}\"")
                 };
-                self.conn
-                    .drop_relation(MaterializeMode::Table, lp.clone())
-                    .await
-                    .ok();
-                self.conn
-                    .drop_relation(MaterializeMode::View, lp)
-                    .await
-                    .ok();
+                #[allow(deprecated)] {
+                    self.conn.drop_relation(MaterializeMode::Table, lp.clone()).await.ok();
+                    self.conn.drop_relation(MaterializeMode::View, lp).await.ok();
+                }
             }
         }
 

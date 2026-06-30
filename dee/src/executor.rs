@@ -165,6 +165,7 @@ where
     (stop_tx, handle)
 }
 
+#[allow(deprecated)]
 #[async_trait]
 impl<C> Executor<C> for SimpleEngine<C>
 where
@@ -327,24 +328,13 @@ where
         Ok(exec_stats)
     }
 
+    #[allow(deprecated)]
     async fn cleanup(&self, dag: &Dag) -> Result<usize, ExecutorError> {
         let mut num_deleted = 0;
         for node in dag.nodes.nodes() {
-            num_deleted += self
-                .conn
-                .drop_relation(MaterializeMode::View, node.id.clone())
-                .await
-                .unwrap_or(0);
-            num_deleted += self
-                .conn
-                .drop_relation(MaterializeMode::Table, node.id.clone())
-                .await
-                .unwrap_or(0);
-            num_deleted += self
-                .conn
-                .drop_relation(MaterializeMode::TempTable, node.id.clone())
-                .await
-                .unwrap_or(0);
+            num_deleted += self.conn.drop_relation(MaterializeMode::View, node.id.clone()).await.unwrap_or(0);
+            num_deleted += self.conn.drop_relation(MaterializeMode::Table, node.id.clone()).await.unwrap_or(0);
+            num_deleted += self.conn.drop_relation(MaterializeMode::TempTable, node.id.clone()).await.unwrap_or(0);
         }
         debug!("cleanup, {} relations dropped", num_deleted);
         Ok(num_deleted)
@@ -441,6 +431,7 @@ where
             let conn = Arc::clone(conn);
             let names = names.to_vec();
             async move {
+                #[allow(deprecated)]
                 for name in names {
                     conn.drop_relation(MaterializeMode::View, name).await.ok();
                 }
@@ -456,6 +447,7 @@ where
                 .get(tmp_id.clone())
                 .ok_or_else(|| ExecutorError::Exec(format!("node '{tmp_id}' not found")))?;
 
+            #[allow(deprecated)]
             self.conn
                 .new_relation(MaterializeMode::View, node.id.clone(), node.query_text.clone())
                 .await
@@ -469,6 +461,7 @@ where
         debug!("resolve_schemas: creating {} source view(s)", dag.sources.len());
         for (src, tmp_name) in dag.sources.iter().zip(source_tmp_names.iter()) {
             let query = format!("SELECT * FROM {} LIMIT 0", src.name);
+            #[allow(deprecated)]
             if let Err(e) = self.conn
                 .new_relation(MaterializeMode::View, tmp_name.clone(), query)
                 .await
@@ -485,6 +478,7 @@ where
         let mut resolved_nodes: Vec<(String, datafusion::arrow::datatypes::SchemaRef)> = Vec::new();
         for orig_id in &topo {
             let tmp_id = &rename_map[orig_id];
+            #[allow(deprecated)]
             match self.conn.get_schema(tmp_id.clone()).await {
                 Some(Ok(schema)) => {
                     debug!("resolve_schemas: resolved schema for '{orig_id}' (via '{tmp_id}')");
@@ -511,6 +505,7 @@ where
         debug!("resolve_schemas: fetching schemas for {} source(s)", dag.sources.len());
         let mut resolved_sources: Vec<datafusion::arrow::datatypes::SchemaRef> = Vec::new();
         for (src, tmp_name) in dag.sources.iter().zip(source_tmp_names.iter()) {
+            #[allow(deprecated)]
             match self.conn.get_schema(tmp_name.clone()).await {
                 Some(Ok(schema)) => {
                     debug!("resolve_schemas: resolved schema for source '{}' (via '{tmp_name}')", src.name);

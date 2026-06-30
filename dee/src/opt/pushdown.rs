@@ -168,7 +168,7 @@ where
             node.materialize,
             MaterializeMode::Table | MaterializeMode::TempTable
         ) {
-            if let Some(Ok(schema)) = conn.get_schema(node_id.clone()).await {
+            if let Some(Ok(schema)) = { #[allow(deprecated)] conn.get_schema(node_id.clone()).await } {
                 register_table_any(&ctx, node_id, Arc::new(EmptyTable::new(schema)))?;
                 continue;
             } else {
