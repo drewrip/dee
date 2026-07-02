@@ -55,10 +55,6 @@ impl OpaqueScanTable {
 
 #[async_trait]
 impl TableProvider for OpaqueScanTable {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -442,9 +438,7 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
                     frontier_sql.insert(n_id.clone(), stmt.to_string());
                 }
                 Err(e) => {
-                    warn!(
-                        "pushdown: could not regenerate SQL for frontier '{n_id}': {e}"
-                    );
+                    warn!("pushdown: could not regenerate SQL for frontier '{n_id}': {e}");
                 }
             }
         }
@@ -765,7 +759,6 @@ pub async fn graph_minor(dag: &Dag) -> Result<Dag, OptimizerError> {
     Ok(minor)
 }
 
-
 #[derive(Debug, Clone)]
 pub struct PushdownPass<C, E>
 where
@@ -882,9 +875,7 @@ where
             // both DAGs reflect the clean, canonical SQL before the source node
             // is updated.
             for (frontier_id, reopt_sql) in &result.frontier_sql {
-                debug!(
-                    "PushdownPass: updating frontier '{frontier_id}' with regenerated SQL"
-                );
+                debug!("PushdownPass: updating frontier '{frontier_id}' with regenerated SQL");
                 if let Some(n) = dag.nodes.get_mut(frontier_id.clone()) {
                     n.query_text = reopt_sql.clone();
                 }
@@ -1673,7 +1664,9 @@ mod tests {
         )
         .await;
 
-        let PushdownResult { source_sql: sql, .. } = pushdown(&dag, "staging")
+        let PushdownResult {
+            source_sql: sql, ..
+        } = pushdown(&dag, "staging")
             .await
             .expect("pushdown should succeed");
 
@@ -1720,7 +1713,9 @@ mod tests {
         )
         .await;
 
-        let PushdownResult { source_sql: sql, .. } = pushdown(&dag, "staging")
+        let PushdownResult {
+            source_sql: sql, ..
+        } = pushdown(&dag, "staging")
             .await
             .expect("pushdown should succeed");
 

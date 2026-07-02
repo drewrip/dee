@@ -69,9 +69,6 @@ impl StubScalar {
 }
 
 impl ScalarUDFImpl for StubScalar {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -126,9 +123,6 @@ impl Accumulator for StubAccumulator {
 }
 
 impl AggregateUDFImpl for StubAggregate {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -182,9 +176,6 @@ impl PartitionEvaluator for StubPartitionEvaluator {
 }
 
 impl WindowUDFImpl for StubWindow {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }
