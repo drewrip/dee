@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -57,5 +58,17 @@ pub trait Connector {
 
     async fn sample_system_memory_usage(&self) -> Result<Option<u64>, ConnectorError> {
         Ok(None)
+    }
+
+    /// Parse `EXPLAIN (FORMAT JSON)` output into a DataFusion
+    /// [`ExecutionPlan`].
+    ///
+    /// Returns `Some(plan)` when the connector can convert its explain
+    async fn explain_to_logical_plan(
+        &self,
+        _json_plan: &str,
+        _schema: SchemaRef,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        None
     }
 }
