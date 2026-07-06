@@ -627,7 +627,7 @@ pub fn make_temp(
 ///   `"foo"`                    → `` (empty — no prefix)
 ///
 /// The landing pad inherits this prefix so it lands in the same catalog/schema.
-fn schema_prefix(node_id: &str) -> String {
+pub(crate) fn schema_prefix(node_id: &str) -> String {
     // Qualified identifiers join segments with `"."`.  Find the last occurrence
     // of that separator and return everything up to and including it.
     if let Some(pos) = node_id.rfind("\".\"") {
