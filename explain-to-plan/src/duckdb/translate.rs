@@ -106,7 +106,17 @@ impl<'a> Translator<'a> {
             field: format!("catalog entry for table '{table}'"),
         })?;
 
-        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(full_schema.clone()));
+        // Tag the scan's schema with the table name DuckDB reported. An
+        // `EmptyExec` otherwise carries only a schema, with no way to recover
+        // which table it scans; `raise::raise_to_logical` reads this back to
+        // reconstruct a `TableScan`.
+        let tagged_schema: SchemaRef = {
+            let mut metadata = full_schema.metadata().clone();
+            metadata.insert(crate::TABLE_NAME_METADATA_KEY.to_string(), table.clone());
+            Arc::new(Schema::new_with_metadata(full_schema.fields().clone(), metadata))
+        };
+
+        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(tagged_schema));
 
         if let Some(filters) = node.extra_info.get("Filters") {
             for f in filters.iter() {
