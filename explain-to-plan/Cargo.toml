@@ -1,0 +1,15 @@
+[package]
+name = "explain-to-plan"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "3496b9e9a1cf0b4fc43975cdc90b42790bafafc6", features = ["sql"] }
+arrow = "59"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tokio = { version = "1.50.0", features = ["full"] }

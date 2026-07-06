@@ -1,0 +1,165 @@
+{
+    "total_memory_allocated": 7602176,
+    "total_bytes_written": 0,
+    "total_bytes_read": 262144,
+    "system_peak_temp_dir_size": 0,
+    "system_peak_buffer_memory": 11999232,
+    "rows_returned": 0,
+    "result_set_size": 0,
+    "latency": 0.001115,
+    "wal_replay_entry_count": 0,
+    "extra_info": {},
+    "commit_local_storage_latency": 0.0,
+    "attach_load_storage_latency": 0.0,
+    "query_name": "EXPLAIN (ANALYZE, FORMAT JSON) SELECT grp, id%3 as m, COUNT(*), MIN(id), MAX(id), AVG(id) FROM t1 GROUP BY grp, id%3;",
+    "cpu_time": 0.0011773380000000002,
+    "checkpoint_latency": 0.0,
+    "cumulative_cardinality": 3060,
+    "waiting_to_attach_latency": 0.0,
+    "write_to_wal_latency": 0.0,
+    "attach_replay_wal_latency": 0.0,
+    "blocked_thread_time": 0.0,
+    "cumulative_rows_scanned": 1000,
+    "children": [
+        {
+            "system_peak_temp_dir_size": 0,
+            "result_set_size": 0,
+            "operator_type": "EXPLAIN_ANALYZE",
+            "operator_timing": 7.1e-7,
+            "operator_rows_scanned": 0,
+            "extra_info": {},
+            "system_peak_buffer_memory": 0,
+            "cumulative_rows_scanned": 1000,
+            "cpu_time": 0.0011773380000000002,
+            "operator_name": "EXPLAIN_ANALYZE",
+            "cumulative_cardinality": 3060,
+            "operator_cardinality": 0,
+            "children": [
+                {
+                    "cumulative_cardinality": 3060,
+                    "operator_cardinality": 30,
+                    "cumulative_rows_scanned": 1000,
+                    "operator_name": "PROJECTION",
+                    "cpu_time": 0.0011766280000000003,
+                    "operator_rows_scanned": 0,
+                    "system_peak_buffer_memory": 0,
+                    "extra_info": {
+                        "Projections": [
+                            "__internal_decompress_integral_bigint(#0, 0)",
+                            "#1",
+                            "#2",
+                            "#3",
+                            "#4",
+                            "#5"
+                        ],
+                        "Estimated Cardinality": "11"
+                    },
+                    "operator_timing": 0.000012,
+                    "system_peak_temp_dir_size": 0,
+                    "result_set_size": 1440,
+                    "operator_type": "PROJECTION",
+                    "children": [
+                        {
+                            "system_peak_temp_dir_size": 0,
+                            "result_set_size": 1230,
+                            "operator_type": "HASH_GROUP_BY",
+                            "operator_timing": 0.0011155020000000002,
+                            "operator_rows_scanned": 0,
+                            "extra_info": {
+                                "Groups": [
+                                    "#0",
+                                    "#1"
+                                ],
+                                "Aggregates": [
+                                    "count_star()",
+                                    "min(#2)",
+                                    "max(#3)",
+                                    "avg(#4)"
+                                ],
+                                "Estimated Cardinality": "11"
+                            },
+                            "system_peak_buffer_memory": 0,
+                            "cumulative_rows_scanned": 1000,
+                            "cpu_time": 0.0011646280000000002,
+                            "operator_name": "HASH_GROUP_BY",
+                            "cumulative_cardinality": 3030,
+                            "operator_cardinality": 30,
+                            "children": [
+                                {
+                                    "cumulative_cardinality": 3000,
+                                    "operator_cardinality": 1000,
+                                    "cumulative_rows_scanned": 1000,
+                                    "operator_name": "PROJECTION",
+                                    "cpu_time": 0.000049126000000000004,
+                                    "operator_rows_scanned": 0,
+                                    "system_peak_buffer_memory": 0,
+                                    "extra_info": {
+                                        "Projections": [
+                                            "grp",
+                                            "(id % 3)",
+                                            "id",
+                                            "id",
+                                            "id"
+                                        ],
+                                        "Estimated Cardinality": "1000"
+                                    },
+                                    "operator_timing": 0.000002792,
+                                    "system_peak_temp_dir_size": 0,
+                                    "result_set_size": 33000,
+                                    "operator_type": "PROJECTION",
+                                    "children": [
+                                        {
+                                            "system_peak_temp_dir_size": 0,
+                                            "result_set_size": 9000,
+                                            "operator_type": "PROJECTION",
+                                            "operator_timing": 0.000001708,
+                                            "operator_rows_scanned": 0,
+                                            "extra_info": {
+                                                "Projections": [
+                                                    "__internal_compress_integral_utinyint(#0, 0)",
+                                                    "#1"
+                                                ],
+                                                "Estimated Cardinality": "1000"
+                                            },
+                                            "system_peak_buffer_memory": 0,
+                                            "cumulative_rows_scanned": 1000,
+                                            "cpu_time": 0.000046334,
+                                            "operator_name": "PROJECTION",
+                                            "cumulative_cardinality": 2000,
+                                            "operator_cardinality": 1000,
+                                            "children": [
+                                                {
+                                                    "cumulative_cardinality": 1000,
+                                                    "operator_cardinality": 1000,
+                                                    "cumulative_rows_scanned": 1000,
+                                                    "operator_name": "SEQ_SCAN",
+                                                    "cpu_time": 0.000044626,
+                                                    "operator_rows_scanned": 1000,
+                                                    "system_peak_buffer_memory": 0,
+                                                    "extra_info": {
+                                                        "Table": "test.main.t1",
+                                                        "Type": "Sequential Scan",
+                                                        "Projections": [
+                                                            "grp",
+                                                            "id"
+                                                        ],
+                                                        "Estimated Cardinality": "1000"
+                                                    },
+                                                    "operator_timing": 0.000044626,
+                                                    "system_peak_temp_dir_size": 0,
+                                                    "result_set_size": 16000,
+                                                    "operator_type": "TABLE_SCAN",
+                                                    "children": []
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

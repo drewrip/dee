@@ -1,0 +1,81 @@
+{
+    "total_memory_allocated": 0,
+    "total_bytes_written": 0,
+    "total_bytes_read": 262144,
+    "system_peak_temp_dir_size": 0,
+    "system_peak_buffer_memory": 1966080,
+    "rows_returned": 0,
+    "result_set_size": 0,
+    "latency": 0.000388375,
+    "wal_replay_entry_count": 0,
+    "extra_info": {},
+    "commit_local_storage_latency": 0.0,
+    "attach_load_storage_latency": 0.0,
+    "query_name": "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM t1 ORDER BY id LIMIT 5;",
+    "cpu_time": 0.00005933300000000001,
+    "checkpoint_latency": 0.0,
+    "cumulative_cardinality": 1005,
+    "waiting_to_attach_latency": 0.0,
+    "write_to_wal_latency": 0.0,
+    "attach_replay_wal_latency": 0.0,
+    "blocked_thread_time": 0.0,
+    "cumulative_rows_scanned": 1000,
+    "children": [
+        {
+            "system_peak_temp_dir_size": 0,
+            "result_set_size": 0,
+            "operator_type": "EXPLAIN_ANALYZE",
+            "operator_timing": 1.25e-7,
+            "operator_rows_scanned": 0,
+            "extra_info": {},
+            "system_peak_buffer_memory": 0,
+            "cumulative_rows_scanned": 1000,
+            "cpu_time": 0.00005933300000000001,
+            "operator_name": "EXPLAIN_ANALYZE",
+            "cumulative_cardinality": 1005,
+            "operator_cardinality": 0,
+            "children": [
+                {
+                    "cumulative_cardinality": 1005,
+                    "operator_cardinality": 5,
+                    "cumulative_rows_scanned": 1000,
+                    "operator_name": "TOP_N",
+                    "cpu_time": 0.000059208000000000006,
+                    "operator_rows_scanned": 0,
+                    "system_peak_buffer_memory": 0,
+                    "extra_info": {
+                        "Top": "5",
+                        "Order By": "test.main.t1.id ASC"
+                    },
+                    "operator_timing": 0.000019291,
+                    "system_peak_temp_dir_size": 0,
+                    "result_set_size": 40,
+                    "operator_type": "TOP_N",
+                    "children": [
+                        {
+                            "system_peak_temp_dir_size": 0,
+                            "result_set_size": 8000,
+                            "operator_type": "TABLE_SCAN",
+                            "operator_timing": 0.000039917000000000004,
+                            "operator_rows_scanned": 1000,
+                            "extra_info": {
+                                "Table": "test.main.t1",
+                                "Type": "Sequential Scan",
+                                "Projections": "id",
+                                "Filters": "optional: Dynamic Filter (id)",
+                                "Estimated Cardinality": "1000"
+                            },
+                            "system_peak_buffer_memory": 0,
+                            "cumulative_rows_scanned": 1000,
+                            "cpu_time": 0.000039917000000000004,
+                            "operator_name": "SEQ_SCAN",
+                            "cumulative_cardinality": 1000,
+                            "operator_cardinality": 1000,
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

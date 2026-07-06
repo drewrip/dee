@@ -1,0 +1,64 @@
+{
+    "total_memory_allocated": 0,
+    "total_bytes_written": 0,
+    "total_bytes_read": 262144,
+    "system_peak_temp_dir_size": 0,
+    "system_peak_buffer_memory": 557056,
+    "rows_returned": 0,
+    "result_set_size": 0,
+    "latency": 0.000419333,
+    "wal_replay_entry_count": 0,
+    "extra_info": {},
+    "commit_local_storage_latency": 0.0,
+    "attach_load_storage_latency": 0.0,
+    "query_name": "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id, grp FROM t1;",
+    "cpu_time": 0.00006208199999999999,
+    "checkpoint_latency": 0.0,
+    "cumulative_cardinality": 1000,
+    "waiting_to_attach_latency": 0.0,
+    "write_to_wal_latency": 0.0,
+    "attach_replay_wal_latency": 0.0,
+    "blocked_thread_time": 0.0,
+    "cumulative_rows_scanned": 1000,
+    "children": [
+        {
+            "system_peak_temp_dir_size": 0,
+            "result_set_size": 0,
+            "operator_type": "EXPLAIN_ANALYZE",
+            "operator_timing": 2.08e-7,
+            "operator_rows_scanned": 0,
+            "extra_info": {},
+            "system_peak_buffer_memory": 0,
+            "cumulative_rows_scanned": 1000,
+            "cpu_time": 0.00006208199999999999,
+            "operator_name": "EXPLAIN_ANALYZE",
+            "cumulative_cardinality": 1000,
+            "operator_cardinality": 0,
+            "children": [
+                {
+                    "cumulative_cardinality": 1000,
+                    "operator_cardinality": 1000,
+                    "cumulative_rows_scanned": 1000,
+                    "operator_name": "SEQ_SCAN",
+                    "cpu_time": 0.000061874,
+                    "operator_rows_scanned": 1000,
+                    "system_peak_buffer_memory": 0,
+                    "extra_info": {
+                        "Table": "test.main.t1",
+                        "Type": "Sequential Scan",
+                        "Projections": [
+                            "id",
+                            "grp"
+                        ],
+                        "Estimated Cardinality": "1000"
+                    },
+                    "operator_timing": 0.000061874,
+                    "system_peak_temp_dir_size": 0,
+                    "result_set_size": 16000,
+                    "operator_type": "TABLE_SCAN",
+                    "children": []
+                }
+            ]
+        }
+    ]
+}

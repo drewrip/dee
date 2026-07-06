@@ -1942,6 +1942,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "explain-to-plan"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

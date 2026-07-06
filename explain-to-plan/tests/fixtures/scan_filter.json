@@ -1,0 +1,62 @@
+{
+    "total_memory_allocated": 0,
+    "total_bytes_written": 0,
+    "total_bytes_read": 262144,
+    "system_peak_temp_dir_size": 0,
+    "system_peak_buffer_memory": 524288,
+    "rows_returned": 0,
+    "result_set_size": 0,
+    "latency": 0.000387833,
+    "wal_replay_entry_count": 0,
+    "extra_info": {},
+    "commit_local_storage_latency": 0.0,
+    "attach_load_storage_latency": 0.0,
+    "query_name": "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM t1 WHERE id > 10;",
+    "cpu_time": 0.000047958000000000004,
+    "checkpoint_latency": 0.0,
+    "cumulative_cardinality": 989,
+    "waiting_to_attach_latency": 0.0,
+    "write_to_wal_latency": 0.0,
+    "attach_replay_wal_latency": 0.0,
+    "blocked_thread_time": 0.0,
+    "cumulative_rows_scanned": 1000,
+    "children": [
+        {
+            "system_peak_temp_dir_size": 0,
+            "result_set_size": 0,
+            "operator_type": "EXPLAIN_ANALYZE",
+            "operator_timing": 2.08e-7,
+            "operator_rows_scanned": 0,
+            "extra_info": {},
+            "system_peak_buffer_memory": 0,
+            "cumulative_rows_scanned": 1000,
+            "cpu_time": 0.000047958000000000004,
+            "operator_name": "EXPLAIN_ANALYZE",
+            "cumulative_cardinality": 989,
+            "operator_cardinality": 0,
+            "children": [
+                {
+                    "cumulative_cardinality": 989,
+                    "operator_cardinality": 989,
+                    "cumulative_rows_scanned": 1000,
+                    "operator_name": "SEQ_SCAN",
+                    "cpu_time": 0.00004775,
+                    "operator_rows_scanned": 1000,
+                    "system_peak_buffer_memory": 0,
+                    "extra_info": {
+                        "Table": "test.main.t1",
+                        "Type": "Sequential Scan",
+                        "Projections": "id",
+                        "Filters": "id>10",
+                        "Estimated Cardinality": "200"
+                    },
+                    "operator_timing": 0.00004775,
+                    "system_peak_temp_dir_size": 0,
+                    "result_set_size": 7912,
+                    "operator_type": "TABLE_SCAN",
+                    "children": []
+                }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,101 @@
+{
+    "total_memory_allocated": 524288,
+    "total_bytes_written": 0,
+    "total_bytes_read": 262144,
+    "system_peak_temp_dir_size": 0,
+    "system_peak_buffer_memory": 1310720,
+    "rows_returned": 0,
+    "result_set_size": 0,
+    "latency": 0.000547333,
+    "wal_replay_entry_count": 0,
+    "extra_info": {},
+    "commit_local_storage_latency": 0.0,
+    "attach_load_storage_latency": 0.0,
+    "query_name": "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id, RANK() OVER (ORDER BY id) FROM t1;",
+    "cpu_time": 0.000136292,
+    "checkpoint_latency": 0.0,
+    "cumulative_cardinality": 3000,
+    "waiting_to_attach_latency": 0.0,
+    "write_to_wal_latency": 0.0,
+    "attach_replay_wal_latency": 0.0,
+    "blocked_thread_time": 0.0,
+    "cumulative_rows_scanned": 1000,
+    "children": [
+        {
+            "system_peak_temp_dir_size": 0,
+            "result_set_size": 0,
+            "operator_type": "EXPLAIN_ANALYZE",
+            "operator_timing": 1.25e-7,
+            "operator_rows_scanned": 0,
+            "extra_info": {},
+            "system_peak_buffer_memory": 0,
+            "cumulative_rows_scanned": 1000,
+            "cpu_time": 0.000136292,
+            "operator_name": "EXPLAIN_ANALYZE",
+            "cumulative_cardinality": 3000,
+            "operator_cardinality": 0,
+            "children": [
+                {
+                    "cumulative_cardinality": 3000,
+                    "operator_cardinality": 1000,
+                    "cumulative_rows_scanned": 1000,
+                    "operator_name": "PROJECTION",
+                    "cpu_time": 0.000136167,
+                    "operator_rows_scanned": 0,
+                    "system_peak_buffer_memory": 0,
+                    "extra_info": {
+                        "Projections": [
+                            "#0",
+                            "#1"
+                        ],
+                        "Estimated Cardinality": "1000"
+                    },
+                    "operator_timing": 3.75e-7,
+                    "system_peak_temp_dir_size": 0,
+                    "result_set_size": 16000,
+                    "operator_type": "PROJECTION",
+                    "children": [
+                        {
+                            "system_peak_temp_dir_size": 0,
+                            "result_set_size": 16000,
+                            "operator_type": "WINDOW",
+                            "operator_timing": 0.000097001,
+                            "operator_rows_scanned": 0,
+                            "extra_info": {
+                                "Projections": "RANK() OVER (ORDER BY id ASC NULLS LAST)"
+                            },
+                            "system_peak_buffer_memory": 0,
+                            "cumulative_rows_scanned": 1000,
+                            "cpu_time": 0.000135792,
+                            "operator_name": "WINDOW",
+                            "cumulative_cardinality": 2000,
+                            "operator_cardinality": 1000,
+                            "children": [
+                                {
+                                    "cumulative_cardinality": 1000,
+                                    "operator_cardinality": 1000,
+                                    "cumulative_rows_scanned": 1000,
+                                    "operator_name": "SEQ_SCAN",
+                                    "cpu_time": 0.000038790999999999995,
+                                    "operator_rows_scanned": 1000,
+                                    "system_peak_buffer_memory": 0,
+                                    "extra_info": {
+                                        "Table": "test.main.t1",
+                                        "Type": "Sequential Scan",
+                                        "Projections": "id",
+                                        "Estimated Cardinality": "1000"
+                                    },
+                                    "operator_timing": 0.000038790999999999995,
+                                    "system_peak_temp_dir_size": 0,
+                                    "result_set_size": 8000,
+                                    "operator_type": "TABLE_SCAN",
+                                    "children": []
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
