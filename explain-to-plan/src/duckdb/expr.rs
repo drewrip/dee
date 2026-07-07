@@ -784,17 +784,10 @@ impl<'a> Parser<'a> {
     }
 
     fn resolve_scalar_call(&self, name: &str, _distinct: bool, args: Vec<Expr>) -> Result<Expr> {
-        if let Some(cast_to) = decompress_target(name) {
-            let arg = args.into_iter().next().ok_or_else(|| {
+        if is_internal_wrapper(name) {
+            return args.into_iter().next().ok_or_else(|| {
                 DuckDBTranslateError::ExprParse(format!("{name} expects at least one argument"))
-            })?;
-            return Ok(Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(arg), cast_to)));
-        }
-        if let Some(cast_to) = compress_target(name) {
-            let arg = args.into_iter().next().ok_or_else(|| {
-                DuckDBTranslateError::ExprParse(format!("{name} expects at least one argument"))
-            })?;
-            return Ok(Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(arg), cast_to)));
+            });
         }
 
         let mapped = map_scalar_fn_name(name);
@@ -816,31 +809,18 @@ fn parse_number(raw: &str) -> ScalarValue {
     }
 }
 
-/// DuckDB emits synthetic `__internal_decompress_integral_<type>(expr, offset)`
-/// projections when reading dictionary/bitpacked storage. Semantically this
-/// widens `expr` back to `<type>`, so we lower it to an equivalent `CAST`.
-fn decompress_target(name: &str) -> Option<DataType> {
-    let ty = name.strip_prefix("__internal_decompress_integral_")?;
-    integral_type(ty)
-}
-
-fn compress_target(name: &str) -> Option<DataType> {
-    let ty = name.strip_prefix("__internal_compress_integral_")?;
-    integral_type(ty)
-}
-
-fn integral_type(ty: &str) -> Option<DataType> {
-    Some(match ty {
-        "utinyint" => DataType::UInt8,
-        "usmallint" => DataType::UInt16,
-        "uinteger" => DataType::UInt32,
-        "ubigint" => DataType::UInt64,
-        "tinyint" => DataType::Int8,
-        "smallint" => DataType::Int16,
-        "integer" => DataType::Int32,
-        "bigint" => DataType::Int64,
-        _ => return None,
-    })
+/// DuckDB emits synthetic `__internal_*(expr, ...)` calls when reading from
+/// compressed/dictionary/bitpacked storage — e.g.
+/// `__internal_decompress_integral_bigint(#0, 0)`,
+/// `__internal_compress_string_utinyint(#0, ...)`. These describe *storage*
+/// encoding decisions the query never mentions and have no corresponding
+/// relational operator or SQL expression; whatever type suffix follows
+/// `__internal_{de,}compress_` (integral, string, or any future variant) is
+/// storage metadata, not a value transformation. They lower to a pure
+/// passthrough of their first argument — the actual column/expression being
+/// encoded — dropping every other argument (offsets, dictionaries, etc.).
+fn is_internal_wrapper(name: &str) -> bool {
+    name.starts_with("__internal")
 }
 
 fn map_scalar_fn_name(name: &str) -> &str {

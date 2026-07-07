@@ -35,7 +35,7 @@ use datafusion::prelude::SessionContext;
 
 use super::DuckDBTranslateError;
 use super::expr;
-use super::model::DuckDBNode;
+use super::model::{DuckDBNode, ExtraInfoValue};
 
 type Result<T> = std::result::Result<T, DuckDBTranslateError>;
 
@@ -97,22 +97,37 @@ impl<'a> Translator<'a> {
 
     fn translate_scan(&self, node: &DuckDBNode) -> Result<Arc<dyn ExecutionPlan>> {
         let table = extra(node, "Table")?.first().unwrap_or_default().to_string();
-        let full_schema = self.catalog.get(&table).cloned().or_else(|| {
-            let bare = table.rsplit('.').next().unwrap_or(&table);
-            self.catalog.get(bare).cloned()
-        });
-        let full_schema = full_schema.ok_or_else(|| DuckDBTranslateError::MissingField {
-            operator: node.operator_name.clone(),
-            field: format!("catalog entry for table '{table}'"),
-        })?;
+        let bare = table.rsplit('.').next().unwrap_or(&table).to_string();
 
-        // Tag the scan's schema with the table name DuckDB reported. An
+        // Try the name DuckDB reported first, then fall back to its bare
+        // (unqualified) last segment. Whichever key actually matched is what
+        // we tag the schema with below — *not* necessarily `table` itself —
+        // since the caller's catalog is keyed however *they* identify the
+        // table (e.g. a bare "lineitem", matching how the rest of their DAG
+        // refers to it), which can differ from DuckDB's own internally
+        // qualified name (e.g. "warehouse.main.lineitem"). Tagging with the
+        // wrong one would make `raise::raise_to_logical` reconstruct a
+        // `TableScan` under a name the caller's own catalog/DAG never uses.
+        let (matched_key, full_schema) = match self.catalog.get(&table) {
+            Some(schema) => (table.clone(), schema.clone()),
+            None => match self.catalog.get(&bare) {
+                Some(schema) => (bare.clone(), schema.clone()),
+                None => {
+                    return Err(DuckDBTranslateError::MissingField {
+                        operator: node.operator_name.clone(),
+                        field: format!("catalog entry for table '{table}'"),
+                    });
+                }
+            },
+        };
+
+        // Tag the scan's schema with the table name that resolved it. An
         // `EmptyExec` otherwise carries only a schema, with no way to recover
         // which table it scans; `raise::raise_to_logical` reads this back to
         // reconstruct a `TableScan`.
         let tagged_schema: SchemaRef = {
             let mut metadata = full_schema.metadata().clone();
-            metadata.insert(crate::TABLE_NAME_METADATA_KEY.to_string(), table.clone());
+            metadata.insert(crate::TABLE_NAME_METADATA_KEY.to_string(), matched_key);
             Arc::new(Schema::new_with_metadata(full_schema.fields().clone(), metadata))
         };
 
@@ -159,8 +174,24 @@ impl<'a> Translator<'a> {
     fn translate_projection(&self, node: &DuckDBNode) -> Result<Arc<dyn ExecutionPlan>> {
         let input = self.only_child(node)?;
         let projections = extra(node, "Projections")?;
-        let input_schema = input.schema();
 
+        // DuckDB inserts bookkeeping projections around joins and compressed
+        // storage reads whose entries are *only* ever bare `#N` positional
+        // references or `__internal_*` storage-encoding wrappers (see
+        // `is_internal_wrapper`) -- real SQL-level SELECTs always print
+        // actual column/expression text, never positional syntax. These
+        // nodes carry no relational meaning, and DuckDB's own EXPLAIN output
+        // for them can even omit a trailing entry outright for
+        // heavily-compressed multi-column joins (observed: a 25-column hash
+        // join's rename-projection listing only 24 entries). Rather than
+        // fail on a missing/unmapped reference — or silently produce a plan
+        // one column short — recognize the pattern up front and skip the
+        // node entirely, passing `input` straight through unchanged.
+        if is_internal_bookkeeping_projection(projections) {
+            return Ok(input);
+        }
+
+        let input_schema = input.schema();
         let mut exprs = Vec::new();
         for text in projections.iter() {
             let logical = expr::parse_expr(text, input_schema.as_ref(), self.ctx)?;
@@ -616,6 +647,16 @@ fn map_join_type(text: &str) -> Result<JoinType> {
         "ANTI" => JoinType::LeftAnti,
         other => return Err(DuckDBTranslateError::UnsupportedOperator(format!("join type {other}"))),
     })
+}
+
+/// Returns `true` if every entry in a `PROJECTION` node's `Projections` list
+/// is either a bare positional reference (`#N`) or an `__internal_*` storage
+/// wrapper call — the signature of a DuckDB-inserted bookkeeping projection
+/// (join column re-ordering, (de)compression) rather than a real SQL-level
+/// projection, which always prints actual column/expression text.
+fn is_internal_bookkeeping_projection(projections: &ExtraInfoValue) -> bool {
+    let mut entries = projections.iter().peekable();
+    entries.peek().is_some() && entries.all(|p| p.starts_with('#') || p.starts_with("__internal"))
 }
 
 /// If `expr` is (transitively, through identity casts) a plain column

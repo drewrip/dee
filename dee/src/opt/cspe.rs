@@ -7,9 +7,9 @@ use datafusion::{
     },
     datasource::{TableProvider, empty::EmptyTable, provider_as_source},
     logical_expr::{LogicalPlan, TableScanBuilder},
-    prelude::SessionContext,
     sql::unparser::Unparser,
 };
+use explain_to_plan::{DuckDBTranslateConfig, ExplainToPlan, raise_to_logical};
 use log::{debug, warn};
 use std::{
     collections::{HashMap, HashSet},
@@ -20,10 +20,10 @@ use std::{
 use crate::{
     connectors::Connector,
     dag::{Dag, MaterializeMode, TransformNode},
-    executor::Executor,
+    executor::{Executor, ProfilingConfig, SimpleEngine},
     opt::{
         OptimizerError, OptimizerPass,
-        common::{create_logical_plan_with_stubs, dialect_for_db, register_table_any, schema_prefix},
+        common::{dialect_for_db, schema_prefix},
         pushdown::graph_minor,
     },
 };
@@ -172,46 +172,94 @@ fn find_maximal_common_subplans(node_entries: &HashMap<String, Vec<PlanEntry>>) 
 }
 
 // ---------------------------------------------------------------------------
-// Building optimized plans, one per Table/TempTable node of the graph minor
+// Analyzing real plans, one per Table/TempTable node of the graph minor
 // ---------------------------------------------------------------------------
 
-/// Plan and optimize every node of `minor` (a view-free DAG — see
-/// [`graph_minor`]), registering each node as a schema-only table in the
-/// shared [`SessionContext`] as we go so downstream nodes' plans terminate at
-/// a `TableScan` referencing it rather than being expanded further. Keeping
-/// DAG node boundaries intact is what lets us later recognize a shared
-/// subtree as ending at (or containing) a scan of a real node.
-async fn build_optimized_plans(minor: &Dag) -> Result<HashMap<String, LogicalPlan>, OptimizerError> {
-    let ctx = SessionContext::new();
+/// Materialize every node of `minor` (a view-free DAG — see [`graph_minor`])
+/// for real against `conn`, capture each node's `EXPLAIN ANALYZE` plan, and
+/// raise it to a [`LogicalPlan`].
+///
+/// Deferring to the database's own optimizer (rather than DataFusion's) means
+/// the subtree matching in [`find_maximal_common_subplans`] reflects how the
+/// query will *actually* run — real filter/join ordering, real pushdown
+/// decisions — not DataFusion's generic heuristics. The cost is that this
+/// pass now touches the live database: every node gets a real
+/// `CREATE TABLE/VIEW ... AS (...)` (via [`SimpleEngine`], the same
+/// mechanism [`crate::opt::hmp::HMPPass`] uses for its baseline run), which
+/// requires `minor`'s raw sources to already exist as real relations in the
+/// connected database.
+///
+/// A node whose plan can't be captured, translated, or raised (e.g. the
+/// connector doesn't support `EXPLAIN ANALYZE` at all, or the query uses an
+/// operator [`raise_to_logical`] doesn't cover) is skipped with a warning
+/// rather than failing the whole pass — it simply won't participate in
+/// common-subplan matching.
+async fn build_analyzed_plans<C>(conn: &Arc<C>, minor: &Dag) -> Result<HashMap<String, LogicalPlan>, OptimizerError>
+where
+    C: Connector + Send + Sync + 'static,
+{
+    let engine = SimpleEngine::new(Arc::clone(conn))
+        .map_err(|e| OptimizerError::Exec(format!("CSPE: failed to create engine: {e}")))?
+        .with_profiling(ProfilingConfig {
+            collect_plans: true,
+            ..Default::default()
+        });
 
+    // Best-effort: clear any relations left over from a previous run before
+    // materializing fresh ones.
+    let _ = engine.cleanup(minor).await;
+
+    let exec_stats = engine.run(minor).await.map_err(|e| {
+        OptimizerError::Exec(format!("CSPE: failed to materialize graph minor for analysis: {e}"))
+    })?;
+
+    // Every table DuckDB's plan JSON might reference: the DAG's raw sources
+    // plus every node we just materialized. Fetched fresh from the live
+    // connector now that everything actually exists as a real relation.
+    let mut catalog: HashMap<String, SchemaRef> = HashMap::new();
     for src in &minor.sources {
-        register_table_any(
-            &ctx,
-            &src.name,
-            Arc::new(EmptyTable::new(Arc::clone(&src.schema))),
-        )?;
+        if let Some(Ok(schema)) = conn.get_schema(src.name.clone()).await {
+            catalog.insert(src.name.clone(), schema);
+        }
     }
+    for node_id in minor.nodes.nodes().map(|n| n.id.clone()) {
+        if let Some(Ok(schema)) = conn.get_schema(node_id.clone()).await {
+            catalog.insert(node_id, schema);
+        }
+    }
+    let translator = DuckDBTranslateConfig::new().with_catalog(catalog);
 
     let mut plans = HashMap::new();
-    for node_id in minor.nodes.topological_sort() {
-        let node = match minor.nodes.get(node_id.clone()) {
-            Some(n) => n,
-            None => continue,
+    for node_id in minor.nodes.nodes().map(|n| n.id.clone()) {
+        let plan_json = match exec_stats.node_stats.get(&node_id).and_then(|s| s.plan.clone()) {
+            Some(json) => json,
+            None => {
+                warn!("CSPE: no EXPLAIN ANALYZE plan captured for '{node_id}', skipping");
+                continue;
+            }
         };
 
-        let raw_plan = create_logical_plan_with_stubs(&ctx, &node.query_text)
-            .await
-            .map_err(|e| OptimizerError::Exec(format!("CSPE: failed to plan node '{node_id}': {e}")))?;
+        let physical = match translator.explain_to_plan(plan_json) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("CSPE: failed to translate DuckDB plan for '{node_id}': {e}");
+                continue;
+            }
+        };
 
-        let opt_plan = ctx.state().optimize(&raw_plan).map_err(|e| {
-            OptimizerError::Exec(format!("CSPE: failed to optimize node '{node_id}': {e}"))
-        })?;
-
-        let schema = Arc::new(opt_plan.schema().as_arrow().clone());
-        register_table_any(&ctx, &node_id, Arc::new(EmptyTable::new(schema)))?;
-
-        plans.insert(node_id, opt_plan);
+        match raise_to_logical(&physical) {
+            Ok(logical) => {
+                plans.insert(node_id, logical);
+            }
+            Err(e) => {
+                warn!("CSPE: failed to raise plan for '{node_id}' to a LogicalPlan: {e}");
+            }
+        }
     }
+
+    // These relations only existed to be analyzed; drop them so this internal
+    // step leaves no trace once the pass has its LogicalPlans in hand.
+    let _ = engine.cleanup(minor).await;
 
     Ok(plans)
 }
@@ -257,8 +305,10 @@ fn collect_dep_ids(plan: &LogicalPlan, minor: &Dag, deps: &mut HashSet<String>) 
 /// Algorithm:
 /// 1. Compute the [`graph_minor`] of the DAG (View nodes inlined away, leaving
 ///    only `Table`/`TempTable` nodes).
-/// 2. Plan and run the DataFusion optimizer over every node's SQL, producing
-///    one optimized [`LogicalPlan`] per node.
+/// 2. Materialize every node for real and capture its `EXPLAIN ANALYZE` plan,
+///    raising it to a [`LogicalPlan`] (see [`build_analyzed_plans`]) — this
+///    defers to the connected database's own optimizer rather than
+///    DataFusion's, so matching reflects how the query actually runs.
 /// 3. Flatten each plan into a parent-linked subtree index and group every
 ///    subtree across all nodes by structural equality. A subtree shared by
 ///    two or more nodes is a candidate; it is *maximal* if its immediate
@@ -274,9 +324,8 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    _conn: Arc<C>,
-    _engine: Arc<E>,
-    _phantom: PhantomData<C>,
+    conn: Arc<C>,
+    _phantom: PhantomData<E>,
 }
 
 impl<C, E> CSPEPass<C, E>
@@ -284,10 +333,9 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    pub fn new(conn: Arc<C>, engine: Arc<E>) -> Self {
+    pub fn new(conn: Arc<C>, _engine: Arc<E>) -> Self {
         Self {
-            _conn: conn,
-            _engine: engine,
+            conn,
             _phantom: PhantomData,
         }
     }
@@ -307,8 +355,8 @@ where
         let mut minor = graph_minor(dag).await?;
         debug!("CSPEPass: graph minor has {} nodes", minor.nodes.num_nodes());
 
-        debug!("CSPEPass: building optimized plans");
-        let plans = build_optimized_plans(&minor).await?;
+        debug!("CSPEPass: materializing graph minor and analyzing real EXPLAIN ANALYZE plans");
+        let plans = build_analyzed_plans(&self.conn, &minor).await?;
 
         let mut node_entries: HashMap<String, Vec<PlanEntry>> = HashMap::new();
         for (node_id, plan) in &plans {
@@ -457,78 +505,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::{Connector, ConnectorError};
+    use crate::connectors::Connector;
+    use crate::connectors::duckdb::{DuckDBConfig, DuckDBConnection};
     use crate::dag::{Dag, MaterializeMode, SourceNode, TransformNode};
-    use crate::executor::{ExecStats, Executor, ExecutorError};
+    use crate::executor::SimpleEngine;
     use crate::graph::Graph;
-    use async_trait::async_trait;
-    use chrono::Utc;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use std::collections::HashMap;
-    use tokio::sync::watch;
 
-    #[derive(Debug, Default)]
-    struct StubConnector;
-
-    #[async_trait]
-    impl Connector for StubConnector {
-        type Config = ();
-        type Connection = StubConnector;
-
-        async fn new(_: ()) -> Result<Arc<Self::Connection>, ConnectorError> {
-            Ok(Arc::new(StubConnector))
-        }
-        async fn execute(&self, _: String) -> Result<usize, ConnectorError> {
-            Ok(0)
-        }
-        async fn new_relation(
-            &self,
-            _: MaterializeMode,
-            _: String,
-            _: String,
-        ) -> Result<usize, ConnectorError> {
-            Ok(0)
-        }
-        async fn drop_relation(
-            &self,
-            _: MaterializeMode,
-            _: String,
-        ) -> Result<usize, ConnectorError> {
-            Ok(0)
-        }
-        async fn get_schema(&self, _: String) -> Option<Result<SchemaRef, ConnectorError>> {
-            None
-        }
-    }
-
-    struct StubExecutor;
-
-    #[async_trait]
-    impl Executor<StubConnector> for StubExecutor {
-        type ExecutionEngine = StubExecutor;
-
-        fn new(_: Arc<StubConnector>) -> Result<StubExecutor, ExecutorError> {
-            Ok(StubExecutor)
-        }
-        async fn run(&self, _: &Dag) -> Result<ExecStats, ExecutorError> {
-            let now = Utc::now();
-            Ok(ExecStats {
-                start: now,
-                finish: now,
-                duration: chrono::TimeDelta::zero(),
-                node_stats: Default::default(),
-                system_samples: vec![],
-            })
-        }
-        async fn cleanup(&self, _: &Dag) -> Result<usize, ExecutorError> {
-            Ok(0)
-        }
-        fn cancel_sender(&self) -> Arc<watch::Sender<bool>> {
-            Arc::new(watch::channel(false).0)
-        }
-        async fn resolve_schemas(&self, _dag: &mut Dag) -> Result<(), ExecutorError> {
-            Ok(())
-        }
+    // CSPE now materializes every node for real to capture its actual
+    // EXPLAIN ANALYZE plan, so these tests run against a real (in-memory)
+    // DuckDB connection rather than a no-op stub. `":memory:"` connections
+    // in the same pool would otherwise each get an isolated database, so the
+    // pool is pinned to a single connection.
+    async fn real_conn() -> Arc<DuckDBConnection> {
+        let cfg = DuckDBConfig::new_from_path(":memory:".to_string()).with_num_connections(1);
+        DuckDBConnection::new(cfg).await.expect("failed to open in-memory duckdb")
     }
 
     fn make_dag(nodes: Vec<TransformNode>) -> Dag {
@@ -553,16 +544,36 @@ mod tests {
         }
     }
 
-    fn pass() -> CSPEPass<StubConnector, StubExecutor> {
-        CSPEPass::new(Arc::new(StubConnector), Arc::new(StubExecutor))
+    fn pass(conn: Arc<DuckDBConnection>) -> CSPEPass<DuckDBConnection, SimpleEngine<DuckDBConnection>> {
+        let engine = SimpleEngine::new(conn.clone()).expect("failed to create engine");
+        CSPEPass::new(conn, Arc::new(engine))
     }
 
-    fn raw_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount", DataType::Float64, false),
+    fn raw_schema(conn: &Arc<DuckDBConnection>) -> SchemaRef {
+        // Live schema, matching what `get_schema` will report once seeded.
+        // Kept separate from seeding itself for readability at call sites.
+        let _ = conn;
+        Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int64, true),
+            datafusion::arrow::datatypes::Field::new("region", datafusion::arrow::datatypes::DataType::Utf8, true),
+            datafusion::arrow::datatypes::Field::new(
+                "amount",
+                datafusion::arrow::datatypes::DataType::Float64,
+                true,
+            ),
         ]))
+    }
+
+    /// Seeds a real `raw` table with a couple of US/EU rows so the DAG's
+    /// queries have real data to run `EXPLAIN ANALYZE` against.
+    async fn seed_raw(conn: &Arc<DuckDBConnection>) {
+        conn.execute(
+            "CREATE TABLE raw AS SELECT * FROM (VALUES \
+             (1, 'US', 10.0), (2, 'US', 20.0), (3, 'EU', 30.0)) AS t(id, region, amount)"
+                .to_string(),
+        )
+        .await
+        .expect("failed to seed raw table");
     }
 
     // DAG layout:
@@ -595,13 +606,16 @@ mod tests {
             &["staging"],
         );
 
+        let conn = real_conn().await;
+        seed_raw(&conn).await;
+
         let mut dag = make_dag(vec![staging, table_a, table_b]);
         dag.sources = vec![SourceNode {
             name: "raw".to_string(),
-            schema: raw_schema(),
+            schema: raw_schema(&conn),
         }];
 
-        let stats = pass().run(&mut dag).await.expect("pass should succeed");
+        let stats = pass(conn).run(&mut dag).await.expect("pass should succeed");
         assert_eq!(stats.get("factored_nodes").map(String::as_str), Some("1"));
 
         let a = dag.nodes.get("table_a".to_string()).unwrap();
@@ -662,12 +676,16 @@ mod tests {
     // DAG layout:
     //
     //   staging (TempTable)   SELECT id, region, amount FROM raw
-    //       ├──► table_a (Table)   SELECT amount, amount * 2 AS doubled FROM staging WHERE region = 'US'
+    //       ├──► table_a (Table)   SELECT amount FROM staging WHERE region = 'US' ORDER BY amount
     //       └──► table_b (Table)   SELECT amount FROM staging WHERE region = 'US'
     //
-    // table_a and table_b diverge at the outermost projection, but share the
-    // same `Filter(region = 'US') -> TableScan(staging)` subtree beneath it.
-    // That subtree — not the whole plan — is the maximal common subplan.
+    // table_a and table_b need exactly the same columns from staging (region
+    // for the filter, amount for the output), so DuckDB's real optimizer
+    // prunes/pushes the scan down identically for both — table_a just sorts
+    // its result on top. table_a and table_b diverge at that outermost sort,
+    // but share the same `Filter(region = 'US') -> TableScan(staging)`
+    // subtree beneath it. That subtree — not the whole plan — is the maximal
+    // common subplan.
     #[tokio::test]
     async fn test_partial_subtree_shared_beneath_differing_projections() {
         let staging = node(
@@ -678,7 +696,7 @@ mod tests {
         );
         let table_a = node(
             "table_a",
-            "SELECT amount, amount * 2 AS doubled FROM staging WHERE region = 'US'",
+            "SELECT amount FROM staging WHERE region = 'US' ORDER BY amount",
             MaterializeMode::Table,
             &["staging"],
         );
@@ -689,13 +707,16 @@ mod tests {
             &["staging"],
         );
 
+        let conn = real_conn().await;
+        seed_raw(&conn).await;
+
         let mut dag = make_dag(vec![staging, table_a, table_b]);
         dag.sources = vec![SourceNode {
             name: "raw".to_string(),
-            schema: raw_schema(),
+            schema: raw_schema(&conn),
         }];
 
-        let stats = pass().run(&mut dag).await.expect("pass should succeed");
+        let stats = pass(conn).run(&mut dag).await.expect("pass should succeed");
         assert_eq!(stats.get("factored_nodes").map(String::as_str), Some("1"));
 
         let a = dag.nodes.get("table_a".to_string()).unwrap();
@@ -711,10 +732,10 @@ mod tests {
             "table_b must reference the factored node; got: {}",
             b.query_text
         );
-        // table_a's distinguishing computation must survive the rewrite.
+        // table_a's distinguishing ORDER BY must survive the rewrite.
         assert!(
-            a.query_text.to_lowercase().contains("doubled") || a.query_text.contains('*'),
-            "table_a must retain its own projection on top of the shared subplan; got: {}",
+            a.query_text.to_uppercase().contains("ORDER BY"),
+            "table_a must retain its own sort on top of the shared subplan; got: {}",
             a.query_text
         );
 
@@ -764,13 +785,16 @@ mod tests {
             &["staging"],
         );
 
+        let conn = real_conn().await;
+        seed_raw(&conn).await;
+
         let mut dag = make_dag(vec![staging, table_a, table_b]);
         dag.sources = vec![SourceNode {
             name: "raw".to_string(),
-            schema: raw_schema(),
+            schema: raw_schema(&conn),
         }];
 
-        let stats = pass().run(&mut dag).await.expect("pass should succeed");
+        let stats = pass(conn).run(&mut dag).await.expect("pass should succeed");
         assert_eq!(stats.get("factored_nodes").map(String::as_str), Some("0"));
 
         let factored: Vec<_> = dag.nodes.nodes().filter(|n| n.id.starts_with("cspe_")).collect();

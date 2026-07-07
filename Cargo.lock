@@ -1736,6 +1736,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "duckdb",
+ "explain-to-plan",
  "futures",
  "itertools 0.14.0",
  "log",

@@ -248,6 +248,22 @@ fn unknown_table_gives_clear_error_instead_of_panicking() {
 }
 
 #[test]
+fn internal_storage_wrapper_functions_are_treated_as_passthrough() {
+    // DuckDB wraps compressed/dictionary-encoded columns in synthetic
+    // `__internal_*` calls with no relational meaning. The known
+    // `__internal_{de,}compress_integral_<type>` family used to be handled
+    // via an explicit type-suffix lookup, which panicked/errored on any
+    // other variant (e.g. the `string` family below) -- any `__internal_*`
+    // call must lower to a bare passthrough of its first argument instead.
+    let plain = r#"[{"name": "PROJECTION", "extra_info": {"Projections": "__internal_compress_string_utinyint(#0, 0)"}, "children": [
+        {"name": "SEQ_SCAN", "extra_info": {"Table": "test.main.t1", "Projections": "name"}, "children": []}
+    ]}]"#;
+    let plan = config().explain_to_plan(plain.to_string()).unwrap();
+    assert_eq!(plan.schema().fields().len(), 1);
+    assert_eq!(plan.schema().field(0).name(), "name");
+}
+
+#[test]
 fn plain_explain_without_analyze_also_parses() {
     // Plain `EXPLAIN (FORMAT JSON)` (no ANALYZE) never has `operator_cardinality`,
     // so scans/filters/projections/joins/aggregates should all still translate;
