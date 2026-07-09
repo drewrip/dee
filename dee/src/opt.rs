@@ -67,6 +67,9 @@ where
     run_pushdown_pass: bool,
     /// Common Subplan Elimination pass
     run_cspe_pass: bool,
+    /// CSPE: order/optimize plans via DataFusion's own optimizer instead of
+    /// materializing each node for real and analyzing its EXPLAIN ANALYZE plan
+    cspe_use_df_optimizer: bool,
     /// Result stats
     stats_on_passes: bool,
 }
@@ -94,6 +97,7 @@ where
             hmp_no_plan_dups: config.hmp_no_plan_dups,
             run_pushdown_pass: config.run_pushdown_pass,
             run_cspe_pass: config.run_cspe_pass,
+            cspe_use_df_optimizer: config.cspe_use_df_optimizer,
             stats_on_passes: false,
         }
     }
@@ -161,7 +165,8 @@ where
         }
 
         if self.run_cspe_pass {
-            let mut pass: CSPEPass<C, E> = CSPEPass::new(self.conn.clone(), self.engine.clone());
+            let mut pass: CSPEPass<C, E> =
+                CSPEPass::new(self.conn.clone(), self.engine.clone(), self.cspe_use_df_optimizer);
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
                 stats.insert("CSPEPass".to_string(), Arc::new(res));
@@ -188,6 +193,7 @@ pub struct OptimizerConfig {
     pub hmp_no_plan_dups: bool,
     pub run_pushdown_pass: bool,
     pub run_cspe_pass: bool,
+    pub cspe_use_df_optimizer: bool,
 }
 
 impl Default for OptimizerConfig {
@@ -202,6 +208,7 @@ impl Default for OptimizerConfig {
             hmp_no_plan_dups: false,
             run_pushdown_pass: false,
             run_cspe_pass: false,
+            cspe_use_df_optimizer: false,
         }
     }
 }
@@ -274,6 +281,11 @@ impl OptimizerConfig {
 
     pub fn with_cspe_pass(mut self) -> Self {
         self.run_cspe_pass = true;
+        self
+    }
+
+    pub fn with_cspe_use_df_optimizer(mut self, use_df_optimizer: bool) -> Self {
+        self.cspe_use_df_optimizer = use_df_optimizer;
         self
     }
 }

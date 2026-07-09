@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
-use datafusion::common::{JoinSide, JoinType, NullEquality};
+use datafusion::common::{JoinSide, JoinType, NullEquality, TableReference};
 use datafusion::logical_expr::{Operator, WindowFunctionDefinition};
 use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_expr::expressions::Column as PhysColumn;
@@ -65,6 +65,38 @@ fn extra<'n>(node: &'n DuckDBNode, field: &str) -> Result<&'n super::model::Extr
     })
 }
 
+/// Looks up `table` (DuckDB's own reported name for a `SEQ_SCAN`/`TABLE_SCAN`,
+/// e.g. the unquoted `warehouse.main.order_items`) in `catalog`, returning the
+/// catalog key that matched (verbatim, as the caller wrote it) alongside its
+/// schema.
+///
+/// Tries, in order:
+/// 1. `table` itself, as a literal catalog key.
+/// 2. Its bare (unqualified) last segment, as a literal catalog key.
+/// 3. Every catalog key, comparing as a parsed [`TableReference`] rather than
+///    as a raw string. This is what actually handles a catalog keyed with
+///    different quoting than DuckDB's own report — e.g. a caller's DAG might
+///    key its catalog by the fully quoted `"warehouse"."main"."order_items"`,
+///    which is byte-for-byte different from DuckDB's unquoted
+///    `warehouse.main.order_items` despite naming the exact same table.
+///    `TableReference` parsing understands quoting, so the two resolve to an
+///    identical `Full` reference and compare equal.
+fn resolve_catalog_entry(catalog: &Catalog, table: &str) -> Option<(String, SchemaRef)> {
+    if let Some(schema) = catalog.get(table) {
+        return Some((table.to_string(), schema.clone()));
+    }
+
+    let bare = table.rsplit('.').next().unwrap_or(table);
+    if let Some(schema) = catalog.get(bare) {
+        return Some((bare.to_string(), schema.clone()));
+    }
+
+    let table_ref = TableReference::from(table);
+    catalog.iter().find_map(|(key, schema)| {
+        (TableReference::from(key.as_str()).resolved_eq(&table_ref)).then(|| (key.clone(), schema.clone()))
+    })
+}
+
 impl<'a> Translator<'a> {
     fn translate(&self, node: &DuckDBNode) -> Result<Arc<dyn ExecutionPlan>> {
         match node.operator_name.as_str() {
@@ -97,29 +129,22 @@ impl<'a> Translator<'a> {
 
     fn translate_scan(&self, node: &DuckDBNode) -> Result<Arc<dyn ExecutionPlan>> {
         let table = extra(node, "Table")?.first().unwrap_or_default().to_string();
-        let bare = table.rsplit('.').next().unwrap_or(&table).to_string();
 
-        // Try the name DuckDB reported first, then fall back to its bare
-        // (unqualified) last segment. Whichever key actually matched is what
-        // we tag the schema with below — *not* necessarily `table` itself —
-        // since the caller's catalog is keyed however *they* identify the
-        // table (e.g. a bare "lineitem", matching how the rest of their DAG
-        // refers to it), which can differ from DuckDB's own internally
-        // qualified name (e.g. "warehouse.main.lineitem"). Tagging with the
-        // wrong one would make `raise::raise_to_logical` reconstruct a
-        // `TableScan` under a name the caller's own catalog/DAG never uses.
-        let (matched_key, full_schema) = match self.catalog.get(&table) {
-            Some(schema) => (table.clone(), schema.clone()),
-            None => match self.catalog.get(&bare) {
-                Some(schema) => (bare.clone(), schema.clone()),
-                None => {
-                    return Err(DuckDBTranslateError::MissingField {
-                        operator: node.operator_name.clone(),
-                        field: format!("catalog entry for table '{table}'"),
-                    });
-                }
-            },
-        };
+        // Whichever catalog key actually matched is what we tag the schema
+        // with below — *not* necessarily `table` itself — since the
+        // caller's catalog is keyed however *they* identify the table (e.g.
+        // a bare "lineitem", or a fully quoted `"warehouse"."main"."lineitem"`,
+        // matching how the rest of their DAG refers to it), which can differ
+        // from DuckDB's own internally reported name (e.g. the unquoted
+        // "warehouse.main.lineitem"). Tagging with the wrong one would make
+        // `raise::raise_to_logical` reconstruct a `TableScan` under a name
+        // the caller's own catalog/DAG never uses.
+        let (matched_key, full_schema) = resolve_catalog_entry(self.catalog, &table).ok_or_else(|| {
+            DuckDBTranslateError::MissingField {
+                operator: node.operator_name.clone(),
+                field: format!("catalog entry for table '{table}'"),
+            }
+        })?;
 
         // Tag the scan's schema with the table name that resolved it. An
         // `EmptyExec` otherwise carries only a schema, with no way to recover

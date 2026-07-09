@@ -79,6 +79,38 @@ def plot_data(results, output_path):
     print(f"\nVisualization saved to {output_path}")
 
 
+def plot_num_factored(results, output_path):
+    if not results:
+        print("No results to plot.")
+        return
+
+    projects = [r["project"] for r in results]
+    counts = [r.get("queries_with_factored_subexpressions", 0) for r in results]
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    bars = ax.bar(projects, counts, color="steelblue")
+
+    for bar, count in zip(bars, counts):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            str(count),
+            ha="center",
+            va="bottom",
+            fontweight="bold",
+        )
+
+    ax.set_ylabel("Queries with Factored Subexpressions")
+    ax.set_title("Common Subplans Factored Out by CSPE, per Project")
+    ax.set_ylim(bottom=0)
+    plt.xticks(rotation=45, ha="right")
+    ax.grid(True, axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout()
+
+    plt.savefig(output_path)
+    print(f"\nVisualization saved to {output_path}")
+
+
 def plot_results(results_path, output_path):
     if not Path(results_path).exists():
         print(f"Error: {results_path} not found.")

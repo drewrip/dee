@@ -82,6 +82,8 @@ pub struct OptCommand {
     omp_exhaust: bool,
     #[arg(long, action)]
     omp_use_pushdown: bool,
+    #[arg(long, action)]
+    cspe_use_df_optimizer: bool,
 
     dag_file: String,
 }

@@ -8,7 +8,7 @@ import argparse
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from .plot import plot_data, plot_deep_dive
+from .plot import plot_data, plot_deep_dive, plot_num_factored
 
 
 def run_cmd(cmd, cwd=None, env=None, capture=True):
@@ -105,6 +105,97 @@ def generate_connections_json(src_project_dir, dest_project_dir, requested_db_ty
     return str(connections_json_path), final_target
 
 
+def prepare_project(project_name, dag_bench_root, tmp_bench_dir, dee_cli_path, db_type, max_mem=None, threads=None):
+    """Copies a project into the scratch directory, compiles it with dbt,
+    converts its manifest to a dee DAG, and generates a connections.json.
+
+    Returns `(dag_json_path, connections_json, target)`, or `None` if the
+    project couldn't be set up (missing source dir or no matching
+    connections.yml output for `db_type`).
+    """
+    print(f"\n--- Preparing Project: {project_name} ---")
+    src_project_path = Path(dag_bench_root) / "projects" / project_name
+    dest_project_path = tmp_bench_dir / project_name
+
+    if not src_project_path.exists():
+        print(f"Error: Project {project_name} not found at {src_project_path}")
+        return None
+
+    shutil.copytree(src_project_path, dest_project_path)
+
+    # 1. dbt compile
+    dbt_target = "dev" if db_type == "duckdb" else "postgres"
+    run_cmd(["dbt", "compile", "--target", dbt_target], cwd=dest_project_path)
+
+    manifest_path = dest_project_path / "target" / "manifest.json"
+    dag_json_path = dest_project_path / "dag.json"
+
+    # 2. convert
+    run_cmd(
+        [
+            dee_cli_path,
+            "convert",
+            "--format",
+            "dbt",
+            "-o",
+            str(dag_json_path),
+            str(manifest_path),
+        ]
+    )
+
+    connections_json, target = generate_connections_json(
+        src_project_path, dest_project_path, db_type, max_mem=max_mem, threads=threads
+    )
+    if not connections_json:
+        print(f"Warning: Could not generate connections.json for {project_name} with type {db_type}")
+        return None
+
+    return dag_json_path, connections_json, target
+
+
+def build_opt_cmd(
+    dee_cli_path,
+    dag_json_path,
+    opt_dag_json_path,
+    connections_json,
+    target,
+    omp_top=None,
+    omp_node_centrality=None,
+    omp_exhaust=False,
+    omp_use_pushdown=False,
+    enable=None,
+    disable=None,
+    hmp_no_plan_dups=False,
+):
+    opt_cmd = [
+        dee_cli_path,
+        "opt",
+        "--stats",
+        "--connections",
+        connections_json,
+        "--target",
+        target,
+        "-o",
+        str(opt_dag_json_path),
+        str(dag_json_path),
+    ]
+    if omp_top:
+        opt_cmd.extend(["--omp-top", str(omp_top)])
+    if omp_node_centrality:
+        opt_cmd.extend(["--omp-node-centrality", omp_node_centrality])
+    if omp_exhaust:
+        opt_cmd.append("--omp-exhaust")
+    if omp_use_pushdown:
+        opt_cmd.append("--omp-use-pushdown")
+    if enable:
+        opt_cmd.extend(["--enable", enable])
+    if disable:
+        opt_cmd.extend(["--disable", disable])
+    if hmp_no_plan_dups:
+        opt_cmd.append("--hmp-no-plan-dups")
+    return opt_cmd
+
+
 def benchmark(
     config_file,
     dag_bench_root,
@@ -134,75 +225,30 @@ def benchmark(
     tmp_bench_dir.mkdir(parents=True)
 
     for project_name in projects_to_run:
-        print(f"\n--- Benchmarking Project: {project_name} ---")
-        src_project_path = Path(dag_bench_root) / "projects" / project_name
-        dest_project_path = tmp_bench_dir / project_name
-
-        if not src_project_path.exists():
-            print(f"Error: Project {project_name} not found at {src_project_path}")
-            continue
-
-        shutil.copytree(src_project_path, dest_project_path)
-
-        # 1. dbt compile
-        dbt_target = "dev" if db_type == "duckdb" else "postgres"
-        run_cmd(["dbt", "compile", "--target", dbt_target], cwd=dest_project_path)
-
-        manifest_path = dest_project_path / "target" / "manifest.json"
-
-        dag_json_path = dest_project_path / "dag.json"
-        opt_dag_json_path = dest_project_path / "dag_opt.json"
-
-        # 2. convert
-        run_cmd(
-            [
-                dee_cli_path,
-                "convert",
-                "--format",
-                "dbt",
-                "-o",
-                str(dag_json_path),
-                str(manifest_path),
-            ]
+        prepared = prepare_project(
+            project_name, dag_bench_root, tmp_bench_dir, dee_cli_path, db_type, max_mem=max_mem, threads=threads
         )
-
-        connections_json, target = generate_connections_json(
-            src_project_path, dest_project_path, db_type, max_mem=max_mem, threads=threads
-        )
-        if not connections_json:
-            print(
-                f"Warning: Could not generate connections.json for {project_name} with type {db_type}"
-            )
+        if prepared is None:
             continue
+        dag_json_path, connections_json, target = prepared
+        opt_dag_json_path = dag_json_path.parent / "dag_opt.json"
 
         # 3. optimize
         print(f"Optimizing DAG for {project_name}...")
-        opt_cmd = [
+        opt_cmd = build_opt_cmd(
             dee_cli_path,
-            "opt",
-            "--stats",
-            "--connections",
+            dag_json_path,
+            opt_dag_json_path,
             connections_json,
-            "--target",
             target,
-            "-o",
-            str(opt_dag_json_path),
-            str(dag_json_path),
-        ]
-        if omp_top:
-            opt_cmd.extend(["--omp-top", str(omp_top)])
-        if omp_node_centrality:
-            opt_cmd.extend(["--omp-node-centrality", omp_node_centrality])
-        if omp_exhaust:
-            opt_cmd.append("--omp-exhaust")
-        if omp_use_pushdown:
-            opt_cmd.append("--omp-use-pushdown")
-        if enable:
-            opt_cmd.extend(["--enable", enable])
-        if disable:
-            opt_cmd.extend(["--disable", disable])
-        if hmp_no_plan_dups:
-            opt_cmd.append("--hmp-no-plan-dups")
+            omp_top=omp_top,
+            omp_node_centrality=omp_node_centrality,
+            omp_exhaust=omp_exhaust,
+            omp_use_pushdown=omp_use_pushdown,
+            enable=enable,
+            disable=disable,
+            hmp_no_plan_dups=hmp_no_plan_dups,
+        )
 
         opt_stats_json = run_cmd(opt_cmd)
         opt_stats = json.loads(opt_stats_json)
@@ -266,6 +312,64 @@ def benchmark(
             result["optimized_distribution"] = optimized_times
 
         results.append(result)
+
+    return results
+
+
+def benchmark_num_factored(
+    config_file,
+    dag_bench_root,
+    dee_cli_path,
+    db_type,
+    max_mem=None,
+    threads=None,
+    enable=None,
+):
+    """Runs only `dee-cli opt` (never `run`) for each benchmark project and
+    records how many queries had a common subexpression factored out by the
+    CSPE pass, per `CSPEPass`'s `queries_with_factored_subexpressions` stat.
+    """
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+
+    projects_to_run = config.get("projects", [])
+    results = []
+
+    tmp_bench_dir = Path("tmp_projects")
+    if tmp_bench_dir.exists():
+        shutil.rmtree(tmp_bench_dir)
+    tmp_bench_dir.mkdir(parents=True)
+
+    # CSPE is off by default, so make sure it's part of whatever passes the
+    # caller wants enabled.
+    enabled_passes = enable if enable else "cspe"
+    if "cspe" not in enabled_passes.split(","):
+        enabled_passes = f"{enabled_passes},cspe"
+
+    for project_name in projects_to_run:
+        prepared = prepare_project(
+            project_name, dag_bench_root, tmp_bench_dir, dee_cli_path, db_type, max_mem=max_mem, threads=threads
+        )
+        if prepared is None:
+            continue
+        dag_json_path, connections_json, target = prepared
+        opt_dag_json_path = dag_json_path.parent / "dag_opt.json"
+
+        print(f"Optimizing DAG for {project_name}...")
+        opt_cmd = build_opt_cmd(
+            dee_cli_path,
+            dag_json_path,
+            opt_dag_json_path,
+            connections_json,
+            target,
+            enable=enabled_passes,
+        )
+        opt_stats = json.loads(run_cmd(opt_cmd))
+
+        cspe_stats = opt_stats.get("CSPEPass", {})
+        num_factored = int(cspe_stats.get("queries_with_factored_subexpressions", 0))
+
+        results.append({"project": project_name, "queries_with_factored_subexpressions": num_factored})
 
     return results
 
@@ -361,6 +465,15 @@ def main():
         action="store_true",
         help="Disable duplicate operator counting within a single plan in HMPPass",
     )
+    parser.add_argument(
+        "--num-factored",
+        action="store_true",
+        help=(
+            "Instead of the full benchmark, only run `dee-cli opt` (never `run`) for each "
+            "project and plot how many queries had a common subexpression factored out by "
+            "the CSPE pass"
+        ),
+    )
     args = parser.parse_args()
 
     if args.max_mem and args.db_type != "duckdb":
@@ -383,6 +496,30 @@ def main():
             f"Error: dee-cli not found at {dee_cli}. Please build the project or set DEE_PATH."
         )
         exit(1)
+
+    if args.num_factored:
+        results = benchmark_num_factored(
+            args.config,
+            dag_bench,
+            dee_cli,
+            args.db_type,
+            max_mem=args.max_mem,
+            threads=args.threads,
+            enable=args.enable,
+        )
+
+        if results:
+            df = pd.DataFrame(results)
+            print("\nQueries with Factored Subexpressions:")
+            print(df.to_string())
+
+        plot_num_factored(results, "num_factored.png")
+
+        results_path = Path("num_factored_results.json")
+        with open(results_path, "w") as f:
+            json.dump(results, f, indent=4)
+        print(f"Results saved to {results_path.absolute()}")
+        return
 
     results = benchmark(
         args.config,

@@ -7,6 +7,7 @@ use datafusion::{
     },
     datasource::{TableProvider, empty::EmptyTable, provider_as_source},
     logical_expr::{LogicalPlan, TableScanBuilder},
+    prelude::{DataFrame, SessionContext},
     sql::unparser::Unparser,
 };
 use explain_to_plan::{DuckDBTranslateConfig, ExplainToPlan, raise_to_logical};
@@ -23,7 +24,7 @@ use crate::{
     executor::{Executor, ProfilingConfig, SimpleEngine},
     opt::{
         OptimizerError, OptimizerPass,
-        common::{dialect_for_db, schema_prefix},
+        common::{create_logical_plan_with_stubs, dialect_for_db, register_table_any, schema_prefix},
         pushdown::graph_minor,
     },
 };
@@ -172,6 +173,54 @@ fn find_maximal_common_subplans(node_entries: &HashMap<String, Vec<PlanEntry>>) 
 }
 
 // ---------------------------------------------------------------------------
+// Building plans via DataFusion's own optimizer (--cspe-use-df-optimizer)
+// ---------------------------------------------------------------------------
+
+/// Plan and optimize every node of `minor` (a view-free DAG — see
+/// [`graph_minor`]) using DataFusion's own logical optimizer, registering
+/// each node as a schema-only table in the shared [`SessionContext`] as we go
+/// so downstream nodes' plans terminate at a `TableScan` referencing it
+/// rather than being expanded further. Keeping DAG node boundaries intact is
+/// what lets us later recognize a shared subtree as ending at (or containing)
+/// a scan of a real node.
+///
+/// This is the `--cspe-use-df-optimizer` alternative to
+/// [`build_analyzed_plans`]: it never touches the live database, but the
+/// resulting plan shape reflects DataFusion's generic optimizer heuristics
+/// rather than the connected database's own real filter/join ordering and
+/// pushdown decisions.
+async fn build_optimized_plans_via_datafusion(minor: &Dag) -> Result<HashMap<String, LogicalPlan>, OptimizerError> {
+    let ctx = SessionContext::new();
+
+    for src in &minor.sources {
+        register_table_any(&ctx, &src.name, Arc::new(EmptyTable::new(Arc::clone(&src.schema))))?;
+    }
+
+    let mut plans = HashMap::new();
+    for node_id in minor.nodes.topological_sort() {
+        let node = match minor.nodes.get(node_id.clone()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let raw_plan = create_logical_plan_with_stubs(&ctx, &node.query_text)
+            .await
+            .map_err(|e| OptimizerError::Exec(format!("CSPE: failed to plan node '{node_id}': {e}")))?;
+
+        let opt_plan = DataFrame::new(ctx.state(), raw_plan)
+            .into_optimized_plan()
+            .map_err(|e| OptimizerError::Exec(format!("CSPE: failed to optimize node '{node_id}': {e}")))?;
+
+        let schema = Arc::new(opt_plan.schema().as_arrow().clone());
+        register_table_any(&ctx, &node_id, Arc::new(EmptyTable::new(schema)))?;
+
+        plans.insert(node_id, opt_plan);
+    }
+
+    Ok(plans)
+}
+
+// ---------------------------------------------------------------------------
 // Analyzing real plans, one per Table/TempTable node of the graph minor
 // ---------------------------------------------------------------------------
 
@@ -308,7 +357,11 @@ fn collect_dep_ids(plan: &LogicalPlan, minor: &Dag, deps: &mut HashSet<String>) 
 /// 2. Materialize every node for real and capture its `EXPLAIN ANALYZE` plan,
 ///    raising it to a [`LogicalPlan`] (see [`build_analyzed_plans`]) — this
 ///    defers to the connected database's own optimizer rather than
-///    DataFusion's, so matching reflects how the query actually runs.
+///    DataFusion's, so matching reflects how the query actually runs. Passing
+///    `--cspe-use-df-optimizer` switches this step to
+///    [`build_optimized_plans_via_datafusion`] instead, which never touches
+///    the live database but orders/optimizes plans with DataFusion's own
+///    generic optimizer.
 /// 3. Flatten each plan into a parent-linked subtree index and group every
 ///    subtree across all nodes by structural equality. A subtree shared by
 ///    two or more nodes is a candidate; it is *maximal* if its immediate
@@ -325,6 +378,11 @@ where
     E: Executor<C> + Send + Sync,
 {
     conn: Arc<C>,
+    /// When set, plans are built via DataFusion's own optimizer
+    /// ([`build_optimized_plans_via_datafusion`]) instead of by materializing
+    /// each node for real and analyzing its `EXPLAIN ANALYZE` plan
+    /// ([`build_analyzed_plans`]). Corresponds to `--cspe-use-df-optimizer`.
+    use_df_optimizer: bool,
     _phantom: PhantomData<E>,
 }
 
@@ -333,9 +391,10 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    pub fn new(conn: Arc<C>, _engine: Arc<E>) -> Self {
+    pub fn new(conn: Arc<C>, _engine: Arc<E>, use_df_optimizer: bool) -> Self {
         Self {
             conn,
+            use_df_optimizer,
             _phantom: PhantomData,
         }
     }
@@ -355,8 +414,13 @@ where
         let mut minor = graph_minor(dag).await?;
         debug!("CSPEPass: graph minor has {} nodes", minor.nodes.num_nodes());
 
-        debug!("CSPEPass: materializing graph minor and analyzing real EXPLAIN ANALYZE plans");
-        let plans = build_analyzed_plans(&self.conn, &minor).await?;
+        let plans = if self.use_df_optimizer {
+            debug!("CSPEPass: building plans via the DataFusion optimizer (--cspe-use-df-optimizer)");
+            build_optimized_plans_via_datafusion(&minor).await?
+        } else {
+            debug!("CSPEPass: materializing graph minor and analyzing real EXPLAIN ANALYZE plans");
+            build_analyzed_plans(&self.conn, &minor).await?
+        };
 
         let mut node_entries: HashMap<String, Vec<PlanEntry>> = HashMap::new();
         for (node_id, plan) in &plans {
@@ -489,9 +553,12 @@ where
         }
 
         stats.insert("factored_nodes".into(), factored.to_string());
-        stats.insert("nodes_rewritten".into(), rewritten_nodes.len().to_string());
+        stats.insert(
+            "queries_with_factored_subexpressions".into(),
+            rewritten_nodes.len().to_string(),
+        );
         debug!(
-            "CSPEPass: complete — {factored} factored node(s), {} node(s) rewritten",
+            "CSPEPass: complete — {factored} factored node(s), {} query(ies) rewritten",
             rewritten_nodes.len()
         );
         Ok(stats)
@@ -545,8 +612,15 @@ mod tests {
     }
 
     fn pass(conn: Arc<DuckDBConnection>) -> CSPEPass<DuckDBConnection, SimpleEngine<DuckDBConnection>> {
+        pass_with_df_optimizer(conn, false)
+    }
+
+    fn pass_with_df_optimizer(
+        conn: Arc<DuckDBConnection>,
+        use_df_optimizer: bool,
+    ) -> CSPEPass<DuckDBConnection, SimpleEngine<DuckDBConnection>> {
         let engine = SimpleEngine::new(conn.clone()).expect("failed to create engine");
-        CSPEPass::new(conn, Arc::new(engine))
+        CSPEPass::new(conn, Arc::new(engine), use_df_optimizer)
     }
 
     fn raw_schema(conn: &Arc<DuckDBConnection>) -> SchemaRef {
@@ -617,6 +691,11 @@ mod tests {
 
         let stats = pass(conn).run(&mut dag).await.expect("pass should succeed");
         assert_eq!(stats.get("factored_nodes").map(String::as_str), Some("1"));
+        assert_eq!(
+            stats.get("queries_with_factored_subexpressions").map(String::as_str),
+            Some("2"),
+            "both table_a and table_b had a subexpression factored out"
+        );
 
         let a = dag.nodes.get("table_a".to_string()).unwrap();
         let b = dag.nodes.get("table_b".to_string()).unwrap();
@@ -673,6 +752,55 @@ mod tests {
         );
     }
 
+    // Same DAG as `test_identical_sibling_queries_factored_into_shared_node`,
+    // but with `--cspe-use-df-optimizer` — plans come from DataFusion's own
+    // optimizer against schema-only stubs, never touching the live DuckDB
+    // connection, so `raw` is intentionally left unseeded.
+    #[tokio::test]
+    async fn test_use_df_optimizer_factors_identical_sibling_queries() {
+        let staging = node(
+            "staging",
+            "SELECT id, region, amount FROM raw",
+            MaterializeMode::TempTable,
+            &[],
+        );
+        let table_a = node(
+            "table_a",
+            "SELECT id, amount FROM staging WHERE region = 'US'",
+            MaterializeMode::Table,
+            &["staging"],
+        );
+        let table_b = node(
+            "table_b",
+            "SELECT id, amount FROM staging WHERE region = 'US'",
+            MaterializeMode::Table,
+            &["staging"],
+        );
+
+        let conn = real_conn().await;
+
+        let mut dag = make_dag(vec![staging, table_a, table_b]);
+        dag.sources = vec![SourceNode {
+            name: "raw".to_string(),
+            schema: raw_schema(&conn),
+        }];
+
+        let stats = pass_with_df_optimizer(conn, true)
+            .run(&mut dag)
+            .await
+            .expect("pass should succeed");
+        assert_eq!(stats.get("factored_nodes").map(String::as_str), Some("1"));
+        assert_eq!(
+            stats.get("queries_with_factored_subexpressions").map(String::as_str),
+            Some("2")
+        );
+
+        let a = dag.nodes.get("table_a".to_string()).unwrap();
+        let b = dag.nodes.get("table_b".to_string()).unwrap();
+        assert!(a.query_text.to_lowercase().contains("cspe_"));
+        assert!(b.query_text.to_lowercase().contains("cspe_"));
+    }
+
     // DAG layout:
     //
     //   staging (TempTable)   SELECT id, region, amount FROM raw
@@ -718,6 +846,11 @@ mod tests {
 
         let stats = pass(conn).run(&mut dag).await.expect("pass should succeed");
         assert_eq!(stats.get("factored_nodes").map(String::as_str), Some("1"));
+        assert_eq!(
+            stats.get("queries_with_factored_subexpressions").map(String::as_str),
+            Some("2"),
+            "both table_a and table_b had a subexpression factored out"
+        );
 
         let a = dag.nodes.get("table_a".to_string()).unwrap();
         let b = dag.nodes.get("table_b".to_string()).unwrap();
@@ -796,6 +929,10 @@ mod tests {
 
         let stats = pass(conn).run(&mut dag).await.expect("pass should succeed");
         assert_eq!(stats.get("factored_nodes").map(String::as_str), Some("0"));
+        assert_eq!(
+            stats.get("queries_with_factored_subexpressions").map(String::as_str),
+            Some("0")
+        );
 
         let factored: Vec<_> = dag.nodes.nodes().filter(|n| n.id.starts_with("cspe_")).collect();
         assert!(factored.is_empty(), "no node should be factored out");
