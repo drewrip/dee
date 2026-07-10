@@ -121,6 +121,7 @@ def benchmark(
     enable=None,
     disable=None,
     hmp_no_plan_dups=False,
+    hmp_max_runs=None,
 ):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
@@ -203,6 +204,8 @@ def benchmark(
             opt_cmd.extend(["--disable", disable])
         if hmp_no_plan_dups:
             opt_cmd.append("--hmp-no-plan-dups")
+        if hmp_max_runs:
+            opt_cmd.extend(["--hmp-max-runs", str(hmp_max_runs)])
 
         opt_stats_json = run_cmd(opt_cmd)
         opt_stats = json.loads(opt_stats_json)
@@ -361,6 +364,11 @@ def main():
         action="store_true",
         help="Disable duplicate operator counting within a single plan in HMPPass",
     )
+    parser.add_argument(
+        "--hmp-max-runs",
+        type=int,
+        help="Max number of DAG runs HMPPass uses to search for materialization candidates",
+    )
     args = parser.parse_args()
 
     if args.max_mem and args.db_type != "duckdb":
@@ -400,6 +408,7 @@ def main():
         enable=args.enable,
         disable=args.disable,
         hmp_no_plan_dups=args.hmp_no_plan_dups,
+        hmp_max_runs=args.hmp_max_runs,
     )
     visualize(results)
 
