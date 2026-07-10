@@ -78,6 +78,8 @@ pub struct OptCommand {
 
     #[arg(long, action)]
     hmp_no_plan_dups: bool,
+    #[arg(long, default_value_t = 1)]
+    hmp_max_runs: usize,
     #[arg(long, action)]
     omp_exhaust: bool,
     #[arg(long, action)]

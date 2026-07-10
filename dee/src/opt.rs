@@ -61,6 +61,8 @@ where
     omp_use_pushdown: bool,
     /// HMP no plan dups
     hmp_no_plan_dups: bool,
+    /// HMP max DAG runs to spend searching for materialization candidates
+    hmp_max_runs: usize,
     /// Pushdown pass
     run_pushdown_pass: bool,
     /// Result stats
@@ -88,6 +90,7 @@ where
             omp_early_termination: config.omp_early_termination,
             omp_use_pushdown: config.omp_use_pushdown,
             hmp_no_plan_dups: config.hmp_no_plan_dups,
+            hmp_max_runs: config.hmp_max_runs,
             run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
         }
@@ -109,7 +112,8 @@ where
         }
 
         if self.run_hmp_pass {
-            let mut pass: HMPPass<C, E> = HMPPass::new(self.conn.clone(), self.hmp_no_plan_dups);
+            let mut pass: HMPPass<C, E> =
+                HMPPass::new(self.conn.clone(), self.hmp_no_plan_dups, self.hmp_max_runs);
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
                 stats.insert("HMPPass".to_string(), Arc::new(res));
@@ -168,6 +172,7 @@ pub struct OptimizerConfig {
     pub omp_early_termination: bool,
     pub omp_use_pushdown: bool,
     pub hmp_no_plan_dups: bool,
+    pub hmp_max_runs: usize,
     pub run_pushdown_pass: bool,
 }
 
@@ -181,6 +186,7 @@ impl Default for OptimizerConfig {
             omp_early_termination: true,
             omp_use_pushdown: false,
             hmp_no_plan_dups: false,
+            hmp_max_runs: 1,
             run_pushdown_pass: false,
         }
     }
@@ -243,6 +249,11 @@ impl OptimizerConfig {
 
     pub fn with_hmp_no_plan_dups(mut self, no_dups: bool) -> Self {
         self.hmp_no_plan_dups = no_dups;
+        self
+    }
+
+    pub fn with_hmp_max_runs(mut self, max_runs: usize) -> Self {
+        self.hmp_max_runs = max_runs.max(1);
         self
     }
 
