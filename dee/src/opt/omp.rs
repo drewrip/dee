@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use itertools::{Itertools, repeat_n};
 use log::debug;
+use serde::Serialize;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 use crate::{
@@ -9,6 +10,18 @@ use crate::{
     executor::{Executor, ExecutorError},
     opt::{Dag, OptimizerError, OptimizerPass, common::make_temp, pushdown::PushdownPass},
 };
+
+/// Runtime of a single plan attempted by the pass, in the order it was run.
+/// Iteration 1 is always the baseline (the DAG's current materialization
+/// configuration). Skipped (duplicate-of-baseline) attempts don't run at all,
+/// so they're omitted from this series. Early-terminated attempts are
+/// included, but their `runtime_ms` is only a lower bound (the cancellation
+/// budget) since the trial was killed before finishing.
+#[derive(Serialize, Debug, Clone)]
+struct IterationStat {
+    iteration: usize,
+    runtime_ms: i64,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum OMPCentrality {
@@ -139,6 +152,11 @@ where
             .map(|id| dag.nodes.get(id.clone()).unwrap().materialize.clone())
             .collect();
 
+        let mut iterations: Vec<IterationStat> = vec![IterationStat {
+            iteration: 1,
+            runtime_ms: baseline_cost as i64,
+        }];
+
         let mut best_cost = baseline_cost;
         let mut best_dag = dag.clone();
 
@@ -214,6 +232,14 @@ where
                             format!("attempt_{}", i + 1),
                             format!("cancelled({})", budget_ms),
                         );
+                        // The trial was killed at budget_ms, so its true
+                        // runtime is unknown beyond "at least budget_ms".
+                        // Record that lower bound so it still shows up in
+                        // the iteration series instead of vanishing.
+                        iterations.push(IterationStat {
+                            iteration: iterations.len() + 1,
+                            runtime_ms: budget_ms as i64,
+                        });
                         last_run_dag = work_dag;
                         continue;
                     }
@@ -230,6 +256,10 @@ where
             };
 
             stats.insert(format!("attempt_{}", i + 1), current_cost.to_string());
+            iterations.push(IterationStat {
+                iteration: iterations.len() + 1,
+                runtime_ms: current_cost as i64,
+            });
 
             if current_cost < best_cost {
                 debug!(
@@ -269,6 +299,11 @@ where
             .map(|n| n.id.clone())
             .collect();
         stats.insert("best_plan".into(), format!("{:?}", best_plan));
+        stats.insert(
+            "iterations".into(),
+            serde_json::to_string(&iterations)
+                .map_err(|e| OptimizerError::Exec(format!("failed to serialize iterations: {e}")))?,
+        );
 
         *dag = best_dag;
         Ok(stats)

@@ -8,7 +8,7 @@ import argparse
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from .plot import plot_data, plot_deep_dive
+from .plot import plot_data, plot_deep_dive, plot_hmp_iterations, plot_omp_iterations
 
 
 def run_cmd(cmd, cwd=None, env=None, capture=True):
@@ -122,6 +122,7 @@ def benchmark(
     disable=None,
     hmp_no_plan_dups=False,
     hmp_max_runs=None,
+    hmp_top_cpu_time=None,
 ):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
@@ -206,6 +207,8 @@ def benchmark(
             opt_cmd.append("--hmp-no-plan-dups")
         if hmp_max_runs:
             opt_cmd.extend(["--hmp-max-runs", str(hmp_max_runs)])
+        if hmp_top_cpu_time is not None:
+            opt_cmd.extend(["--hmp-top-cpu-time", str(hmp_top_cpu_time)])
 
         opt_stats_json = run_cmd(opt_cmd)
         opt_stats = json.loads(opt_stats_json)
@@ -369,6 +372,11 @@ def main():
         type=int,
         help="Max number of DAG runs HMPPass uses to search for materialization candidates",
     )
+    parser.add_argument(
+        "--hmp-top-cpu-time",
+        type=float,
+        help="Fraction (0, 1.0] of total operator CPU time used to build HMPPass's working set",
+    )
     args = parser.parse_args()
 
     if args.max_mem and args.db_type != "duckdb":
@@ -409,6 +417,7 @@ def main():
         disable=args.disable,
         hmp_no_plan_dups=args.hmp_no_plan_dups,
         hmp_max_runs=args.hmp_max_runs,
+        hmp_top_cpu_time=args.hmp_top_cpu_time,
     )
     visualize(results)
 
@@ -420,6 +429,12 @@ def main():
 
     if args.deep_dive:
         plot_deep_dive(results, "deep-dive.png")
+
+    if any(r.get("opt_stats", {}).get("HMPPass") for r in results):
+        plot_hmp_iterations(results, "hmp_iterations.png")
+
+    if any(r.get("opt_stats", {}).get("OMPPass") for r in results):
+        plot_omp_iterations(results, "omp_iterations.png")
 
 
 if __name__ == "__main__":
