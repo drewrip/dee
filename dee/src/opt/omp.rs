@@ -118,19 +118,22 @@ where
             .map(|r| r.duration.num_milliseconds() as f32)
             .map_err(|e| OptimizerError::Exec(format!("baseline run failed: {e}")))?;
 
-        // Rank nodes by the chosen centrality metric. Only nodes with more than
-        // one downstream consumer benefit from materialization (out-degree > 1).
+        // Only nodes with more than one downstream consumer benefit from
+        // materialization (out-degree > 1). Rank the survivors by the chosen
+        // centrality metric; in Paths mode, out-degree is still the filter —
+        // paths-to-sinks is only used to break ties among qualifying nodes.
         let mut candidates: Vec<(String, usize)> = dag
             .nodes
             .nodes()
-            .map(|n| {
+            .map(|n| (n.id.clone(), dag.nodes.out_degree(&n.id)))
+            .filter(|(_, out_degree)| *out_degree > 1)
+            .map(|(id, out_degree)| {
                 let rank = match self.centrality {
-                    OMPCentrality::OutDegree => dag.nodes.out_degree(&n.id),
-                    OMPCentrality::Paths => dag.nodes.paths_to_sinks(&n.id),
+                    OMPCentrality::OutDegree => out_degree,
+                    OMPCentrality::Paths => dag.nodes.paths_to_sinks(&id),
                 };
-                (n.id.clone(), rank)
+                (id, rank)
             })
-            .filter(|(_, d)| *d > 1)
             .collect();
 
         candidates.sort_by_key(|(_, rank)| *rank);
