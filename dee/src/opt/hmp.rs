@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use log::debug;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     marker::PhantomData,
@@ -26,6 +26,9 @@ where
     /// candidates. Each attempted materialization (successful or not) costs
     /// one run, in addition to the initial baseline run.
     max_runs: usize,
+    /// Fraction (0, 1.0] of total operator CPU time used to build the
+    /// `working_set` of candidate operators to materialize.
+    top_cpu_time: f64,
     _phantom: PhantomData<E>,
 }
 
@@ -46,6 +49,14 @@ struct DuckDBPlan {
 struct OpKey {
     name: String,
     cardinality: String,
+}
+
+/// Runtime of a single iteration attempted by the pass, in the order it was
+/// run. Iteration 1 is always the baseline (no materializations applied).
+#[derive(Serialize, Debug, Clone)]
+struct IterationStat {
+    iteration: usize,
+    runtime_ms: i64,
 }
 
 impl DuckDBPlan {
@@ -112,11 +123,16 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    pub fn new(conn: Arc<C>, no_plan_dups: bool, max_runs: usize) -> Self {
+    pub fn new(conn: Arc<C>, no_plan_dups: bool, max_runs: usize, top_cpu_time: f64) -> Self {
         Self {
             conn,
             no_plan_dups,
             max_runs: max_runs.max(1),
+            top_cpu_time: if top_cpu_time > 0.0 && top_cpu_time <= 1.0 {
+                top_cpu_time
+            } else {
+                0.5
+            },
             _phantom: PhantomData,
         }
     }
@@ -260,6 +276,53 @@ where
     }
 }
 
+/// Canonical string signature of a DAG's structure. Used to detect when two
+/// different materialization combinations produce an equivalent DAG (e.g.
+/// after `make_temp`'s landing-pad insertion / view inlining), so we can
+/// avoid re-running a trial we've effectively already tried.
+fn dag_signature(dag: &Dag) -> String {
+    let mut node_sigs: Vec<String> = dag
+        .nodes
+        .nodes()
+        .map(|n| {
+            let mut deps: Vec<&str> = n.depends_on.iter().map(String::as_str).collect();
+            deps.sort_unstable();
+            format!(
+                "{}::{}::{}::[{}]",
+                n.id,
+                n.materialize.as_str(),
+                n.query_text,
+                deps.join(",")
+            )
+        })
+        .collect();
+    node_sigs.sort_unstable();
+    node_sigs.join("|")
+}
+
+/// All k-sized combinations of `items`, preserving relative order.
+fn combinations(items: &[String], k: usize) -> Vec<Vec<String>> {
+    fn helper(items: &[String], start: usize, k: usize, combo: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+        if combo.len() == k {
+            out.push(combo.clone());
+            return;
+        }
+        for i in start..items.len() {
+            combo.push(items[i].clone());
+            helper(items, i + 1, k, combo, out);
+            combo.pop();
+        }
+    }
+
+    let mut out = Vec::new();
+    if k == 0 || k > items.len() {
+        return out;
+    }
+    let mut combo = Vec::with_capacity(k);
+    helper(items, 0, k, &mut combo, &mut out);
+    out
+}
+
 #[async_trait]
 impl<C, E> OptimizerPass<C, E> for HMPPass<C, E>
 where
@@ -268,8 +331,8 @@ where
 {
     async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError> {
         debug!(
-            "Running HMPPass (Heuristic Materialization Pass), max_runs={}",
-            self.max_runs
+            "Running HMPPass (Heuristic Materialization Pass), max_runs={}, top_cpu_time={}",
+            self.max_runs, self.top_cpu_time
         );
         let mut stats = HashMap::new();
 
@@ -283,7 +346,7 @@ where
             });
 
         let _ = engine.cleanup(dag).await.unwrap();
-        let mut exec_stats = engine
+        let exec_stats = engine
             .run(dag)
             .await
             .map_err(|e| OptimizerError::Exec(format!("baseline run failed: {}", e)))?;
@@ -293,108 +356,149 @@ where
         debug!("Baseline run completed in {}ms", best_ms);
         stats.insert("baseline_runtime_ms".into(), best_ms.to_string());
 
-        // 2. Iteratively materialize views: rank operators, try the top
-        // candidates in order, lock in the first one that improves runtime,
-        // then re-rank against the new DAG. Stop once the run budget is
-        // exhausted or a full ranking pass finds nothing that helps.
-        let mut materialized_views: Vec<String> = Vec::new();
-        let mut rejected_views: HashSet<String> = HashSet::new();
-        let mut lp_counter = 0usize;
+        let mut iterations: Vec<IterationStat> = vec![IterationStat {
+            iteration: 1,
+            runtime_ms: best_ms,
+        }];
 
-        while runs_used < self.max_runs {
-            debug!(
-                "Searching for common expensive operators (run {}/{})",
-                runs_used + 1,
-                self.max_runs
-            );
-            let ranked_ops = self.rank_operators(dag, &exec_stats);
+        // 2. Build the working_set: walk the operator ranking, accumulating
+        // CPU time until it covers `top_cpu_time` of the total.
+        let ranked_ops = self.rank_operators(dag, &exec_stats);
+        let total_timing: f64 = ranked_ops.iter().map(|(_, t, _)| t).sum();
 
-            let mut locked_in = false;
-            for (op_key, timing, pdt) in ranked_ops {
-                if runs_used >= self.max_runs {
+        let mut working_set_ops: Vec<OpKey> = Vec::new();
+        if total_timing > 0.0 {
+            let mut cumulative = 0.0;
+            for (op_key, timing, _) in &ranked_ops {
+                working_set_ops.push(op_key.clone());
+                cumulative += timing;
+                if cumulative / total_timing >= self.top_cpu_time {
                     break;
                 }
+            }
+        }
+        debug!(
+            "Working set contains {} operator(s) (top_cpu_time={})",
+            working_set_ops.len(),
+            self.top_cpu_time
+        );
 
-                debug!(
-                    "Evaluating operator {:?} (PDT={:.4}s, timing={:.4}s)",
-                    op_key, pdt, timing
-                );
+        // Map each working_set operator back to the node that should be
+        // materialized for it, deduplicating candidates found via more than
+        // one operator.
+        let mut candidate_nodes: Vec<String> = Vec::new();
+        for op_key in &working_set_ops {
+            if let Some(candidate) = Self::find_materialization_candidate(dag, op_key, &exec_stats)
+                && !candidate_nodes.contains(&candidate)
+            {
+                candidate_nodes.push(candidate);
+            }
+        }
+        debug!(
+            "Working set maps to {} distinct candidate node(s): {:?}",
+            candidate_nodes.len(),
+            candidate_nodes
+        );
 
-                let candidate = match Self::find_materialization_candidate(dag, &op_key, &exec_stats)
-                {
-                    Some(c) => c,
-                    None => continue,
-                };
+        // 3. Search combinations of candidate nodes, starting with singles,
+        // then pairs, then triples, etc. Every attempt (successful or not)
+        // costs one run out of `max_runs`, so larger combination sizes are
+        // only reached once every smaller size has been fully explored
+        // within budget.
+        let baseline_dag = dag.clone();
+        let mut best_combo: Vec<String> = Vec::new();
+        let mut tried_dag_sigs: HashSet<String> = HashSet::new();
 
-                if materialized_views.contains(&candidate) || rejected_views.contains(&candidate) {
+        'sizes: for k in 1..=candidate_nodes.len() {
+            if runs_used >= self.max_runs {
+                break;
+            }
+            let combos = combinations(&candidate_nodes, k);
+            debug!("Trying {} combination(s) of size {}", combos.len(), k);
+
+            for combo in combos {
+                if runs_used >= self.max_runs {
+                    break 'sizes;
+                }
+
+                let mut trial_dag = baseline_dag.clone();
+                let mut trial_counter = 0usize;
+                for node_id in &combo {
+                    make_temp(&mut trial_dag, node_id, &mut trial_counter)?;
+                }
+
+                if !tried_dag_sigs.insert(dag_signature(&trial_dag)) {
                     debug!(
-                        "Node '{}' already evaluated this run, skipping",
-                        candidate
+                        "Combo {:?} produces a DAG equivalent to one already tried, skipping",
+                        combo
                     );
                     continue;
                 }
 
-                let snapshot = dag.clone();
-                make_temp(dag, &candidate, &mut lp_counter)?;
-
                 debug!(
-                    "Trying materialization of '{}', re-running DAG to measure impact",
-                    candidate
+                    "Trying materialization combo {:?}, re-running DAG to measure impact",
+                    combo
                 );
-                let _ = engine.cleanup(dag).await.unwrap();
-                let candidate_stats = engine
-                    .run(dag)
+                let _ = engine.cleanup(&trial_dag).await.unwrap();
+                let trial_stats = engine
+                    .run(&trial_dag)
                     .await
                     .map_err(|e| OptimizerError::Exec(format!("candidate run failed: {}", e)))?;
                 runs_used += 1;
 
-                let candidate_ms = candidate_stats.duration.num_milliseconds();
-                if candidate_ms < best_ms {
+                let trial_ms = trial_stats.duration.num_milliseconds();
+                iterations.push(IterationStat {
+                    iteration: iterations.len() + 1,
+                    runtime_ms: trial_ms,
+                });
+                if trial_ms < best_ms {
                     debug!(
-                        "Materializing '{}' improved runtime: {}ms -> {}ms",
-                        candidate, best_ms, candidate_ms
+                        "Combo {:?} improved runtime: {}ms -> {}ms",
+                        combo, best_ms, trial_ms
                     );
-                    best_ms = candidate_ms;
-                    exec_stats = candidate_stats;
-                    materialized_views.push(candidate);
-                    locked_in = true;
-                    break;
+                    best_ms = trial_ms;
+                    best_combo = combo;
                 } else {
                     debug!(
-                        "Materializing '{}' did not improve runtime ({}ms -> {}ms), reverting",
-                        candidate, best_ms, candidate_ms
+                        "Combo {:?} did not improve runtime ({}ms -> {}ms)",
+                        combo, best_ms, trial_ms
                     );
-                    *dag = snapshot;
-                    rejected_views.insert(candidate);
                 }
             }
+        }
 
-            if !locked_in {
-                debug!("No candidate improved runtime this round, stopping search");
-                break;
-            }
+        // 4. Apply whichever combination (if any) produced the best runtime.
+        let mut lp_counter = 0usize;
+        for node_id in &best_combo {
+            make_temp(dag, node_id, &mut lp_counter)?;
         }
 
         debug!(
             "Heuristic complete: materialized {} view(s) using {}/{} runs",
-            materialized_views.len(),
+            best_combo.len(),
             runs_used,
             self.max_runs
         );
         stats.insert(
             "new_materializations".into(),
-            if materialized_views.is_empty() {
+            if best_combo.is_empty() {
                 "none".into()
             } else {
-                materialized_views.join(",")
+                best_combo.join(",")
             },
         );
         stats.insert(
             "materialization_count".into(),
-            materialized_views.len().to_string(),
+            best_combo.len().to_string(),
         );
+        stats.insert("working_set_size".into(), working_set_ops.len().to_string());
         stats.insert("runs_used".into(), runs_used.to_string());
         stats.insert("final_runtime_ms".into(), best_ms.to_string());
+        stats.insert(
+            "iterations".into(),
+            serde_json::to_string(&iterations)
+                .map_err(|e| OptimizerError::Exec(format!("failed to serialize iterations: {e}")))?,
+        );
 
         Ok(stats)
     }

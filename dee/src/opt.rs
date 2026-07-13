@@ -63,6 +63,8 @@ where
     hmp_no_plan_dups: bool,
     /// HMP max DAG runs to spend searching for materialization candidates
     hmp_max_runs: usize,
+    /// HMP fraction of total operator CPU time used to build the working set
+    hmp_top_cpu_time: f64,
     /// Pushdown pass
     run_pushdown_pass: bool,
     /// Result stats
@@ -91,6 +93,7 @@ where
             omp_use_pushdown: config.omp_use_pushdown,
             hmp_no_plan_dups: config.hmp_no_plan_dups,
             hmp_max_runs: config.hmp_max_runs,
+            hmp_top_cpu_time: config.hmp_top_cpu_time,
             run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
         }
@@ -112,8 +115,12 @@ where
         }
 
         if self.run_hmp_pass {
-            let mut pass: HMPPass<C, E> =
-                HMPPass::new(self.conn.clone(), self.hmp_no_plan_dups, self.hmp_max_runs);
+            let mut pass: HMPPass<C, E> = HMPPass::new(
+                self.conn.clone(),
+                self.hmp_no_plan_dups,
+                self.hmp_max_runs,
+                self.hmp_top_cpu_time,
+            );
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
                 stats.insert("HMPPass".to_string(), Arc::new(res));
@@ -173,6 +180,7 @@ pub struct OptimizerConfig {
     pub omp_use_pushdown: bool,
     pub hmp_no_plan_dups: bool,
     pub hmp_max_runs: usize,
+    pub hmp_top_cpu_time: f64,
     pub run_pushdown_pass: bool,
 }
 
@@ -187,6 +195,7 @@ impl Default for OptimizerConfig {
             omp_use_pushdown: false,
             hmp_no_plan_dups: false,
             hmp_max_runs: 1,
+            hmp_top_cpu_time: 0.5,
             run_pushdown_pass: false,
         }
     }
@@ -254,6 +263,19 @@ impl OptimizerConfig {
 
     pub fn with_hmp_max_runs(mut self, max_runs: usize) -> Self {
         self.hmp_max_runs = max_runs.max(1);
+        self
+    }
+
+    pub fn with_hmp_top_cpu_time(mut self, top_cpu_time: f64) -> Self {
+        self.hmp_top_cpu_time = if top_cpu_time > 0.0 && top_cpu_time <= 1.0 {
+            top_cpu_time
+        } else {
+            warn!(
+                "hmp_top_cpu_time must be in (0, 1.0], got {}, falling back to 0.5",
+                top_cpu_time
+            );
+            0.5
+        };
         self
     }
 

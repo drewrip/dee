@@ -154,6 +154,91 @@ def plot_deep_dive(results, output_path):
     print(f"\nDeep dive visualization saved to {output_path}")
 
 
+def _plot_pass_iterations(results, output_path, pass_name):
+    if not results:
+        print("No results to plot.")
+        return
+
+    pass_results = []
+    for r in results:
+        pass_stats = r.get("opt_stats", {}).get(pass_name)
+        if not pass_stats or "iterations" not in pass_stats:
+            continue
+        iterations = json.loads(pass_stats["iterations"])
+        if not iterations:
+            continue
+        pass_results.append((r.get("project", "Unknown"), iterations))
+
+    if not pass_results:
+        print(f"No {pass_name} iteration data found to plot.")
+        return
+
+    n = len(pass_results)
+    fig, axes = plt.subplots(n, 1, figsize=(10, 4.5 * n), squeeze=False)
+
+    for idx, (project_name, iterations) in enumerate(pass_results):
+        ax = axes[idx][0]
+        iters = [it["iteration"] for it in iterations]
+        runtimes_ms = [it["runtime_ms"] for it in iterations]
+        baseline = runtimes_ms[0]
+
+        # Distance of each iteration's runtime to the baseline (first run).
+        # Negative distances mean that iteration was faster than baseline.
+        distances = [rt - baseline for rt in runtimes_ms]
+        total_distance = sum(distances)
+        net_change_pct = (total_distance / baseline * 100) if baseline else 0.0
+
+        # Only iterations after the baseline are actual optimization attempts;
+        # the baseline's distance to itself (0) isn't a candidate "best improvement".
+        trial_distances = distances[1:]
+        if total_distance < 0:
+            payoff_label = "Done"
+        elif not trial_distances or min(trial_distances) >= 0:
+            payoff_label = "Never"
+        else:
+            best_improvement = min(trial_distances)
+            payoff_iters = total_distance / abs(best_improvement)
+            payoff_label = f"{payoff_iters:.1f}"
+
+        ax.plot(iters, runtimes_ms, marker="o", color="steelblue", linewidth=2, markersize=6)
+        ax.axhline(y=baseline, color="red", linestyle="--", alpha=0.6, label="Baseline (iteration 1)")
+
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Runtime (ms)")
+        ax.set_title(f"{project_name}: {pass_name} Runtime over Iterations")
+        ax.set_xticks(iters)
+        ax.grid(True, linestyle="--", alpha=0.5)
+        ax.legend(loc="upper right")
+
+        annotation = (
+            f"Total net change: {net_change_pct:+.1f}%\n"
+            f"Expected payoff iterations: {payoff_label}"
+        )
+        ax.text(
+            0.02,
+            0.02,
+            annotation,
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="steelblue"),
+        )
+
+    plt.tight_layout()
+    plt.savefig(output_path)
+    print(f"\n{pass_name} iteration visualization saved to {output_path}")
+
+
+def plot_hmp_iterations(results, output_path):
+    _plot_pass_iterations(results, output_path, "HMPPass")
+
+
+def plot_omp_iterations(results, output_path):
+    _plot_pass_iterations(results, output_path, "OMPPass")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize benchmark results.")
     parser.add_argument(
@@ -167,11 +252,21 @@ def main():
         help="Path to save the output plot (default: results_plot.png)"
     )
     parser.add_argument(
-        "--deep-dive", 
-        action="store_true", 
+        "--deep-dive",
+        action="store_true",
         help="Generate a deep-dive plot instead of the standard reduction plot"
     )
-    
+    parser.add_argument(
+        "--hmp-iterations",
+        action="store_true",
+        help="Generate the HMPPass runtime-over-iterations plot instead of the standard reduction plot",
+    )
+    parser.add_argument(
+        "--omp-iterations",
+        action="store_true",
+        help="Generate the OMPPass runtime-over-iterations plot instead of the standard reduction plot",
+    )
+
     args = parser.parse_args()
 
     if not Path(args.results).exists():
@@ -183,6 +278,10 @@ def main():
 
     if args.deep_dive:
         plot_deep_dive(results, args.output)
+    elif args.hmp_iterations:
+        plot_hmp_iterations(results, args.output)
+    elif args.omp_iterations:
+        plot_omp_iterations(results, args.output)
     else:
         plot_data(results, args.output)
 
