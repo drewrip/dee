@@ -123,6 +123,8 @@ def benchmark(
     hmp_no_plan_dups=False,
     hmp_max_runs=None,
     hmp_top_cpu_time=None,
+    hmp_show_operators=None,
+    hmp_show_nodes=None,
 ):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
@@ -209,6 +211,16 @@ def benchmark(
             opt_cmd.extend(["--hmp-max-runs", str(hmp_max_runs)])
         if hmp_top_cpu_time is not None:
             opt_cmd.extend(["--hmp-top-cpu-time", str(hmp_top_cpu_time)])
+        if hmp_show_operators is not None:
+            if hmp_show_operators:
+                opt_cmd.extend(["--hmp-show-operators", hmp_show_operators])
+            else:
+                opt_cmd.append("--hmp-show-operators")
+        if hmp_show_nodes is not None:
+            if hmp_show_nodes:
+                opt_cmd.extend(["--hmp-show-nodes", hmp_show_nodes])
+            else:
+                opt_cmd.append("--hmp-show-nodes")
 
         opt_stats_json = run_cmd(opt_cmd)
         opt_stats = json.loads(opt_stats_json)
@@ -377,6 +389,28 @@ def main():
         type=float,
         help="Fraction (0, 1.0] of total operator CPU time used to build HMPPass's working set",
     )
+    parser.add_argument(
+        "--hmp-show-operators",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Log a table of HMP operator rankings after the baseline run. "
+            "Optionally pass a path to also write the table there."
+        ),
+    )
+    parser.add_argument(
+        "--hmp-show-nodes",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Log a table of HMP node rankings after the baseline run. "
+            "Optionally pass a path to also write the table there."
+        ),
+    )
     args = parser.parse_args()
 
     if args.max_mem and args.db_type != "duckdb":
@@ -418,6 +452,8 @@ def main():
         hmp_no_plan_dups=args.hmp_no_plan_dups,
         hmp_max_runs=args.hmp_max_runs,
         hmp_top_cpu_time=args.hmp_top_cpu_time,
+        hmp_show_operators=args.hmp_show_operators,
+        hmp_show_nodes=args.hmp_show_nodes,
     )
     visualize(results)
 

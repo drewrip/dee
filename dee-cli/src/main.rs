@@ -82,6 +82,14 @@ pub struct OptCommand {
     hmp_max_runs: usize,
     #[arg(long, default_value_t = 0.5)]
     hmp_top_cpu_time: f64,
+    /// Log a table of HMP operator rankings after the baseline run. Pass a
+    /// path to also write the table there, e.g. `--hmp-show-operators=out.txt`.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    hmp_show_operators: Option<String>,
+    /// Log a table of HMP node rankings after the baseline run. Pass a path
+    /// to also write the table there, e.g. `--hmp-show-nodes=out.txt`.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    hmp_show_nodes: Option<String>,
     #[arg(long, action)]
     omp_exhaust: bool,
     #[arg(long, action)]
