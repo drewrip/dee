@@ -1,8 +1,9 @@
 use async_trait::async_trait;
-use log::debug;
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     marker::PhantomData,
     sync::Arc,
 };
@@ -29,6 +30,12 @@ where
     /// Fraction (0, 1.0] of total operator CPU time used to build the
     /// `working_set` of candidate operators to materialize.
     top_cpu_time: f64,
+    /// When set, log a table of operator rankings after the baseline run.
+    /// `Some("")` logs the table only; `Some(path)` also writes it to `path`.
+    show_operators: Option<String>,
+    /// When set, log a table of node (View) rankings after the baseline run.
+    /// `Some("")` logs the table only; `Some(path)` also writes it to `path`.
+    show_nodes: Option<String>,
     _phantom: PhantomData<E>,
 }
 
@@ -57,6 +64,25 @@ struct OpKey {
 struct IterationStat {
     iteration: usize,
     runtime_ms: i64,
+}
+
+/// One row of the `--hmp-show-operators` ranking table.
+#[derive(Serialize, Debug, Clone)]
+struct OperatorRankingRow {
+    rank: usize,
+    operator: String,
+    total_cpu_time_s: f64,
+    table_occurrences: usize,
+    traced_views: Vec<String>,
+}
+
+/// One row of the `--hmp-show-nodes` ranking table: a View (out-degree > 1)
+/// and the aggregate CPU time of every operator traced back to it.
+#[derive(Serialize, Debug, Clone)]
+struct NodeRankingRow {
+    rank: usize,
+    node: String,
+    total_cpu_time_s: f64,
 }
 
 impl DuckDBPlan {
@@ -123,11 +149,20 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    pub fn new(conn: Arc<C>, no_plan_dups: bool, max_runs: usize, top_cpu_time: f64) -> Self {
+    pub fn new(
+        conn: Arc<C>,
+        no_plan_dups: bool,
+        max_runs: usize,
+        top_cpu_time: f64,
+        show_operators: Option<String>,
+        show_nodes: Option<String>,
+    ) -> Self {
         Self {
             conn,
             no_plan_dups,
             max_runs: max_runs.max(1),
+            show_operators,
+            show_nodes,
             top_cpu_time: if top_cpu_time > 0.0 && top_cpu_time <= 1.0 {
                 top_cpu_time
             } else {
@@ -141,7 +176,7 @@ where
     /// materialized (Table) nodes by their potential duplication time,
     /// descending. Only operators seen more than once are returned, since
     /// those are the only ones a new materialization could deduplicate.
-    fn rank_operators(&self, dag: &Dag, exec_stats: &ExecStats) -> Vec<(OpKey, f64, f64)> {
+    fn rank_operators(&self, dag: &Dag, exec_stats: &ExecStats) -> Vec<(OpKey, f64, f64, usize)> {
         let mut timing_map: HashMap<OpKey, f64> = HashMap::new();
         let mut occurrence_map: HashMap<OpKey, usize> = HashMap::new();
 
@@ -184,7 +219,8 @@ where
             .map(|(sig, t)| {
                 let n = occurrence_map.get(&sig).cloned().unwrap_or(1) as f64;
                 let potential_duplication_time = if n > 0.0 { t - t / n } else { 0.0 };
-                (sig, t, potential_duplication_time)
+                let occurrences = occurrence_map.get(&sig).cloned().unwrap_or(0);
+                (sig, t, potential_duplication_time, occurrences)
             })
             .collect();
 
@@ -192,14 +228,14 @@ where
 
         if !ranked_ops.is_empty() {
             debug!("Top 5 bottlenecks by potential duplication time across all plans:");
-            for (i, (op, timing, pdt)) in ranked_ops.iter().take(5).enumerate() {
+            for (i, (op, timing, pdt, occurrences)) in ranked_ops.iter().take(5).enumerate() {
                 debug!(
                     "  {}. {:?} - PDT: {:.4}s (Total Timing: {:.4}s, Found {} times)",
                     i + 1,
                     op,
                     pdt,
                     timing,
-                    occurrence_map.get(op).unwrap_or(&0)
+                    occurrences
                 );
             }
         }
@@ -207,71 +243,205 @@ where
         ranked_ops
     }
 
-    /// Find the node that should be materialized for a given operator: the
-    /// nearest branch point (out-degree > 1) downstream of the View node
-    /// whose EXPLAIN plan contains the operator.
-    fn find_materialization_candidate(
+    /// Build the `--hmp-show-operators` ranking table: rank, operator key,
+    /// total CPU time, number of materialized Table plans the operator
+    /// appears in, and every View whose EXPLAIN plan contains the operator.
+    fn build_operator_table(
         dag: &Dag,
-        op_key: &OpKey,
         exec_stats: &ExecStats,
-    ) -> Option<String> {
-        let sorted_node_ids = dag.nodes.topological_sort();
+        ranked_ops: &[(OpKey, f64, f64, usize)],
+    ) -> Vec<OperatorRankingRow> {
+        ranked_ops
+            .iter()
+            .enumerate()
+            .map(|(i, (op_key, timing, _, occurrences))| OperatorRankingRow {
+                rank: i + 1,
+                operator: format!("{}(cardinality={})", op_key.name, op_key.cardinality),
+                total_cpu_time_s: *timing,
+                table_occurrences: *occurrences,
+                traced_views: Self::find_traced_views(dag, op_key, exec_stats),
+            })
+            .collect()
+    }
 
-        let mut candidate_node_id = None;
-        for node_id in &sorted_node_ids {
-            let node = dag.nodes.get(node_id.clone())?;
-            if matches!(node.materialize, MaterializeMode::View) {
-                if let Some(node_stat) = exec_stats.node_stats.get(node_id) {
-                    if let Some(plan_str) = &node_stat.plan {
-                        // Plain EXPLAIN JSON is usually an array
-                        if let Ok(plans) = serde_json::from_str::<Vec<DuckDBPlan>>(plan_str) {
-                            if plans.iter().any(|p| p.contains_operator(op_key)) {
-                                debug!(
-                                    "Operator found in view node '{}' (closest to source)",
-                                    node_id
-                                );
-                                candidate_node_id = Some(node_id.clone());
-                                break;
-                            }
-                        }
-                    }
+    /// Render the operator ranking table as aligned plain text.
+    fn format_operator_table(rows: &[OperatorRankingRow]) -> String {
+        let headers = [
+            "Rank",
+            "Operator",
+            "Total CPU Time (s)",
+            "Table Occurrences",
+            "Traced View(s)",
+        ];
+        let rows_str: Vec<[String; 5]> = rows
+            .iter()
+            .map(|r| {
+                [
+                    r.rank.to_string(),
+                    r.operator.clone(),
+                    format!("{:.4}", r.total_cpu_time_s),
+                    r.table_occurrences.to_string(),
+                    if r.traced_views.is_empty() {
+                        "-".to_string()
+                    } else {
+                        r.traced_views.join(", ")
+                    },
+                ]
+            })
+            .collect();
+
+        let mut widths: [usize; 5] = std::array::from_fn(|i| headers[i].len());
+        for row in &rows_str {
+            for (i, cell) in row.iter().enumerate() {
+                widths[i] = widths[i].max(cell.len());
+            }
+        }
+
+        let mut out = String::new();
+        for (i, h) in headers.iter().enumerate() {
+            out.push_str(&format!("{:<width$}  ", h, width = widths[i]));
+        }
+        out.push('\n');
+        for (i, _) in headers.iter().enumerate() {
+            out.push_str(&format!("{:-<width$}  ", "", width = widths[i]));
+        }
+        for row in &rows_str {
+            out.push('\n');
+            for (i, cell) in row.iter().enumerate() {
+                out.push_str(&format!("{:<width$}  ", cell, width = widths[i]));
+            }
+        }
+        out
+    }
+
+    /// Log the operator ranking table and, if `show_operators` carries a
+    /// non-empty path, write it there too.
+    fn log_operator_table(&self, dag: &Dag, exec_stats: &ExecStats, ranked_ops: &[(OpKey, f64, f64, usize)]) {
+        let Some(path) = &self.show_operators else {
+            return;
+        };
+
+        let rows = Self::build_operator_table(dag, exec_stats, ranked_ops);
+        let table = Self::format_operator_table(&rows);
+        info!("HMPPass operator rankings:\n{}", table);
+
+        if !path.is_empty()
+            && let Err(e) = fs::write(path, &table)
+        {
+            warn!("failed to write operator rankings to '{}': {}", path, e);
+        }
+    }
+
+    /// Find every View node whose EXPLAIN plan contains the given operator,
+    /// i.e. every View the operator can be traced back to (not just the one
+    /// `find_materialization_candidate` would pick to materialize).
+    fn find_traced_views(dag: &Dag, op_key: &OpKey, exec_stats: &ExecStats) -> Vec<String> {
+        let mut views = Vec::new();
+        for node in dag.nodes.nodes() {
+            if !matches!(node.materialize, MaterializeMode::View) {
+                continue;
+            }
+            let Some(node_stat) = exec_stats.node_stats.get(&node.id) else {
+                continue;
+            };
+            let Some(plan_str) = &node_stat.plan else {
+                continue;
+            };
+            if let Ok(plans) = serde_json::from_str::<Vec<DuckDBPlan>>(plan_str)
+                && plans.iter().any(|p| p.contains_operator(op_key))
+            {
+                views.push(node.id.clone());
+            }
+        }
+        views
+    }
+
+    /// Build the `--hmp-show-nodes` ranking table: for every View with
+    /// out-degree > 1 (a branch point, the only kind of View that
+    /// materializing can actually deduplicate work for), sum the CPU time of
+    /// every operator that traces back to it via `find_traced_views` (the
+    /// same mapping the `--hmp-show-operators` table uses). Sorted by total
+    /// CPU time, descending -- this is also the order `run()` searches down
+    /// when picking which node to try materializing.
+    fn build_node_table(
+        dag: &Dag,
+        exec_stats: &ExecStats,
+        ranked_ops: &[(OpKey, f64, f64, usize)],
+    ) -> Vec<NodeRankingRow> {
+        let mut aggregate_cpu_time: HashMap<String, f64> = HashMap::new();
+        for (op_key, timing, _, _) in ranked_ops {
+            for view in Self::find_traced_views(dag, op_key, exec_stats) {
+                if dag.nodes.out_degree(&view) > 1 {
+                    *aggregate_cpu_time.entry(view).or_insert(0.0) += timing;
                 }
             }
         }
 
-        // Follow the graph until a branch is found
-        let mut current_id = candidate_node_id?;
-        while dag.nodes.out_degree(&current_id) == 1 {
-            let next_node = dag
-                .nodes
-                .nodes()
-                .find(|n| n.depends_on.contains(&current_id))
-                .map(|n| n.id.clone());
+        let mut rows: Vec<(String, f64)> = aggregate_cpu_time.into_iter().collect();
+        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            if let Some(next_id) = next_node {
-                debug!(
-                    "Node '{}' has out-degree 1, moving downstream to '{}'",
-                    current_id, next_id
-                );
-                current_id = next_id;
-            } else {
-                break;
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, (node, total_cpu_time_s))| NodeRankingRow {
+                rank: i + 1,
+                node,
+                total_cpu_time_s,
+            })
+            .collect()
+    }
+
+    /// Render the node ranking table as aligned plain text.
+    fn format_node_table(rows: &[NodeRankingRow]) -> String {
+        let headers = ["Rank", "Node", "Total CPU Time (s)"];
+        let rows_str: Vec<[String; 3]> = rows
+            .iter()
+            .map(|r| {
+                [
+                    r.rank.to_string(),
+                    r.node.clone(),
+                    format!("{:.4}", r.total_cpu_time_s),
+                ]
+            })
+            .collect();
+
+        let mut widths: [usize; 3] = std::array::from_fn(|i| headers[i].len());
+        for row in &rows_str {
+            for (i, cell) in row.iter().enumerate() {
+                widths[i] = widths[i].max(cell.len());
             }
         }
 
-        let out_degree = dag.nodes.out_degree(&current_id);
-        if out_degree > 1 {
-            debug!(
-                "Found optimal branch point at node '{}' (out-degree={})",
-                current_id, out_degree
-            );
-            Some(current_id)
-        } else {
-            debug!(
-                "Stopped at node '{}' with out-degree {}, skipping candidate",
-                current_id, out_degree
-            );
-            None
+        let mut out = String::new();
+        for (i, h) in headers.iter().enumerate() {
+            out.push_str(&format!("{:<width$}  ", h, width = widths[i]));
+        }
+        out.push('\n');
+        for (i, _) in headers.iter().enumerate() {
+            out.push_str(&format!("{:-<width$}  ", "", width = widths[i]));
+        }
+        for row in &rows_str {
+            out.push('\n');
+            for (i, cell) in row.iter().enumerate() {
+                out.push_str(&format!("{:<width$}  ", cell, width = widths[i]));
+            }
+        }
+        out
+    }
+
+    /// Log the node ranking table and, if `show_nodes` carries a non-empty
+    /// path, write it there too.
+    fn log_node_table(&self, node_ranking: &[NodeRankingRow]) {
+        let Some(path) = &self.show_nodes else {
+            return;
+        };
+
+        let table = Self::format_node_table(node_ranking);
+        info!("HMPPass node rankings:\n{}", table);
+
+        if !path.is_empty()
+            && let Err(e) = fs::write(path, &table)
+        {
+            warn!("failed to write node rankings to '{}': {}", path, e);
         }
     }
 }
@@ -361,42 +531,33 @@ where
             runtime_ms: best_ms,
         }];
 
-        // 2. Build the working_set: walk the operator ranking, accumulating
-        // CPU time until it covers `top_cpu_time` of the total.
+        // 2. Build the operator ranking, then the node ranking derived from
+        // it: for every View with out-degree > 1, the aggregate CPU time of
+        // every operator traced back to it. Walk the node ranking,
+        // accumulating CPU time until it covers `top_cpu_time` of the total,
+        // to build the working set of candidate nodes to search.
         let ranked_ops = self.rank_operators(dag, &exec_stats);
-        let total_timing: f64 = ranked_ops.iter().map(|(_, t, _)| t).sum();
+        self.log_operator_table(dag, &exec_stats, &ranked_ops);
 
-        let mut working_set_ops: Vec<OpKey> = Vec::new();
-        if total_timing > 0.0 {
+        let node_ranking = Self::build_node_table(dag, &exec_stats, &ranked_ops);
+        self.log_node_table(&node_ranking);
+        let total_node_timing: f64 = node_ranking.iter().map(|r| r.total_cpu_time_s).sum();
+
+        let mut candidate_nodes: Vec<String> = Vec::new();
+        if total_node_timing > 0.0 {
             let mut cumulative = 0.0;
-            for (op_key, timing, _) in &ranked_ops {
-                working_set_ops.push(op_key.clone());
-                cumulative += timing;
-                if cumulative / total_timing >= self.top_cpu_time {
+            for row in &node_ranking {
+                candidate_nodes.push(row.node.clone());
+                cumulative += row.total_cpu_time_s;
+                if cumulative / total_node_timing >= self.top_cpu_time {
                     break;
                 }
             }
         }
         debug!(
-            "Working set contains {} operator(s) (top_cpu_time={})",
-            working_set_ops.len(),
-            self.top_cpu_time
-        );
-
-        // Map each working_set operator back to the node that should be
-        // materialized for it, deduplicating candidates found via more than
-        // one operator.
-        let mut candidate_nodes: Vec<String> = Vec::new();
-        for op_key in &working_set_ops {
-            if let Some(candidate) = Self::find_materialization_candidate(dag, op_key, &exec_stats)
-                && !candidate_nodes.contains(&candidate)
-            {
-                candidate_nodes.push(candidate);
-            }
-        }
-        debug!(
-            "Working set maps to {} distinct candidate node(s): {:?}",
+            "Candidate working set contains {} node(s) (top_cpu_time={}): {:?}",
             candidate_nodes.len(),
+            self.top_cpu_time,
             candidate_nodes
         );
 
@@ -491,7 +652,7 @@ where
             "materialization_count".into(),
             best_combo.len().to_string(),
         );
-        stats.insert("working_set_size".into(), working_set_ops.len().to_string());
+        stats.insert("working_set_size".into(), candidate_nodes.len().to_string());
         stats.insert("runs_used".into(), runs_used.to_string());
         stats.insert("final_runtime_ms".into(), best_ms.to_string());
         stats.insert(

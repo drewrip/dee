@@ -34,7 +34,9 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
         .with_omp_use_pushdown(opt_cmd.omp_use_pushdown)
         .with_hmp_no_plan_dups(opt_cmd.hmp_no_plan_dups)
         .with_hmp_max_runs(opt_cmd.hmp_max_runs)
-        .with_hmp_top_cpu_time(opt_cmd.hmp_top_cpu_time);
+        .with_hmp_top_cpu_time(opt_cmd.hmp_top_cpu_time)
+        .with_hmp_show_operators(opt_cmd.hmp_show_operators)
+        .with_hmp_show_nodes(opt_cmd.hmp_show_nodes);
 
     if let Some(enabled_passes) = opt_cmd.enable {
         config = config.with_all_disabled();

@@ -65,6 +65,13 @@ where
     hmp_max_runs: usize,
     /// HMP fraction of total operator CPU time used to build the working set
     hmp_top_cpu_time: f64,
+    /// HMP: when set, log a table of operator rankings after the baseline
+    /// run. `Some("")` logs only; `Some(path)` also writes it to `path`.
+    hmp_show_operators: Option<String>,
+    /// HMP: when set, log a table of node (View) rankings after the
+    /// baseline run. `Some("")` logs only; `Some(path)` also writes it to
+    /// `path`.
+    hmp_show_nodes: Option<String>,
     /// Pushdown pass
     run_pushdown_pass: bool,
     /// Result stats
@@ -94,6 +101,8 @@ where
             hmp_no_plan_dups: config.hmp_no_plan_dups,
             hmp_max_runs: config.hmp_max_runs,
             hmp_top_cpu_time: config.hmp_top_cpu_time,
+            hmp_show_operators: config.hmp_show_operators,
+            hmp_show_nodes: config.hmp_show_nodes,
             run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
         }
@@ -120,6 +129,8 @@ where
                 self.hmp_no_plan_dups,
                 self.hmp_max_runs,
                 self.hmp_top_cpu_time,
+                self.hmp_show_operators.clone(),
+                self.hmp_show_nodes.clone(),
             );
             let res = pass.run(dag).await?;
             if self.stats_on_passes {
@@ -181,6 +192,8 @@ pub struct OptimizerConfig {
     pub hmp_no_plan_dups: bool,
     pub hmp_max_runs: usize,
     pub hmp_top_cpu_time: f64,
+    pub hmp_show_operators: Option<String>,
+    pub hmp_show_nodes: Option<String>,
     pub run_pushdown_pass: bool,
 }
 
@@ -196,6 +209,8 @@ impl Default for OptimizerConfig {
             hmp_no_plan_dups: false,
             hmp_max_runs: 1,
             hmp_top_cpu_time: 0.5,
+            hmp_show_operators: None,
+            hmp_show_nodes: None,
             run_pushdown_pass: false,
         }
     }
@@ -276,6 +291,16 @@ impl OptimizerConfig {
             );
             0.5
         };
+        self
+    }
+
+    pub fn with_hmp_show_operators(mut self, show_operators: Option<String>) -> Self {
+        self.hmp_show_operators = show_operators;
+        self
+    }
+
+    pub fn with_hmp_show_nodes(mut self, show_nodes: Option<String>) -> Self {
+        self.hmp_show_nodes = show_nodes;
         self
     }
 
