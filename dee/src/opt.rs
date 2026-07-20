@@ -88,6 +88,10 @@ where
     /// baseline run. `Some("")` logs only; `Some(path)` also writes it to
     /// `path`.
     hmp_show_nodes: Option<String>,
+    /// HMP: rank VIEW candidates by total CPU time divided by the View's
+    /// estimated cardinality (from its EXPLAIN plan), instead of raw total
+    /// CPU time.
+    hmp_normalize_with_cardinality: bool,
     /// Pushdown pass
     run_pushdown_pass: bool,
     /// Result stats
@@ -124,6 +128,7 @@ where
             hmp_top_cpu_time: config.hmp_top_cpu_time,
             hmp_show_operators: config.hmp_show_operators,
             hmp_show_nodes: config.hmp_show_nodes,
+            hmp_normalize_with_cardinality: config.hmp_normalize_with_cardinality,
             run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
             explain_enabled: config.explain,
@@ -161,6 +166,7 @@ where
                 self.hmp_top_cpu_time,
                 self.hmp_show_operators.clone(),
                 self.hmp_show_nodes.clone(),
+                self.hmp_normalize_with_cardinality,
             );
             let res = pass.run(dag).await?;
             if self.explain_enabled {
@@ -236,6 +242,7 @@ pub struct OptimizerConfig {
     pub hmp_top_cpu_time: f64,
     pub hmp_show_operators: Option<String>,
     pub hmp_show_nodes: Option<String>,
+    pub hmp_normalize_with_cardinality: bool,
     pub run_pushdown_pass: bool,
     /// Collect an `Explain` HTML section from each pass during `run()`.
     pub explain: bool,
@@ -255,6 +262,7 @@ impl Default for OptimizerConfig {
             hmp_top_cpu_time: 0.5,
             hmp_show_operators: None,
             hmp_show_nodes: None,
+            hmp_normalize_with_cardinality: false,
             run_pushdown_pass: false,
             explain: false,
         }
@@ -346,6 +354,11 @@ impl OptimizerConfig {
 
     pub fn with_hmp_show_nodes(mut self, show_nodes: Option<String>) -> Self {
         self.hmp_show_nodes = show_nodes;
+        self
+    }
+
+    pub fn with_hmp_normalize_with_cardinality(mut self, normalize_with_cardinality: bool) -> Self {
+        self.hmp_normalize_with_cardinality = normalize_with_cardinality;
         self
     }
 

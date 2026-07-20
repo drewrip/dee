@@ -125,6 +125,7 @@ def benchmark(
     hmp_top_cpu_time=None,
     hmp_show_operators=None,
     hmp_show_nodes=None,
+    hmp_normalize_with_cardinality=False,
     explain_dir=None,
 ):
     with open(config_file, "r") as f:
@@ -222,6 +223,8 @@ def benchmark(
                 opt_cmd.extend(["--hmp-show-nodes", hmp_show_nodes])
             else:
                 opt_cmd.append("--hmp-show-nodes")
+        if hmp_normalize_with_cardinality:
+            opt_cmd.append("--hmp-normalize-with-cardinality")
         if explain_dir:
             explain_dir_path = Path(explain_dir)
             explain_dir_path.mkdir(parents=True, exist_ok=True)
@@ -419,6 +422,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--hmp-normalize-with-cardinality",
+        action="store_true",
+        help=(
+            "Rank HMP VIEW candidates by total CPU time divided by the View's "
+            "estimated cardinality (from its EXPLAIN plan), instead of raw total CPU time"
+        ),
+    )
+    parser.add_argument(
         "--explain",
         metavar="DIR",
         help="Directory to write per-project optimizer explain HTML reports to",
@@ -466,6 +477,7 @@ def main():
         hmp_top_cpu_time=args.hmp_top_cpu_time,
         hmp_show_operators=args.hmp_show_operators,
         hmp_show_nodes=args.hmp_show_nodes,
+        hmp_normalize_with_cardinality=args.hmp_normalize_with_cardinality,
         explain_dir=args.explain,
     )
     visualize(results)

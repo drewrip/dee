@@ -40,6 +40,10 @@ where
     /// When set, log a table of node (View) rankings after the baseline run.
     /// `Some("")` logs the table only; `Some(path)` also writes it to `path`.
     show_nodes: Option<String>,
+    /// When set, rank VIEW candidates by total CPU time divided by the
+    /// View's estimated cardinality (from its EXPLAIN plan), instead of raw
+    /// total CPU time.
+    normalize_with_cardinality: bool,
     /// Data collected during the last `run()`, used by `Explain::explain`.
     explain_data: Option<HMPExplainData>,
     _phantom: PhantomData<E>,
@@ -54,6 +58,7 @@ struct HMPExplainData {
     runs_used: usize,
     max_runs: usize,
     top_cpu_time: f64,
+    normalize_with_cardinality: bool,
     operator_rows: Vec<OperatorRankingRow>,
     node_rows: Vec<NodeRankingRow>,
     working_set: Vec<String>,
@@ -109,6 +114,12 @@ struct NodeRankingRow {
     rank: usize,
     node: String,
     total_cpu_time_s: f64,
+    /// Estimated cardinality of the View's own EXPLAIN plan, when available.
+    cardinality: Option<f64>,
+    /// The value nodes are ranked by: `total_cpu_time_s`, or (when
+    /// `--hmp-normalize-with-cardinality` is set) `total_cpu_time_s` divided
+    /// by `cardinality`.
+    ranking_score: f64,
 }
 
 impl DuckDBPlan {
@@ -182,6 +193,7 @@ where
         top_cpu_time: f64,
         show_operators: Option<String>,
         show_nodes: Option<String>,
+        normalize_with_cardinality: bool,
     ) -> Self {
         Self {
             conn,
@@ -189,6 +201,7 @@ where
             max_runs: max_runs.max(1),
             show_operators,
             show_nodes,
+            normalize_with_cardinality,
             top_cpu_time: if top_cpu_time > 0.0 && top_cpu_time <= 1.0 {
                 top_cpu_time
             } else {
@@ -383,17 +396,32 @@ where
         views
     }
 
+    /// Estimated cardinality of a View's own EXPLAIN plan, taken from the
+    /// root operator of its (already-collected) query plan.
+    fn view_cardinality(exec_stats: &ExecStats, view_id: &str) -> Option<f64> {
+        let node_stat = exec_stats.node_stats.get(view_id)?;
+        let plan_str = node_stat.plan.as_ref()?;
+        let plans: Vec<DuckDBPlan> = serde_json::from_str(plan_str).ok()?;
+        let root = plans.first()?;
+        let sig = root.get_sig()?;
+        sig.cardinality.parse::<f64>().ok()
+    }
+
     /// Build the `--hmp-show-nodes` ranking table: for every View with
     /// out-degree > 1 (a branch point, the only kind of View that
     /// materializing can actually deduplicate work for), sum the CPU time of
     /// every operator that traces back to it via `find_traced_views` (the
-    /// same mapping the `--hmp-show-operators` table uses). Sorted by total
-    /// CPU time, descending -- this is also the order `run()` searches down
-    /// when picking which node to try materializing.
+    /// same mapping the `--hmp-show-operators` table uses). Sorted by
+    /// `ranking_score`, descending -- this is also the order `run()`
+    /// searches down when picking which node to try materializing.
+    /// `ranking_score` is `total_cpu_time_s`, or (when
+    /// `normalize_with_cardinality` is set) `total_cpu_time_s` divided by the
+    /// View's estimated cardinality, from its EXPLAIN plan.
     fn build_node_table(
         dag: &Dag,
         exec_stats: &ExecStats,
         ranked_ops: &[(OpKey, f64, f64, usize)],
+        normalize_with_cardinality: bool,
     ) -> Vec<NodeRankingRow> {
         let mut aggregate_cpu_time: HashMap<String, f64> = HashMap::new();
         for (op_key, timing, _, _) in ranked_ops {
@@ -404,34 +432,50 @@ where
             }
         }
 
-        let mut rows: Vec<(String, f64)> = aggregate_cpu_time.into_iter().collect();
-        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut rows: Vec<(String, f64, Option<f64>, f64)> = aggregate_cpu_time
+            .into_iter()
+            .map(|(node, total_cpu_time_s)| {
+                let cardinality = Self::view_cardinality(exec_stats, &node);
+                let ranking_score = match (normalize_with_cardinality, cardinality) {
+                    (true, Some(c)) if c > 0.0 => total_cpu_time_s / c,
+                    _ => total_cpu_time_s,
+                };
+                (node, total_cpu_time_s, cardinality, ranking_score)
+            })
+            .collect();
+        rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
 
         rows.into_iter()
             .enumerate()
-            .map(|(i, (node, total_cpu_time_s))| NodeRankingRow {
+            .map(|(i, (node, total_cpu_time_s, cardinality, ranking_score))| NodeRankingRow {
                 rank: i + 1,
                 node,
                 total_cpu_time_s,
+                cardinality,
+                ranking_score,
             })
             .collect()
     }
 
     /// Render the node ranking table as aligned plain text.
     fn format_node_table(rows: &[NodeRankingRow]) -> String {
-        let headers = ["Rank", "Node", "Total CPU Time (s)"];
-        let rows_str: Vec<[String; 3]> = rows
+        let headers = ["Rank", "Node", "Total CPU Time (s)", "Cardinality", "Ranking Score"];
+        let rows_str: Vec<[String; 5]> = rows
             .iter()
             .map(|r| {
                 [
                     r.rank.to_string(),
                     r.node.clone(),
                     format!("{:.4}", r.total_cpu_time_s),
+                    r.cardinality
+                        .map(|c| format!("{:.0}", c))
+                        .unwrap_or_else(|| "-".to_string()),
+                    format!("{:.4}", r.ranking_score),
                 ]
             })
             .collect();
 
-        let mut widths: [usize; 3] = std::array::from_fn(|i| headers[i].len());
+        let mut widths: [usize; 5] = std::array::from_fn(|i| headers[i].len());
         for row in &rows_str {
             for (i, cell) in row.iter().enumerate() {
                 widths[i] = widths[i].max(cell.len());
@@ -567,16 +611,21 @@ where
         let ranked_ops = self.rank_operators(dag, &exec_stats);
         self.log_operator_table(dag, &exec_stats, &ranked_ops);
 
-        let node_ranking = Self::build_node_table(dag, &exec_stats, &ranked_ops);
+        let node_ranking = Self::build_node_table(
+            dag,
+            &exec_stats,
+            &ranked_ops,
+            self.normalize_with_cardinality,
+        );
         self.log_node_table(&node_ranking);
-        let total_node_timing: f64 = node_ranking.iter().map(|r| r.total_cpu_time_s).sum();
+        let total_node_timing: f64 = node_ranking.iter().map(|r| r.ranking_score).sum();
 
         let mut candidate_nodes: Vec<String> = Vec::new();
         if total_node_timing > 0.0 {
             let mut cumulative = 0.0;
             for row in &node_ranking {
                 candidate_nodes.push(row.node.clone());
-                cumulative += row.total_cpu_time_s;
+                cumulative += row.ranking_score;
                 if cumulative / total_node_timing >= self.top_cpu_time {
                     break;
                 }
@@ -696,6 +745,7 @@ where
             runs_used,
             max_runs: self.max_runs,
             top_cpu_time: self.top_cpu_time,
+            normalize_with_cardinality: self.normalize_with_cardinality,
             operator_rows: Self::build_operator_table(dag, &exec_stats, &ranked_ops),
             node_rows: node_ranking,
             working_set: candidate_nodes,
@@ -737,6 +787,15 @@ where
                 "Search budget used",
                 format!("{}/{} runs", data.runs_used, data.max_runs),
             ),
+            (
+                "Ranking normalized by cardinality",
+                if data.normalize_with_cardinality {
+                    "yes"
+                } else {
+                    "no"
+                }
+                .to_string(),
+            ),
         ]);
 
         let node_rows: Vec<Vec<String>> = data
@@ -747,6 +806,10 @@ where
                     r.rank.to_string(),
                     r.node.clone(),
                     format!("{:.4}s", r.total_cpu_time_s),
+                    r.cardinality
+                        .map(|c| format!("{:.0}", c))
+                        .unwrap_or_else(|| "-".to_string()),
+                    format!("{:.4}", r.ranking_score),
                     if data.working_set.contains(&r.node) {
                         "yes".to_string()
                     } else {
@@ -756,7 +819,14 @@ where
             })
             .collect();
         let node_table = render_ranked_table(
-            &["Rank", "View", "Aggregate CPU time", "In working set"],
+            &[
+                "Rank",
+                "View",
+                "Aggregate CPU time",
+                "Cardinality",
+                "Ranking score",
+                "In working set",
+            ],
             &node_rows,
         );
 
