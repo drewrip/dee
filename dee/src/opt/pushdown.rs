@@ -30,7 +30,10 @@ use crate::{
         build_opaque_context, create_logical_plan_with_stubs, dialect_for_db, is_transitive_dep,
         register_table_any, validate,
     },
-    opt::{Dag, OptimizerError, OptimizerPass},
+    opt::{
+        Dag, Explain, OptimizerError, OptimizerPass,
+        explain::{render_card_grid, render_ranked_table},
+    },
 };
 
 /// A schema-only [`TableProvider`] that declares `Exact` filter pushdown
@@ -767,7 +770,18 @@ where
 {
     _conn: Arc<C>,
     engine: Arc<E>,
+    /// Data collected during the last `run()`, used by `Explain::explain`.
+    explain_data: Option<PushdownExplainData>,
     _phantom: PhantomData<C>,
+}
+
+/// Everything `Explain::explain` needs to describe what the last `run()`
+/// did and why, retained from otherwise-local data computed during `run()`.
+#[derive(Debug, Clone)]
+struct PushdownExplainData {
+    /// `(node_id, outcome)` for every TempTable considered, deepest-first.
+    outcomes: Vec<(String, String)>,
+    rewrites_applied: usize,
 }
 
 impl<C, E> PushdownPass<C, E>
@@ -779,6 +793,7 @@ where
         Self {
             _conn: conn,
             engine,
+            explain_data: None,
             _phantom: PhantomData,
         }
     }
@@ -855,9 +870,14 @@ where
         // same optimized LogicalPlans used for filter/projection extraction).
         // Apply all of them to both the working minor and the original DAG.
         let mut rewrites: usize = 0;
+        let mut outcomes: Vec<(String, String)> = Vec::new();
         for node_id in &temp_table_ids {
             if minor.nodes.frontier_materializes(node_id).is_empty() {
                 debug!("PushdownPass: '{node_id}' has no materializing frontier, skipping");
+                outcomes.push((
+                    node_id.clone(),
+                    "skipped (no materializing frontier)".to_string(),
+                ));
                 continue;
             }
 
@@ -867,6 +887,7 @@ where
                 Ok(r) => r,
                 Err(e) => {
                     warn!("PushdownPass: skipping '{node_id}', pushdown failed: {e}");
+                    outcomes.push((node_id.clone(), format!("skipped (pushdown failed: {e})")));
                     continue;
                 }
             };
@@ -892,6 +913,7 @@ where
 
             if result.source_sql == original_sql {
                 debug!("PushdownPass: '{node_id}' unchanged (nothing pushed down)");
+                outcomes.push((node_id.clone(), "unchanged (nothing pushed down)".to_string()));
                 continue;
             }
 
@@ -899,6 +921,10 @@ where
                 "PushdownPass: '{node_id}' rewritten ({} chars)",
                 result.source_sql.len()
             );
+            outcomes.push((
+                node_id.clone(),
+                format!("rewritten ({} chars)", result.source_sql.len()),
+            ));
 
             {
                 let node = dag.nodes.get_mut(node_id.clone()).ok_or_else(|| {
@@ -919,7 +945,53 @@ where
 
         stats.insert("rewrites_applied".into(), rewrites.to_string());
         debug!("PushdownPass: complete — {rewrites} rewrite(s) applied");
+
+        self.explain_data = Some(PushdownExplainData {
+            outcomes,
+            rewrites_applied: rewrites,
+        });
+
         Ok(stats)
+    }
+}
+
+impl<C, E> Explain for PushdownPass<C, E>
+where
+    C: Connector + Send + 'static + Sync,
+    E: Executor<C> + Send + Sync,
+{
+    fn explain_label(&self) -> String {
+        "PushdownPass".to_string()
+    }
+
+    fn explain(&self) -> String {
+        let Some(data) = &self.explain_data else {
+            return r#"<div class="panel"><p class="subtle">PushdownPass did not run.</p></div>"#
+                .to_string();
+        };
+
+        let cards = render_card_grid(&[
+            ("TempTables considered", data.outcomes.len().to_string()),
+            ("Rewrites applied", data.rewrites_applied.to_string()),
+        ]);
+
+        let rows: Vec<Vec<String>> = data
+            .outcomes
+            .iter()
+            .map(|(node_id, outcome)| vec![node_id.clone(), outcome.clone()])
+            .collect();
+        let table = render_ranked_table(&["TempTable", "Outcome"], &rows);
+
+        format!(
+            r#"<div class="section-stack">
+        {cards}
+        <div class="panel">
+          <h2>Per-node outcome</h2>
+          <div class="subtle">Each TempTable is processed deepest-first, so nodes closer to the sinks see the most specific filter/projection context before shallower nodes are updated. A node is skipped if it has no materializing frontier to push predicates/projections into, or if pushdown found nothing to change.</div>
+          {table}
+        </div>
+      </div>"#
+        )
     }
 }
 

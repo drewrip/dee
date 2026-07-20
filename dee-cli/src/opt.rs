@@ -36,7 +36,8 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
         .with_hmp_max_runs(opt_cmd.hmp_max_runs)
         .with_hmp_top_cpu_time(opt_cmd.hmp_top_cpu_time)
         .with_hmp_show_operators(opt_cmd.hmp_show_operators)
-        .with_hmp_show_nodes(opt_cmd.hmp_show_nodes);
+        .with_hmp_show_nodes(opt_cmd.hmp_show_nodes)
+        .with_explain(opt_cmd.explain.is_some());
 
     if let Some(enabled_passes) = opt_cmd.enable {
         config = config.with_all_disabled();
@@ -56,14 +57,15 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
     };
     config = config.with_omp_centrality(centrality);
 
-    let opt_stats = match &target_connection {
+    let (opt_stats, explain_sections) = match &target_connection {
         Connection::DuckDB(config_conn) => {
             let conn = DuckDBConnection::new(config_conn.clone()).await?;
             let engine = SimpleEngine::new(conn.clone())?;
             engine.cleanup(&dag).await?;
             let mut optimizer =
                 Optimizer::new_with_config(conn, Arc::new(engine), config).stats_on_passes(true);
-            optimizer.run(&mut dag).await?
+            let stats = optimizer.run(&mut dag).await?;
+            (stats, optimizer.explain_sections().to_vec())
         }
         Connection::Postgres(config_conn) => {
             let conn = PostgresConnection::new(config_conn.clone()).await?;
@@ -71,9 +73,14 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
             engine.cleanup(&dag).await?;
             let mut optimizer =
                 Optimizer::new_with_config(conn, Arc::new(engine), config).stats_on_passes(true);
-            optimizer.run(&mut dag).await?
+            let stats = optimizer.run(&mut dag).await?;
+            (stats, optimizer.explain_sections().to_vec())
         }
     };
+    if let Some(path) = &opt_cmd.explain {
+        let html = dee::opt::explain::render_explain_html(&explain_sections);
+        fs::write(path, html)?;
+    }
     if opt_cmd.stats {
         let mut buf = Vec::new();
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");

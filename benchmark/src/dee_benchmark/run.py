@@ -66,8 +66,8 @@ def generate_connections_json(src_project_dir, dest_project_dir, requested_db_ty
 
                 dest_db_path = dest_project_dir / src_db_path.name
                 if src_db_path.exists():
-                    print(f"Copying database from {src_db_path} to {dest_db_path}...")
-                    shutil.copy2(src_db_path, dest_db_path)
+                    print(f"Linking database from {src_db_path} to {dest_db_path}...")
+                    dest_db_path.symlink_to(src_db_path.resolve())
                 else:
                     print(
                         f"Warning: Source database file {src_db_path} does not exist."
@@ -125,6 +125,7 @@ def benchmark(
     hmp_top_cpu_time=None,
     hmp_show_operators=None,
     hmp_show_nodes=None,
+    explain_dir=None,
 ):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
@@ -221,6 +222,12 @@ def benchmark(
                 opt_cmd.extend(["--hmp-show-nodes", hmp_show_nodes])
             else:
                 opt_cmd.append("--hmp-show-nodes")
+        if explain_dir:
+            explain_dir_path = Path(explain_dir)
+            explain_dir_path.mkdir(parents=True, exist_ok=True)
+            opt_cmd.append(
+                f"--explain={explain_dir_path / f'{project_name}.html'}"
+            )
 
         opt_stats_json = run_cmd(opt_cmd)
         opt_stats = json.loads(opt_stats_json)
@@ -411,6 +418,11 @@ def main():
             "Optionally pass a path to also write the table there."
         ),
     )
+    parser.add_argument(
+        "--explain",
+        metavar="DIR",
+        help="Directory to write per-project optimizer explain HTML reports to",
+    )
     args = parser.parse_args()
 
     if args.max_mem and args.db_type != "duckdb":
@@ -454,6 +466,7 @@ def main():
         hmp_top_cpu_time=args.hmp_top_cpu_time,
         hmp_show_operators=args.hmp_show_operators,
         hmp_show_nodes=args.hmp_show_nodes,
+        explain_dir=args.explain,
     )
     visualize(results)
 
