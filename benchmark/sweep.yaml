@@ -1,10 +1,11 @@
 projects:
-  - synth/multi-sink/p01_ecommerce
-  - synth/multi-sink/p02_fraud
-  - synth/multi-sink/p03_iot
-  - synth/multi-sink/p04_hr
-  - synth/multi-sink/p05_logistics
-  - synth/multi-sink/p06_saas
-  - synth/multi-sink/p07_healthcare
-  - synth/multi-sink/p09_gaming
-  - synth/multi-sink/p10_energy
+  - p01_iot
+  - p02_adtech
+  - p03_ecommerce
+  - p04_fraud
+  - p05_hr
+  - p06_logistics
+  - p07_saas
+  - p08_healthcare
+  - p09_gaming
+  - p10_energy

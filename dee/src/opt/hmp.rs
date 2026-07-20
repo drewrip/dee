@@ -12,7 +12,11 @@ use crate::{
     connectors::Connector,
     dag::MaterializeMode,
     executor::{ExecStats, Executor, ProfilingConfig, SimpleEngine},
-    opt::{Dag, OptimizerError, OptimizerPass, common::make_temp},
+    opt::{
+        Dag, Explain, OptimizerError, OptimizerPass,
+        common::make_temp,
+        explain::{render_bar_row, render_card_grid, render_ranked_table},
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -36,7 +40,25 @@ where
     /// When set, log a table of node (View) rankings after the baseline run.
     /// `Some("")` logs the table only; `Some(path)` also writes it to `path`.
     show_nodes: Option<String>,
+    /// Data collected during the last `run()`, used by `Explain::explain`.
+    explain_data: Option<HMPExplainData>,
     _phantom: PhantomData<E>,
+}
+
+/// Everything `Explain::explain` needs to describe what the last `run()`
+/// did and why, retained from otherwise-local data computed during `run()`.
+#[derive(Debug, Clone)]
+struct HMPExplainData {
+    baseline_ms: i64,
+    final_ms: i64,
+    runs_used: usize,
+    max_runs: usize,
+    top_cpu_time: f64,
+    operator_rows: Vec<OperatorRankingRow>,
+    node_rows: Vec<NodeRankingRow>,
+    working_set: Vec<String>,
+    best_combo: Vec<String>,
+    iterations: Vec<IterationStat>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -64,6 +86,10 @@ struct OpKey {
 struct IterationStat {
     iteration: usize,
     runtime_ms: i64,
+    /// Materialization combo tried at this iteration; empty for the
+    /// baseline (iteration 1).
+    #[serde(default)]
+    combo: Vec<String>,
 }
 
 /// One row of the `--hmp-show-operators` ranking table.
@@ -168,6 +194,7 @@ where
             } else {
                 0.5
             },
+            explain_data: None,
             _phantom: PhantomData,
         }
     }
@@ -529,6 +556,7 @@ where
         let mut iterations: Vec<IterationStat> = vec![IterationStat {
             iteration: 1,
             runtime_ms: best_ms,
+            combo: Vec::new(),
         }];
 
         // 2. Build the operator ranking, then the node ranking derived from
@@ -611,6 +639,7 @@ where
                 iterations.push(IterationStat {
                     iteration: iterations.len() + 1,
                     runtime_ms: trial_ms,
+                    combo: combo.clone(),
                 });
                 if trial_ms < best_ms {
                     debug!(
@@ -661,6 +690,151 @@ where
                 .map_err(|e| OptimizerError::Exec(format!("failed to serialize iterations: {e}")))?,
         );
 
+        self.explain_data = Some(HMPExplainData {
+            baseline_ms: iterations.first().map(|i| i.runtime_ms).unwrap_or(best_ms),
+            final_ms: best_ms,
+            runs_used,
+            max_runs: self.max_runs,
+            top_cpu_time: self.top_cpu_time,
+            operator_rows: Self::build_operator_table(dag, &exec_stats, &ranked_ops),
+            node_rows: node_ranking,
+            working_set: candidate_nodes,
+            best_combo,
+            iterations,
+        });
+
         Ok(stats)
+    }
+}
+
+impl<C, E> Explain for HMPPass<C, E>
+where
+    C: Connector + Send + 'static + Sync,
+    E: Executor<C> + Send + Sync,
+{
+    fn explain_label(&self) -> String {
+        "HMPPass".to_string()
+    }
+
+    fn explain(&self) -> String {
+        let Some(data) = &self.explain_data else {
+            return r#"<div class="panel"><p class="subtle">HMPPass did not run.</p></div>"#
+                .to_string();
+        };
+
+        let change_pct = if data.baseline_ms > 0 {
+            (data.final_ms - data.baseline_ms) as f64 / data.baseline_ms as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        let cards = render_card_grid(&[
+            ("Baseline runtime", format!("{} ms", data.baseline_ms)),
+            ("Final runtime", format!("{} ms", data.final_ms)),
+            ("Change", format!("{change_pct:+.1}%")),
+            ("Materializations chosen", data.best_combo.len().to_string()),
+            (
+                "Search budget used",
+                format!("{}/{} runs", data.runs_used, data.max_runs),
+            ),
+        ]);
+
+        let node_rows: Vec<Vec<String>> = data
+            .node_rows
+            .iter()
+            .map(|r| {
+                vec![
+                    r.rank.to_string(),
+                    r.node.clone(),
+                    format!("{:.4}s", r.total_cpu_time_s),
+                    if data.working_set.contains(&r.node) {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    },
+                ]
+            })
+            .collect();
+        let node_table = render_ranked_table(
+            &["Rank", "View", "Aggregate CPU time", "In working set"],
+            &node_rows,
+        );
+
+        let operator_rows: Vec<Vec<String>> = data
+            .operator_rows
+            .iter()
+            .take(15)
+            .map(|r| {
+                vec![
+                    r.rank.to_string(),
+                    r.operator.clone(),
+                    format!("{:.4}s", r.total_cpu_time_s),
+                    r.table_occurrences.to_string(),
+                    r.traced_views.join(", "),
+                ]
+            })
+            .collect();
+        let operator_table = render_ranked_table(
+            &[
+                "Rank",
+                "Operator",
+                "Total CPU time",
+                "Table occurrences",
+                "Traced view(s)",
+            ],
+            &operator_rows,
+        );
+
+        let max_iter_ms = data
+            .iterations
+            .iter()
+            .map(|i| i.runtime_ms)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let iteration_bars: String = data
+            .iterations
+            .iter()
+            .map(|it| {
+                let label = if it.combo.is_empty() {
+                    format!("Iteration {} (baseline)", it.iteration)
+                } else {
+                    format!("Iteration {}: materialize [{}]", it.iteration, it.combo.join(", "))
+                };
+                let is_winner = it.combo == data.best_combo && !it.combo.is_empty();
+                let label = if is_winner {
+                    format!("{label} — chosen")
+                } else {
+                    label
+                };
+                render_bar_row(
+                    &label,
+                    &format!("{} ms", it.runtime_ms),
+                    it.runtime_ms as f64 / max_iter_ms as f64 * 100.0,
+                )
+            })
+            .collect();
+
+        format!(
+            r##"<div class="section-stack">
+        {cards}
+        <div class="panel">
+          <h2>Why these nodes were considered</h2>
+          <div class="subtle">Views with out-degree &gt; 1 are candidates because materializing them can deduplicate work repeated by every downstream consumer. They're ranked by the aggregate CPU time of every operator (from the baseline's EXPLAIN plans) traced back to them. The working set walks this ranking, accumulating nodes until it covers {:.0}% of the total ranked CPU time.</div>
+          {node_table}
+        </div>
+        <div class="panel">
+          <h2>Duplicated operators driving the ranking</h2>
+          <div class="subtle">Operators that appear in more than one materialized plan, ranked by potential duplication time (time that a new materialization could eliminate).</div>
+          {operator_table}
+        </div>
+        <div class="panel">
+          <h2>Combinations searched</h2>
+          <div class="subtle">Combinations of working-set nodes were tried smallest-first (singles, then pairs, ...) until the run budget was exhausted. The combination with the lowest runtime was applied to the DAG.</div>
+          <div class="plan-tree">{iteration_bars}</div>
+        </div>
+      </div>"##,
+            data.top_cpu_time * 100.0
+        )
     }
 }

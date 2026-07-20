@@ -1,4 +1,5 @@
 pub mod common;
+pub mod explain;
 pub mod hmp;
 pub mod omp;
 pub mod pushdown;
@@ -22,6 +23,8 @@ use crate::{
     },
 };
 
+pub use crate::opt::explain::render_explain_html;
+
 #[derive(Error, Debug)]
 pub enum OptimizerError {
     #[error("couldn't execute DAG - {0}")]
@@ -37,6 +40,19 @@ where
     E: Executor<C> + Send,
 {
     async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError>;
+}
+
+/// Implemented by optimizer passes that can explain, after `run()` has
+/// completed, what they did and why. Each pass retains whatever data it
+/// collected during `run()` (candidates considered, plans tried, the one
+/// chosen) so `explain()` can render it into an HTML snippet.
+pub trait Explain {
+    /// Tab label for this pass's explain section, e.g. `"HMPPass"`.
+    fn explain_label(&self) -> String;
+
+    /// An HTML snippet (a `<section>...</section>`) explaining what this
+    /// pass did and why. Only meaningful after `run()` has completed.
+    fn explain(&self) -> String;
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +92,11 @@ where
     run_pushdown_pass: bool,
     /// Result stats
     stats_on_passes: bool,
+    /// Collect per-pass `Explain` sections during `run()`
+    explain_enabled: bool,
+    /// `(pass label, explain HTML)` pairs collected during the last `run()`,
+    /// in pass execution order. Only populated when `explain_enabled`.
+    explain_sections: Vec<(String, String)>,
 }
 
 impl<C, E> Optimizer<C, E>
@@ -105,12 +126,21 @@ where
             hmp_show_nodes: config.hmp_show_nodes,
             run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
+            explain_enabled: config.explain,
+            explain_sections: Vec::new(),
         }
     }
 
     pub fn stats_on_passes(mut self, collect_stats: bool) -> Self {
         self.stats_on_passes = collect_stats;
         self
+    }
+
+    /// `(pass label, explain HTML)` pairs collected during the last `run()`,
+    /// in pass execution order. Empty unless `OptimizerConfig::with_explain`
+    /// was enabled.
+    pub fn explain_sections(&self) -> &[(String, String)] {
+        &self.explain_sections
     }
 
     pub async fn run(
@@ -133,6 +163,10 @@ where
                 self.hmp_show_nodes.clone(),
             );
             let res = pass.run(dag).await?;
+            if self.explain_enabled {
+                self.explain_sections
+                    .push((pass.explain_label(), pass.explain()));
+            }
             if self.stats_on_passes {
                 stats.insert("HMPPass".to_string(), Arc::new(res));
             }
@@ -153,6 +187,10 @@ where
                 self.omp_use_pushdown,
             );
             let res = pass.run(dag).await?;
+            if self.explain_enabled {
+                self.explain_sections
+                    .push((pass.explain_label(), pass.explain()));
+            }
             if self.stats_on_passes {
                 stats.insert("OMPPass".to_string(), Arc::new(res));
             }
@@ -167,6 +205,10 @@ where
             let mut pass: PushdownPass<C, E> =
                 PushdownPass::new(self.conn.clone(), self.engine.clone());
             let res = pass.run(dag).await?;
+            if self.explain_enabled {
+                self.explain_sections
+                    .push((pass.explain_label(), pass.explain()));
+            }
             if self.stats_on_passes {
                 stats.insert("PushdownPass".to_string(), Arc::new(res));
             }
@@ -195,6 +237,8 @@ pub struct OptimizerConfig {
     pub hmp_show_operators: Option<String>,
     pub hmp_show_nodes: Option<String>,
     pub run_pushdown_pass: bool,
+    /// Collect an `Explain` HTML section from each pass during `run()`.
+    pub explain: bool,
 }
 
 impl Default for OptimizerConfig {
@@ -212,6 +256,7 @@ impl Default for OptimizerConfig {
             hmp_show_operators: None,
             hmp_show_nodes: None,
             run_pushdown_pass: false,
+            explain: false,
         }
     }
 }
@@ -306,6 +351,11 @@ impl OptimizerConfig {
 
     pub fn with_pushdown_pass(mut self) -> Self {
         self.run_pushdown_pass = true;
+        self
+    }
+
+    pub fn with_explain(mut self, enabled: bool) -> Self {
+        self.explain = enabled;
         self
     }
 }

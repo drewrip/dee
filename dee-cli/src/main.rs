@@ -94,6 +94,11 @@ pub struct OptCommand {
     omp_exhaust: bool,
     #[arg(long, action)]
     omp_use_pushdown: bool,
+    /// Write an HTML report explaining what each enabled pass did and why.
+    /// Pass a path to choose the output file, e.g. `--explain=out.html`;
+    /// bare `--explain` writes to `explain.html`.
+    #[arg(long, num_args = 0..=1, default_missing_value = "explain.html")]
+    explain: Option<String>,
 
     dag_file: String,
 }

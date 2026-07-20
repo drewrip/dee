@@ -8,7 +8,12 @@ use crate::{
     connectors::Connector,
     dag::MaterializeMode,
     executor::{Executor, ExecutorError},
-    opt::{Dag, OptimizerError, OptimizerPass, common::make_temp, pushdown::PushdownPass},
+    opt::{
+        Dag, Explain, OptimizerError, OptimizerPass,
+        common::make_temp,
+        explain::{render_bar_row, render_card_grid, render_ranked_table},
+        pushdown::PushdownPass,
+    },
 };
 
 /// Runtime of a single plan attempted by the pass, in the order it was run.
@@ -21,6 +26,28 @@ use crate::{
 struct IterationStat {
     iteration: usize,
     runtime_ms: i64,
+}
+
+/// One materialization plan attempt, used by `Explain::explain`.
+#[derive(Debug, Clone)]
+struct OMPAttempt {
+    label: String,
+    outcome: String,
+    cost_ms: Option<f64>,
+    is_best: bool,
+}
+
+/// Everything `Explain::explain` needs to describe what the last `run()`
+/// did and why, retained from otherwise-local data computed during `run()`.
+#[derive(Debug, Clone)]
+struct OMPExplainData {
+    baseline_cost: f32,
+    best_cost: f32,
+    centrality: OMPCentrality,
+    candidates: Vec<(String, usize)>,
+    top_candidates: Vec<String>,
+    best_plan: Vec<String>,
+    attempts: Vec<OMPAttempt>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,6 +69,8 @@ where
     centrality: OMPCentrality,
     early_termination: bool,
     use_pushdown: bool,
+    /// Data collected during the last `run()`, used by `Explain::explain`.
+    explain_data: Option<OMPExplainData>,
     _phantom: PhantomData<C>,
 }
 
@@ -65,6 +94,7 @@ where
             centrality,
             early_termination,
             use_pushdown,
+            explain_data: None,
             _phantom: PhantomData,
         }
     }
@@ -178,12 +208,27 @@ where
         // the original dag.  Starts as dag.clone() because the baseline run used
         // the original dag.
         let mut last_run_dag = dag.clone();
+        let mut attempts: Vec<OMPAttempt> = Vec::new();
+        let describe_plan = |plan: &[MaterializeMode]| -> String {
+            top_candidates
+                .iter()
+                .zip(plan.iter())
+                .map(|(id, mode)| format!("{id}={}", mode.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
 
         for (i, plan) in plans.iter().enumerate() {
             // The baseline combination was already measured above — skip it.
             if *plan == baseline_modes {
                 debug!("OMPPass: plan {} is the baseline, skipping", i + 1);
                 stats.insert(format!("attempt_{}", i + 1), "baseline(skipped)".to_string());
+                attempts.push(OMPAttempt {
+                    label: format!("Plan {}: {}", i + 1, describe_plan(plan)),
+                    outcome: "skipped (same as baseline)".to_string(),
+                    cost_ms: None,
+                    is_best: false,
+                });
                 continue;
             }
 
@@ -243,6 +288,12 @@ where
                             iteration: iterations.len() + 1,
                             runtime_ms: budget_ms as i64,
                         });
+                        attempts.push(OMPAttempt {
+                            label: format!("Plan {}: {}", i + 1, describe_plan(plan)),
+                            outcome: format!("cancelled (exceeded {budget_ms}ms budget)"),
+                            cost_ms: Some(budget_ms as f64),
+                            is_best: false,
+                        });
                         last_run_dag = work_dag;
                         continue;
                     }
@@ -262,6 +313,12 @@ where
             iterations.push(IterationStat {
                 iteration: iterations.len() + 1,
                 runtime_ms: current_cost as i64,
+            });
+            attempts.push(OMPAttempt {
+                label: format!("Plan {}: {}", i + 1, describe_plan(plan)),
+                outcome: format!("{current_cost:.2} ms"),
+                cost_ms: Some(current_cost as f64),
+                is_best: false,
             });
 
             if current_cost < best_cost {
@@ -308,7 +365,122 @@ where
                 .map_err(|e| OptimizerError::Exec(format!("failed to serialize iterations: {e}")))?,
         );
 
+        for attempt in attempts.iter_mut() {
+            if let Some(cost) = attempt.cost_ms
+                && (cost - best_cost as f64).abs() < 1e-6
+            {
+                attempt.is_best = true;
+            }
+        }
+
+        self.explain_data = Some(OMPExplainData {
+            baseline_cost,
+            best_cost,
+            centrality: self.centrality,
+            candidates,
+            top_candidates,
+            best_plan,
+            attempts,
+        });
+
         *dag = best_dag;
         Ok(stats)
+    }
+}
+
+impl<C, E> Explain for OMPPass<C, E>
+where
+    C: Connector + Send + 'static + Sync,
+    E: Executor<C> + Send + Sync,
+{
+    fn explain_label(&self) -> String {
+        "OMPPass".to_string()
+    }
+
+    fn explain(&self) -> String {
+        let Some(data) = &self.explain_data else {
+            return r#"<div class="panel"><p class="subtle">OMPPass did not run.</p></div>"#
+                .to_string();
+        };
+
+        let change_pct = if data.baseline_cost > 0.0 {
+            (data.best_cost - data.baseline_cost) / data.baseline_cost * 100.0
+        } else {
+            0.0
+        };
+
+        let centrality_label = match data.centrality {
+            OMPCentrality::OutDegree => "out-degree",
+            OMPCentrality::Paths => "paths-to-sinks",
+        };
+
+        let cards = render_card_grid(&[
+            ("Baseline cost", format!("{:.2} ms", data.baseline_cost)),
+            ("Best cost", format!("{:.2} ms", data.best_cost)),
+            ("Change", format!("{change_pct:+.1}%")),
+            ("Plans evaluated", data.attempts.len().to_string()),
+            ("Materializations chosen", data.best_plan.len().to_string()),
+        ]);
+
+        let candidate_rows: Vec<Vec<String>> = data
+            .candidates
+            .iter()
+            .rev()
+            .map(|(id, rank)| {
+                vec![
+                    id.clone(),
+                    rank.to_string(),
+                    if data.top_candidates.contains(id) {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    },
+                ]
+            })
+            .collect();
+        let candidate_table = render_ranked_table(
+            &["Node", centrality_label, "In working set"],
+            &candidate_rows,
+        );
+
+        let max_cost = data
+            .attempts
+            .iter()
+            .filter_map(|a| a.cost_ms)
+            .fold(data.baseline_cost as f64, f64::max)
+            .max(1.0);
+        let attempt_bars: String = data
+            .attempts
+            .iter()
+            .map(|a| {
+                let label = if a.is_best {
+                    format!("{} — chosen", a.label)
+                } else {
+                    a.label.clone()
+                };
+                render_bar_row(
+                    &label,
+                    &a.outcome,
+                    a.cost_ms.unwrap_or(0.0) / max_cost * 100.0,
+                )
+            })
+            .collect();
+
+        format!(
+            r##"<div class="section-stack">
+        {cards}
+        <div class="panel">
+          <h2>Why these nodes were considered</h2>
+          <div class="subtle">Only nodes with more than one downstream consumer (out-degree &gt; 1) can benefit from materialization. Candidates are ranked by {centrality_label}; the working set is the top {top_n} of them.</div>
+          {candidate_table}
+        </div>
+        <div class="panel">
+          <h2>Plans evaluated</h2>
+          <div class="subtle">Every View/TempTable assignment for the working set was tried (2^N combinations, baseline excluded). Early termination cancels a trial once it exceeds the current best runtime.</div>
+          <div class="plan-tree">{attempt_bars}</div>
+        </div>
+      </div>"##,
+            top_n = data.top_candidates.len(),
+        )
     }
 }
