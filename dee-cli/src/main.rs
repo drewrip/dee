@@ -90,6 +90,11 @@ pub struct OptCommand {
     /// to also write the table there, e.g. `--hmp-show-nodes=out.txt`.
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     hmp_show_nodes: Option<String>,
+    /// Rank HMP VIEW candidates by total CPU time divided by the View's
+    /// estimated cardinality (from its EXPLAIN plan), instead of raw total
+    /// CPU time.
+    #[arg(long, action)]
+    hmp_normalize_with_cardinality: bool,
     #[arg(long, action)]
     omp_exhaust: bool,
     #[arg(long, action)]
