@@ -4,7 +4,7 @@ use dee::{
     dag::Dag,
     executor::{Executor, SimpleEngine},
     file::DagFile,
-    opt::{Optimizer, OptimizerConfig},
+    opt::{hmp::HMPStrategy, Optimizer, OptimizerConfig},
 };
 use log::info;
 use serde::Serialize;
@@ -57,6 +57,12 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
         crate::CliOMPCentrality::Paths => dee::opt::omp::OMPCentrality::Paths,
     };
     config = config.with_omp_centrality(centrality);
+
+    let strategy = match opt_cmd.hmp_strategy {
+        crate::CliHMPStrategy::Breadth => HMPStrategy::Breadth,
+        crate::CliHMPStrategy::Greedy => HMPStrategy::Greedy,
+    };
+    config = config.with_hmp_strategy(strategy);
 
     let (opt_stats, explain_sections) = match &target_connection {
         Connection::DuckDB(config_conn) => {

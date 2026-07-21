@@ -19,6 +19,19 @@ use crate::{
     },
 };
 
+/// Strategy HMP uses to search through the node ranking when deciding
+/// which VIEWs to materialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HMPStrategy {
+    /// Walk the node ranking, trying all k-sized combinations smallest-first
+    /// (singles, pairs, triples, ...). This is the default / original behavior.
+    #[default]
+    Breadth,
+    /// Walk the node ranking sequentially, committing each materialization
+    /// that improves performance before trying the next node down the ranking.
+    Greedy,
+}
+
 #[derive(Debug, Clone)]
 pub struct HMPPass<C, E>
 where
@@ -44,6 +57,8 @@ where
     /// View's estimated cardinality (from its EXPLAIN plan), instead of raw
     /// total CPU time.
     normalize_with_cardinality: bool,
+    /// Strategy for searching through the node ranking.
+    strategy: HMPStrategy,
     /// Data collected during the last `run()`, used by `Explain::explain`.
     explain_data: Option<HMPExplainData>,
     _phantom: PhantomData<E>,
@@ -64,6 +79,7 @@ struct HMPExplainData {
     working_set: Vec<String>,
     best_combo: Vec<String>,
     iterations: Vec<IterationStat>,
+    strategy: HMPStrategy,
 }
 
 #[derive(Deserialize, Debug)]
@@ -97,12 +113,12 @@ struct IterationStat {
     combo: Vec<String>,
 }
 
-/// One row of the `--hmp-show-operators` ranking table.
+/// One row of the `--hmp-show-operators` table.
 #[derive(Serialize, Debug, Clone)]
 struct OperatorRankingRow {
     rank: usize,
     operator: String,
-    total_cpu_time_s: f64,
+    avg_runtime_s: f64,
     table_occurrences: usize,
     traced_views: Vec<String>,
 }
@@ -194,6 +210,7 @@ where
         show_operators: Option<String>,
         show_nodes: Option<String>,
         normalize_with_cardinality: bool,
+        strategy: HMPStrategy,
     ) -> Self {
         Self {
             conn,
@@ -202,6 +219,7 @@ where
             show_operators,
             show_nodes,
             normalize_with_cardinality,
+            strategy,
             top_cpu_time: if top_cpu_time > 0.0 && top_cpu_time <= 1.0 {
                 top_cpu_time
             } else {
@@ -212,11 +230,10 @@ where
         }
     }
 
-    /// Rank operators found in the EXPLAIN ANALYZE plans of currently
-    /// materialized (Table) nodes by their potential duplication time,
-    /// descending. Only operators seen more than once are returned, since
-    /// those are the only ones a new materialization could deduplicate.
-    fn rank_operators(&self, dag: &Dag, exec_stats: &ExecStats) -> Vec<(OpKey, f64, f64, usize)> {
+    /// Build a map from each operator found in the EXPLAIN ANALYZE plans of
+    /// currently materialized (Table) nodes to its average runtime across
+    /// occurrences, along with the occurrence count.
+    fn operator_stats(&self, dag: &Dag, exec_stats: &ExecStats) -> HashMap<OpKey, (f64, usize)> {
         let mut timing_map: HashMap<OpKey, f64> = HashMap::new();
         let mut occurrence_map: HashMap<OpKey, usize> = HashMap::new();
 
@@ -253,51 +270,39 @@ where
         }
         debug!("Analyzed {} materialized nodes", materialized_node_count);
 
-        let mut ranked_ops: Vec<_> = timing_map
+        timing_map
             .into_iter()
-            .filter(|(sig, _)| occurrence_map.get(sig).cloned().unwrap_or(0) > 1)
-            .map(|(sig, t)| {
-                let n = occurrence_map.get(&sig).cloned().unwrap_or(1) as f64;
-                let potential_duplication_time = if n > 0.0 { t - t / n } else { 0.0 };
+            .map(|(sig, total)| {
                 let occurrences = occurrence_map.get(&sig).cloned().unwrap_or(0);
-                (sig, t, potential_duplication_time, occurrences)
+                let avg = if occurrences > 0 {
+                    total / occurrences as f64
+                } else {
+                    0.0
+                };
+                (sig, (avg, occurrences))
             })
-            .collect();
-
-        ranked_ops.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-
-        if !ranked_ops.is_empty() {
-            debug!("Top 5 bottlenecks by potential duplication time across all plans:");
-            for (i, (op, timing, pdt, occurrences)) in ranked_ops.iter().take(5).enumerate() {
-                debug!(
-                    "  {}. {:?} - PDT: {:.4}s (Total Timing: {:.4}s, Found {} times)",
-                    i + 1,
-                    op,
-                    pdt,
-                    timing,
-                    occurrences
-                );
-            }
-        }
-
-        ranked_ops
+            .collect()
     }
 
-    /// Build the `--hmp-show-operators` ranking table: rank, operator key,
-    /// total CPU time, number of materialized Table plans the operator
-    /// appears in, and every View whose EXPLAIN plan contains the operator.
+    /// Build the `--hmp-show-operators` table: operator key, its average
+    /// runtime across occurrences, number of materialized Table plans the
+    /// operator appears in, and every View whose EXPLAIN plan contains the
+    /// operator. Rows are sorted by operator name for stable output.
     fn build_operator_table(
         dag: &Dag,
         exec_stats: &ExecStats,
-        ranked_ops: &[(OpKey, f64, f64, usize)],
+        op_stats: &HashMap<OpKey, (f64, usize)>,
     ) -> Vec<OperatorRankingRow> {
-        ranked_ops
-            .iter()
+        let mut entries: Vec<_> = op_stats.iter().collect();
+        entries.sort_by(|a, b| a.0.name.cmp(&b.0.name).then(a.0.cardinality.cmp(&b.0.cardinality)));
+
+        entries
+            .into_iter()
             .enumerate()
-            .map(|(i, (op_key, timing, _, occurrences))| OperatorRankingRow {
+            .map(|(i, (op_key, (avg_runtime, occurrences)))| OperatorRankingRow {
                 rank: i + 1,
                 operator: format!("{}(cardinality={})", op_key.name, op_key.cardinality),
-                total_cpu_time_s: *timing,
+                avg_runtime_s: *avg_runtime,
                 table_occurrences: *occurrences,
                 traced_views: Self::find_traced_views(dag, op_key, exec_stats),
             })
@@ -309,7 +314,7 @@ where
         let headers = [
             "Rank",
             "Operator",
-            "Total CPU Time (s)",
+            "Avg Runtime (s)",
             "Table Occurrences",
             "Traced View(s)",
         ];
@@ -319,7 +324,7 @@ where
                 [
                     r.rank.to_string(),
                     r.operator.clone(),
-                    format!("{:.4}", r.total_cpu_time_s),
+                    format!("{:.4}", r.avg_runtime_s),
                     r.table_occurrences.to_string(),
                     if r.traced_views.is_empty() {
                         "-".to_string()
@@ -356,12 +361,12 @@ where
 
     /// Log the operator ranking table and, if `show_operators` carries a
     /// non-empty path, write it there too.
-    fn log_operator_table(&self, dag: &Dag, exec_stats: &ExecStats, ranked_ops: &[(OpKey, f64, f64, usize)]) {
+    fn log_operator_table(&self, dag: &Dag, exec_stats: &ExecStats, op_stats: &HashMap<OpKey, (f64, usize)>) {
         let Some(path) = &self.show_operators else {
             return;
         };
 
-        let rows = Self::build_operator_table(dag, exec_stats, ranked_ops);
+        let rows = Self::build_operator_table(dag, exec_stats, op_stats);
         let table = Self::format_operator_table(&rows);
         info!("HMPPass operator rankings:\n{}", table);
 
@@ -409,25 +414,25 @@ where
 
     /// Build the `--hmp-show-nodes` ranking table: for every View with
     /// out-degree > 1 (a branch point, the only kind of View that
-    /// materializing can actually deduplicate work for), sum the CPU time of
-    /// every operator that traces back to it via `find_traced_views` (the
-    /// same mapping the `--hmp-show-operators` table uses). Sorted by
-    /// `ranking_score`, descending -- this is also the order `run()`
-    /// searches down when picking which node to try materializing.
+    /// materializing can actually deduplicate work for), sum the average
+    /// runtime of every operator that traces back to it via
+    /// `find_traced_views` (the same mapping the `--hmp-show-operators` table
+    /// uses). Sorted by `ranking_score`, descending -- this is also the order
+    /// `run()` searches down when picking which node to try materializing.
     /// `ranking_score` is `total_cpu_time_s`, or (when
     /// `normalize_with_cardinality` is set) `total_cpu_time_s` divided by the
     /// View's estimated cardinality, from its EXPLAIN plan.
     fn build_node_table(
         dag: &Dag,
         exec_stats: &ExecStats,
-        ranked_ops: &[(OpKey, f64, f64, usize)],
+        op_stats: &HashMap<OpKey, (f64, usize)>,
         normalize_with_cardinality: bool,
     ) -> Vec<NodeRankingRow> {
         let mut aggregate_cpu_time: HashMap<String, f64> = HashMap::new();
-        for (op_key, timing, _, _) in ranked_ops {
+        for (op_key, (avg_runtime, _)) in op_stats {
             for view in Self::find_traced_views(dag, op_key, exec_stats) {
                 if dag.nodes.out_degree(&view) > 1 {
-                    *aggregate_cpu_time.entry(view).or_insert(0.0) += timing;
+                    *aggregate_cpu_time.entry(view).or_insert(0.0) += avg_runtime;
                 }
             }
         }
@@ -603,18 +608,18 @@ where
             combo: Vec::new(),
         }];
 
-        // 2. Build the operator ranking, then the node ranking derived from
-        // it: for every View with out-degree > 1, the aggregate CPU time of
-        // every operator traced back to it. Walk the node ranking,
-        // accumulating CPU time until it covers `top_cpu_time` of the total,
-        // to build the working set of candidate nodes to search.
-        let ranked_ops = self.rank_operators(dag, &exec_stats);
-        self.log_operator_table(dag, &exec_stats, &ranked_ops);
+        // 2. Build the operator stats, then the node ranking derived from
+        // them: for every View with out-degree > 1, the aggregate average
+        // runtime of every operator traced back to it. Walk the node
+        // ranking, accumulating CPU time until it covers `top_cpu_time` of
+        // the total, to build the working set of candidate nodes to search.
+        let op_stats = self.operator_stats(dag, &exec_stats);
+        self.log_operator_table(dag, &exec_stats, &op_stats);
 
         let node_ranking = Self::build_node_table(
             dag,
             &exec_stats,
-            &ranked_ops,
+            &op_stats,
             self.normalize_with_cardinality,
         );
         self.log_node_table(&node_ranking);
@@ -638,70 +643,134 @@ where
             candidate_nodes
         );
 
-        // 3. Search combinations of candidate nodes, starting with singles,
-        // then pairs, then triples, etc. Every attempt (successful or not)
-        // costs one run out of `max_runs`, so larger combination sizes are
-        // only reached once every smaller size has been fully explored
-        // within budget.
+        // 3. Search through candidate nodes to find the best materialization
+        // combination. The strategy determines how we explore the search space.
         let baseline_dag = dag.clone();
         let mut best_combo: Vec<String> = Vec::new();
         let mut tried_dag_sigs: HashSet<String> = HashSet::new();
 
-        'sizes: for k in 1..=candidate_nodes.len() {
-            if runs_used >= self.max_runs {
-                break;
+        match self.strategy {
+            HMPStrategy::Breadth => {
+                // Try all k-sized combinations smallest-first (singles, pairs,
+                // triples, ...). Every attempt costs one run out of `max_runs`.
+                'sizes: for k in 1..=candidate_nodes.len() {
+                    if runs_used >= self.max_runs {
+                        break;
+                    }
+                    let combos = combinations(&candidate_nodes, k);
+                    debug!("Trying {} combination(s) of size {}", combos.len(), k);
+
+                    for combo in combos {
+                        if runs_used >= self.max_runs {
+                            break 'sizes;
+                        }
+
+                        let mut trial_dag = baseline_dag.clone();
+                        let mut trial_counter = 0usize;
+                        for node_id in &combo {
+                            make_temp(&mut trial_dag, node_id, &mut trial_counter)?;
+                        }
+
+                        if !tried_dag_sigs.insert(dag_signature(&trial_dag)) {
+                            debug!(
+                                "Combo {:?} produces a DAG equivalent to one already tried, skipping",
+                                combo
+                            );
+                            continue;
+                        }
+
+                        debug!(
+                            "Trying materialization combo {:?}, re-running DAG to measure impact",
+                            combo
+                        );
+                        let _ = engine.cleanup(&trial_dag).await.unwrap();
+                        let trial_stats = engine
+                            .run(&trial_dag)
+                            .await
+                            .map_err(|e| OptimizerError::Exec(format!("candidate run failed: {}", e)))?;
+                        runs_used += 1;
+
+                        let trial_ms = trial_stats.duration.num_milliseconds();
+                        iterations.push(IterationStat {
+                            iteration: iterations.len() + 1,
+                            runtime_ms: trial_ms,
+                            combo: combo.clone(),
+                        });
+                        if trial_ms < best_ms {
+                            debug!(
+                                "Combo {:?} improved runtime: {}ms -> {}ms",
+                                combo, best_ms, trial_ms
+                            );
+                            best_ms = trial_ms;
+                            best_combo = combo;
+                        } else {
+                            debug!(
+                                "Combo {:?} did not improve runtime ({}ms -> {}ms)",
+                                combo, best_ms, trial_ms
+                            );
+                        }
+                    }
+                }
             }
-            let combos = combinations(&candidate_nodes, k);
-            debug!("Trying {} combination(s) of size {}", combos.len(), k);
+            HMPStrategy::Greedy => {
+                // Walk the node ranking sequentially. For each node, try
+                // materializing it along with all previously-committed nodes.
+                // If performance improves, commit that node and continue down
+                // the ranking.
+                let mut committed: Vec<String> = Vec::new();
+                for node_id in &candidate_nodes {
+                    if runs_used >= self.max_runs {
+                        break;
+                    }
 
-            for combo in combos {
-                if runs_used >= self.max_runs {
-                    break 'sizes;
-                }
+                    let mut trial_combo = committed.clone();
+                    trial_combo.push(node_id.clone());
 
-                let mut trial_dag = baseline_dag.clone();
-                let mut trial_counter = 0usize;
-                for node_id in &combo {
-                    make_temp(&mut trial_dag, node_id, &mut trial_counter)?;
-                }
+                    let mut trial_dag = baseline_dag.clone();
+                    let mut trial_counter = 0usize;
+                    for nid in &trial_combo {
+                        make_temp(&mut trial_dag, nid, &mut trial_counter)?;
+                    }
 
-                if !tried_dag_sigs.insert(dag_signature(&trial_dag)) {
+                    if !tried_dag_sigs.insert(dag_signature(&trial_dag)) {
+                        debug!(
+                            "Combo {:?} produces a DAG equivalent to one already tried, skipping",
+                            trial_combo
+                        );
+                        continue;
+                    }
+
                     debug!(
-                        "Combo {:?} produces a DAG equivalent to one already tried, skipping",
-                        combo
+                        "Trying materialization combo {:?}, re-running DAG to measure impact",
+                        trial_combo
                     );
-                    continue;
-                }
+                    let _ = engine.cleanup(&trial_dag).await.unwrap();
+                    let trial_stats = engine
+                        .run(&trial_dag)
+                        .await
+                        .map_err(|e| OptimizerError::Exec(format!("candidate run failed: {}", e)))?;
+                    runs_used += 1;
 
-                debug!(
-                    "Trying materialization combo {:?}, re-running DAG to measure impact",
-                    combo
-                );
-                let _ = engine.cleanup(&trial_dag).await.unwrap();
-                let trial_stats = engine
-                    .run(&trial_dag)
-                    .await
-                    .map_err(|e| OptimizerError::Exec(format!("candidate run failed: {}", e)))?;
-                runs_used += 1;
-
-                let trial_ms = trial_stats.duration.num_milliseconds();
-                iterations.push(IterationStat {
-                    iteration: iterations.len() + 1,
-                    runtime_ms: trial_ms,
-                    combo: combo.clone(),
-                });
-                if trial_ms < best_ms {
-                    debug!(
-                        "Combo {:?} improved runtime: {}ms -> {}ms",
-                        combo, best_ms, trial_ms
-                    );
-                    best_ms = trial_ms;
-                    best_combo = combo;
-                } else {
-                    debug!(
-                        "Combo {:?} did not improve runtime ({}ms -> {}ms)",
-                        combo, best_ms, trial_ms
-                    );
+                    let trial_ms = trial_stats.duration.num_milliseconds();
+                    iterations.push(IterationStat {
+                        iteration: iterations.len() + 1,
+                        runtime_ms: trial_ms,
+                        combo: trial_combo.clone(),
+                    });
+                    if trial_ms < best_ms {
+                        debug!(
+                            "Combo {:?} improved runtime: {}ms -> {}ms",
+                            trial_combo, best_ms, trial_ms
+                        );
+                        best_ms = trial_ms;
+                        best_combo = trial_combo.clone();
+                        committed = trial_combo;
+                    } else {
+                        debug!(
+                            "Combo {:?} did not improve runtime ({}ms -> {}ms)",
+                            trial_combo, best_ms, trial_ms
+                        );
+                    }
                 }
             }
         }
@@ -746,11 +815,12 @@ where
             max_runs: self.max_runs,
             top_cpu_time: self.top_cpu_time,
             normalize_with_cardinality: self.normalize_with_cardinality,
-            operator_rows: Self::build_operator_table(dag, &exec_stats, &ranked_ops),
+            operator_rows: Self::build_operator_table(dag, &exec_stats, &op_stats),
             node_rows: node_ranking,
             working_set: candidate_nodes,
             best_combo,
             iterations,
+            strategy: self.strategy,
         });
 
         Ok(stats)
@@ -786,6 +856,14 @@ where
             (
                 "Search budget used",
                 format!("{}/{} runs", data.runs_used, data.max_runs),
+            ),
+            (
+                "Search strategy",
+                match data.strategy {
+                    HMPStrategy::Breadth => "breadth",
+                    HMPStrategy::Greedy => "greedy",
+                }
+                .to_string(),
             ),
             (
                 "Ranking normalized by cardinality",
@@ -838,7 +916,7 @@ where
                 vec![
                     r.rank.to_string(),
                     r.operator.clone(),
-                    format!("{:.4}s", r.total_cpu_time_s),
+                    format!("{:.4}s", r.avg_runtime_s),
                     r.table_occurrences.to_string(),
                     r.traced_views.join(", "),
                 ]
@@ -848,7 +926,7 @@ where
             &[
                 "Rank",
                 "Operator",
-                "Total CPU time",
+                "Avg runtime",
                 "Table occurrences",
                 "Traced view(s)",
             ],
@@ -894,8 +972,8 @@ where
           {node_table}
         </div>
         <div class="panel">
-          <h2>Duplicated operators driving the ranking</h2>
-          <div class="subtle">Operators that appear in more than one materialized plan, ranked by potential duplication time (time that a new materialization could eliminate).</div>
+          <h2>Operators traced back to candidate views</h2>
+          <div class="subtle">Operators from materialized plans, with their average runtime across occurrences.</div>
           {operator_table}
         </div>
         <div class="panel">

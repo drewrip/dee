@@ -17,7 +17,7 @@ use crate::{
     executor::Executor,
     opt::{
         common::validate_dag,
-        hmp::HMPPass,
+        hmp::{HMPPass, HMPStrategy},
         omp::{OMPCentrality, OMPPass},
         pushdown::PushdownPass,
     },
@@ -92,6 +92,8 @@ where
     /// estimated cardinality (from its EXPLAIN plan), instead of raw total
     /// CPU time.
     hmp_normalize_with_cardinality: bool,
+    /// HMP: strategy for searching through the node ranking.
+    hmp_strategy: HMPStrategy,
     /// Pushdown pass
     run_pushdown_pass: bool,
     /// Result stats
@@ -129,6 +131,7 @@ where
             hmp_show_operators: config.hmp_show_operators,
             hmp_show_nodes: config.hmp_show_nodes,
             hmp_normalize_with_cardinality: config.hmp_normalize_with_cardinality,
+            hmp_strategy: config.hmp_strategy,
             run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
             explain_enabled: config.explain,
@@ -167,6 +170,7 @@ where
                 self.hmp_show_operators.clone(),
                 self.hmp_show_nodes.clone(),
                 self.hmp_normalize_with_cardinality,
+                self.hmp_strategy,
             );
             let res = pass.run(dag).await?;
             if self.explain_enabled {
@@ -243,6 +247,7 @@ pub struct OptimizerConfig {
     pub hmp_show_operators: Option<String>,
     pub hmp_show_nodes: Option<String>,
     pub hmp_normalize_with_cardinality: bool,
+    pub hmp_strategy: HMPStrategy,
     pub run_pushdown_pass: bool,
     /// Collect an `Explain` HTML section from each pass during `run()`.
     pub explain: bool,
@@ -263,6 +268,7 @@ impl Default for OptimizerConfig {
             hmp_show_operators: None,
             hmp_show_nodes: None,
             hmp_normalize_with_cardinality: false,
+            hmp_strategy: HMPStrategy::default(),
             run_pushdown_pass: false,
             explain: false,
         }
@@ -359,6 +365,11 @@ impl OptimizerConfig {
 
     pub fn with_hmp_normalize_with_cardinality(mut self, normalize_with_cardinality: bool) -> Self {
         self.hmp_normalize_with_cardinality = normalize_with_cardinality;
+        self
+    }
+
+    pub fn with_hmp_strategy(mut self, strategy: HMPStrategy) -> Self {
+        self.hmp_strategy = strategy;
         self
     }
 

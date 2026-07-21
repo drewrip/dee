@@ -56,6 +56,12 @@ pub enum CliOMPCentrality {
     Paths,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum CliHMPStrategy {
+    Breadth,
+    Greedy,
+}
+
 #[derive(Args)]
 pub struct OptCommand {
     #[arg(short, long)]
@@ -95,6 +101,12 @@ pub struct OptCommand {
     /// CPU time.
     #[arg(long, action)]
     hmp_normalize_with_cardinality: bool,
+    /// Choose the search strategy HMP uses to select which VIEWs to
+    /// materialize. `breadth` (default) tries all k-sized combinations
+    /// smallest-first. `greedy` walks the node ranking and commits each
+    /// materialization that improves performance.
+    #[arg(long, default_value = "breadth")]
+    hmp_strategy: CliHMPStrategy,
     #[arg(long, action)]
     omp_exhaust: bool,
     #[arg(long, action)]
