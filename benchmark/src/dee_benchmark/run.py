@@ -126,6 +126,7 @@ def benchmark(
     hmp_show_operators=None,
     hmp_show_nodes=None,
     hmp_normalize_with_cardinality=False,
+    hmp_strategy=None,
     explain_dir=None,
 ):
     with open(config_file, "r") as f:
@@ -225,6 +226,8 @@ def benchmark(
                 opt_cmd.append("--hmp-show-nodes")
         if hmp_normalize_with_cardinality:
             opt_cmd.append("--hmp-normalize-with-cardinality")
+        if hmp_strategy:
+            opt_cmd.extend(["--hmp-strategy", hmp_strategy])
         if explain_dir:
             explain_dir_path = Path(explain_dir)
             explain_dir_path.mkdir(parents=True, exist_ok=True)
@@ -430,6 +433,11 @@ def main():
         ),
     )
     parser.add_argument(
+        "--hmp-strategy",
+        choices=["breadth", "greedy"],
+        help="Search strategy HMP uses to select which VIEWs to materialize",
+    )
+    parser.add_argument(
         "--explain",
         metavar="DIR",
         help="Directory to write per-project optimizer explain HTML reports to",
@@ -478,6 +486,7 @@ def main():
         hmp_show_operators=args.hmp_show_operators,
         hmp_show_nodes=args.hmp_show_nodes,
         hmp_normalize_with_cardinality=args.hmp_normalize_with_cardinality,
+        hmp_strategy=args.hmp_strategy,
         explain_dir=args.explain,
     )
     visualize(results)
