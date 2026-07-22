@@ -175,9 +175,9 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "arrow"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffaaa3e009861fd829d0a24dd6f115aa8e4634324bb092147d43baafe69ca4a7"
+checksum = "b952ca5a8046ad741b60f142d6eca4aeebcad615694202bc64c5341f23e32c5b"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -196,9 +196,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-arith"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ac95125e1d71c4a252b5a9c729aef111e80418f08aaa6dbabd1ba66918247fc"
+checksum = "64a13b8d3008c4e9063c597a08f46446fe3fd5789277127672d6c0bdbb43b1ff"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -210,9 +210,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-array"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c60c79628e9a97cb90d7a0dc3e944f216a902f837d4ecabc14d524bddbbc137"
+checksum = "9486151b2f0785bafc6fa04fc5c99fcb4495455662e58787ea32eaaed33c4192"
 dependencies = [
  "ahash 0.8.12",
  "arrow-buffer",
@@ -229,9 +229,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-buffer"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6026f638c400e9878c1b1cc05c3cfd46fbf381285916ab408678701c1df46c1a"
+checksum = "c4776577a87794bfdf0b4e90e2ea12454fa7738ea2823c4be5b9d1851da7b434"
 dependencies = [
  "bytes",
  "half",
@@ -241,9 +241,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-cast"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c82c236c3caf8df5664284f3f1fbe89938852163998c3fdbf37e84ac220445e9"
+checksum = "a9ad451ce4f98710828a455b96991b8f031deb2e67f5fcad6773f017e4a69c3a"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -263,9 +263,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-csv"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12714e5fb7954159af1e26d4e0d37108bcf1a2ad5ee5c5bf02a944d564d588b7"
+checksum = "8aa7bf96d6141a7bcca2eed57c7c9767d2a2175281857b8a7b68308992864784"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -278,9 +278,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-data"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bd568aa70c4ec5947027b0d5caee94877433b661a0bb9e8ddceeeb5f0c9b1ab"
+checksum = "b38fe43e2e8704360f1464e6e8cc4fc381ef02cc4fb0192afa8df1aaa0115c66"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -291,9 +291,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-ipc"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e57ee4d470eab1a021bc4b63fa2b2c15d572892bf227b0a982d3b755a6c662b5"
+checksum = "29dac499fcbc6ba74ee0324057821d381929a48526a3966bd9dffb44aa06d98c"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -307,9 +307,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-json"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38f47e0e7a284e1f3707a780dc8cd5451b1614e9e398ea2d9ca03c7a2fe9a9ed"
+checksum = "0fe05e916ddc50f4c7a363cd69c0ef5894fcee063517e9a0b8582f0c56746af6"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -332,9 +332,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-ord"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a79cf73ad2eba8686ec2aa9bbf8671208e509025f166afc040cedbd94ffe4983"
+checksum = "0e13dbdc2a9c053c10c7baa6e30faee04a180aa7ce88e471835850ce37abd20b"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -345,9 +345,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-row"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cea0f7d8ed6182f14952761e2c0f989852d5aa334fcbc49f73a9f2247c25b879"
+checksum = "4d5a1f8c733d15260b305683472ee8ad89c62cbd706703ca873b90d051b41592"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -358,9 +358,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-schema"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80b3e786a0dd9103acd583a6fb486dbf2f3268466cc0bd571dcf34cef231c1f1"
+checksum = "d9e4969dc350d571766247143ab36a5187d095d3d3690970408bc630d47c69e5"
 dependencies = [
  "bitflags",
  "serde_core",
@@ -369,9 +369,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-select"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "067a67e0361f6c31f4a7248759f36ca4ca71b187a941ed4d49da1c7d3d4db624"
+checksum = "402770dba90865359d98d1ef92ef16e23d75c0cca9c2c880c8a05468b7743bf9"
 dependencies = [
  "ahash 0.8.12",
  "arrow-array",
@@ -383,9 +383,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-string"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99bc95847f3ff62a2b03d6f8ce2e3e78f01362060549a2a311898dd442f6256d"
+checksum = "a2b0afbb8b9016700938291123df30838b89decc3213dba00852021988b170d3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1092,8 +1092,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1144,8 +1144,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-catalog"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1168,8 +1168,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-catalog-listing"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1186,12 +1186,13 @@ dependencies = [
  "itertools 0.15.0",
  "log",
  "object_store 0.13.2",
+ "percent-encoding",
 ]
 
 [[package]]
 name = "datafusion-common"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -1216,8 +1217,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-common-runtime"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "futures",
  "log",
@@ -1226,8 +1227,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "async-compression",
@@ -1261,8 +1262,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-arrow"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -1284,8 +1285,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-csv"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1306,8 +1307,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-json"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1328,8 +1329,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-parquet"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1359,13 +1360,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-doc"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 
 [[package]]
 name = "datafusion-execution"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -1379,6 +1380,7 @@ dependencies = [
  "log",
  "object_store 0.13.2",
  "parking_lot",
+ "pin-project-lite",
  "rand 0.9.4",
  "tempfile",
  "tokio",
@@ -1388,8 +1390,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-expr"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1410,8 +1412,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-expr-common"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1421,8 +1423,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -1452,8 +1454,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-aggregate"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1471,8 +1473,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-aggregate-common"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1482,8 +1484,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-nested"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -1506,8 +1508,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-table"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1521,8 +1523,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-window"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1537,8 +1539,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-window-common"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -1546,8 +1548,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-macros"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "datafusion-doc",
  "quote",
@@ -1556,8 +1558,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "chrono",
@@ -1575,8 +1577,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1596,8 +1598,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr-adapter"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1610,8 +1612,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr-common"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "chrono",
@@ -1626,8 +1628,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-optimizer"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1644,8 +1646,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-plan"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "arrow-data",
@@ -1678,8 +1680,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-pruning"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1693,8 +1695,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-session"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "async-trait",
  "datafusion-common",
@@ -1706,8 +1708,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-sql"
-version = "54.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=3496b9e9a1cf0b4fc43975cdc90b42790bafafc6#3496b9e9a1cf0b4fc43975cdc90b42790bafafc6"
+version = "54.1.0"
+source = "git+https://github.com/apache/datafusion.git?rev=eef101769d650b2b06ac2bcf298f71113a047c9d#eef101769d650b2b06ac2bcf298f71113a047c9d"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -1720,6 +1722,7 @@ dependencies = [
  "recursive",
  "regex",
  "sqlparser 0.62.0",
+ "stacker",
 ]
 
 [[package]]
@@ -1828,7 +1831,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 [[package]]
 name = "duckdb"
 version = "1.10504.0"
-source = "git+https://github.com/drewrip/duckdb-rs.git#13d83c34621645919fba638c499cd833ba90b529"
+source = "git+https://github.com/drewrip/duckdb-rs.git#1b0eb60b822afe21ce956433993f9bbdabdabc7b"
 dependencies = [
  "arrow",
  "cast",
@@ -2800,7 +2803,7 @@ checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 [[package]]
 name = "libduckdb-sys"
 version = "1.10504.0"
-source = "git+https://github.com/drewrip/duckdb-rs.git#13d83c34621645919fba638c499cd833ba90b529"
+source = "git+https://github.com/drewrip/duckdb-rs.git#1b0eb60b822afe21ce956433993f9bbdabdabc7b"
 dependencies = [
  "cc",
  "flate2",
@@ -3177,9 +3180,9 @@ dependencies = [
 
 [[package]]
 name = "parquet"
-version = "59.0.0"
+version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "970dff83e97d953c827ae8176f6bf4e9f77bf62daacc01ec5df348ec5eacd913"
+checksum = "5302d4da74d6596a1f11f9928767995b53bca657cbeea1e4e8c5074f8a1157dd"
 dependencies = [
  "ahash 0.8.12",
  "arrow-array",
@@ -5735,7 +5738,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

@@ -15,7 +15,7 @@ tempfile = "3.27.0"
 r2d2 = "0.8.10"
 futures = "0.3.32"
 log = "0.4.29"
-datafusion = { git = "https://github.com/apache/datafusion.git", rev = "3496b9e9a1cf0b4fc43975cdc90b42790bafafc6", features = ["sql"] }
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "eef101769d650b2b06ac2bcf298f71113a047c9d", features = ["sql"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 itertools = "0.14.0"
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio"] }
