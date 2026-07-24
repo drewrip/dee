@@ -117,7 +117,7 @@ def benchmark(
     omp_top=None,
     omp_node_centrality=None,
     omp_exhaust=False,
-    omp_use_pushdown=False,
+    omp_no_pushdown=False,
     enable=None,
     disable=None,
     hmp_no_plan_dups=False,
@@ -127,6 +127,7 @@ def benchmark(
     hmp_show_nodes=None,
     hmp_normalize_with_cardinality=False,
     hmp_strategy=None,
+    hmp_no_pushdown=False,
     explain_dir=None,
 ):
     with open(config_file, "r") as f:
@@ -202,8 +203,8 @@ def benchmark(
             opt_cmd.extend(["--omp-node-centrality", omp_node_centrality])
         if omp_exhaust:
             opt_cmd.append("--omp-exhaust")
-        if omp_use_pushdown:
-            opt_cmd.append("--omp-use-pushdown")
+        if omp_no_pushdown:
+            opt_cmd.append("--omp-no-pushdown")
         if enable:
             opt_cmd.extend(["--enable", enable])
         if disable:
@@ -228,6 +229,8 @@ def benchmark(
             opt_cmd.append("--hmp-normalize-with-cardinality")
         if hmp_strategy:
             opt_cmd.extend(["--hmp-strategy", hmp_strategy])
+        if hmp_no_pushdown:
+            opt_cmd.append("--hmp-no-pushdown")
         if explain_dir:
             explain_dir_path = Path(explain_dir)
             explain_dir_path.mkdir(parents=True, exist_ok=True)
@@ -375,9 +378,9 @@ def main():
         help="Disable early termination in OMPPass and evaluate all candidate plans",
     )
     parser.add_argument(
-        "--omp-use-pushdown",
+        "--omp-no-pushdown",
         action="store_true",
-        help="Run the pushdown pass on each OMP candidate DAG before benchmarking it",
+        help="Disable running the pushdown pass on each OMP candidate DAG before benchmarking it (enabled by default)",
     )
     parser.add_argument(
         "--enable",
@@ -438,6 +441,11 @@ def main():
         help="Search strategy HMP uses to select which VIEWs to materialize",
     )
     parser.add_argument(
+        "--hmp-no-pushdown",
+        action="store_true",
+        help="Disable running the pushdown pass on each HMP candidate DAG before benchmarking it (enabled by default)",
+    )
+    parser.add_argument(
         "--explain",
         metavar="DIR",
         help="Directory to write per-project optimizer explain HTML reports to",
@@ -477,7 +485,7 @@ def main():
         omp_top=args.omp_top,
         omp_node_centrality=args.omp_node_centrality,
         omp_exhaust=args.omp_exhaust,
-        omp_use_pushdown=args.omp_use_pushdown,
+        omp_no_pushdown=args.omp_no_pushdown,
         enable=args.enable,
         disable=args.disable,
         hmp_no_plan_dups=args.hmp_no_plan_dups,
@@ -487,6 +495,7 @@ def main():
         hmp_show_nodes=args.hmp_show_nodes,
         hmp_normalize_with_cardinality=args.hmp_normalize_with_cardinality,
         hmp_strategy=args.hmp_strategy,
+        hmp_no_pushdown=args.hmp_no_pushdown,
         explain_dir=args.explain,
     )
     visualize(results)

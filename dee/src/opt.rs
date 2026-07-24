@@ -94,6 +94,8 @@ where
     hmp_normalize_with_cardinality: bool,
     /// HMP: strategy for searching through the node ranking.
     hmp_strategy: HMPStrategy,
+    /// HMP: use pushdown before each candidate evaluation
+    hmp_use_pushdown: bool,
     /// Pushdown pass
     run_pushdown_pass: bool,
     /// Result stats
@@ -132,6 +134,7 @@ where
             hmp_show_nodes: config.hmp_show_nodes,
             hmp_normalize_with_cardinality: config.hmp_normalize_with_cardinality,
             hmp_strategy: config.hmp_strategy,
+            hmp_use_pushdown: config.hmp_use_pushdown,
             run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
             explain_enabled: config.explain,
@@ -164,6 +167,7 @@ where
         if self.run_hmp_pass {
             let mut pass: HMPPass<C, E> = HMPPass::new(
                 self.conn.clone(),
+                self.engine.clone(),
                 self.hmp_no_plan_dups,
                 self.hmp_max_runs,
                 self.hmp_top_cpu_time,
@@ -171,6 +175,7 @@ where
                 self.hmp_show_nodes.clone(),
                 self.hmp_normalize_with_cardinality,
                 self.hmp_strategy,
+                self.hmp_use_pushdown,
             );
             let res = pass.run(dag).await?;
             if self.explain_enabled {
@@ -248,6 +253,7 @@ pub struct OptimizerConfig {
     pub hmp_show_nodes: Option<String>,
     pub hmp_normalize_with_cardinality: bool,
     pub hmp_strategy: HMPStrategy,
+    pub hmp_use_pushdown: bool,
     pub run_pushdown_pass: bool,
     /// Collect an `Explain` HTML section from each pass during `run()`.
     pub explain: bool,
@@ -261,7 +267,7 @@ impl Default for OptimizerConfig {
             omp_top: None,
             omp_centrality: OMPCentrality::default(),
             omp_early_termination: true,
-            omp_use_pushdown: false,
+            omp_use_pushdown: true,
             hmp_no_plan_dups: false,
             hmp_max_runs: 1,
             hmp_top_cpu_time: 0.5,
@@ -269,6 +275,7 @@ impl Default for OptimizerConfig {
             hmp_show_nodes: None,
             hmp_normalize_with_cardinality: false,
             hmp_strategy: HMPStrategy::default(),
+            hmp_use_pushdown: true,
             run_pushdown_pass: false,
             explain: false,
         }
@@ -370,6 +377,11 @@ impl OptimizerConfig {
 
     pub fn with_hmp_strategy(mut self, strategy: HMPStrategy) -> Self {
         self.hmp_strategy = strategy;
+        self
+    }
+
+    pub fn with_hmp_use_pushdown(mut self, use_pushdown: bool) -> Self {
+        self.hmp_use_pushdown = use_pushdown;
         self
     }
 

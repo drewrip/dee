@@ -16,6 +16,7 @@ use crate::{
         Dag, Explain, OptimizerError, OptimizerPass,
         common::make_temp,
         explain::{render_bar_row, render_card_grid, render_ranked_table},
+        pushdown::PushdownPass,
     },
 };
 
@@ -39,6 +40,7 @@ where
     E: Executor<C> + Send + Sync,
 {
     conn: Arc<C>,
+    engine: Arc<E>,
     no_plan_dups: bool,
     /// Max number of DAG re-runs to spend searching for materialization
     /// candidates. Each attempted materialization (successful or not) costs
@@ -59,6 +61,9 @@ where
     normalize_with_cardinality: bool,
     /// Strategy for searching through the node ranking.
     strategy: HMPStrategy,
+    /// Run the PushdownPass before evaluating each candidate materialization
+    /// combination, for more accurate cost measurements.
+    use_pushdown: bool,
     /// Data collected during the last `run()`, used by `Explain::explain`.
     explain_data: Option<HMPExplainData>,
     _phantom: PhantomData<E>,
@@ -204,6 +209,7 @@ where
 {
     pub fn new(
         conn: Arc<C>,
+        engine: Arc<E>,
         no_plan_dups: bool,
         max_runs: usize,
         top_cpu_time: f64,
@@ -211,15 +217,18 @@ where
         show_nodes: Option<String>,
         normalize_with_cardinality: bool,
         strategy: HMPStrategy,
+        use_pushdown: bool,
     ) -> Self {
         Self {
             conn,
+            engine,
             no_plan_dups,
             max_runs: max_runs.max(1),
             show_operators,
             show_nodes,
             normalize_with_cardinality,
             strategy,
+            use_pushdown,
             top_cpu_time: if top_cpu_time > 0.0 && top_cpu_time <= 1.0 {
                 top_cpu_time
             } else {
@@ -679,6 +688,17 @@ where
                             continue;
                         }
 
+                        if self.use_pushdown {
+                            let mut pushdown_pass =
+                                PushdownPass::new(self.conn.clone(), self.engine.clone());
+                            if let Err(e) = pushdown_pass.run(&mut trial_dag).await {
+                                debug!(
+                                    "HMPPass: pushdown failed for combo {:?}, continuing without it: {e}",
+                                    combo
+                                );
+                            }
+                        }
+
                         debug!(
                             "Trying materialization combo {:?}, re-running DAG to measure impact",
                             combo
@@ -738,6 +758,17 @@ where
                             trial_combo
                         );
                         continue;
+                    }
+
+                    if self.use_pushdown {
+                        let mut pushdown_pass =
+                            PushdownPass::new(self.conn.clone(), self.engine.clone());
+                        if let Err(e) = pushdown_pass.run(&mut trial_dag).await {
+                            debug!(
+                                "HMPPass: pushdown failed for combo {:?}, continuing without it: {e}",
+                                trial_combo
+                            );
+                        }
                     }
 
                     debug!(
