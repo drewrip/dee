@@ -246,7 +246,7 @@ fn extract_pushdowns(plan: &LogicalPlan, source_id: &str) -> Option<(Vec<Expr>, 
                 .collect();
 
             // Translate the projection (column index list) into column names.
-            let cols: Vec<String> = match &ts.projection {
+            let mut cols: Vec<String> = match &ts.projection {
                 Some(indices) => {
                     let full_fields = ts.source.schema().fields().clone();
                     indices
@@ -257,6 +257,25 @@ fn extract_pushdowns(plan: &LogicalPlan, source_id: &str) -> Option<(Vec<Expr>, 
                 // No explicit projection → all columns needed.
                 None => vec![],
             };
+
+            // Because `OpaqueScanTable` declares `Exact` filter pushdown support,
+            // DataFusion folds predicates fully into `ts.filters` and does not
+            // require their referenced columns to remain in `ts.projection` (it
+            // trusts the provider to have applied the filter itself). If we
+            // don't add those columns back here, a predicate like `is_active`
+            // that isn't otherwise selected/joined-on can be pruned from the
+            // rewritten source's column list while the frontier's regenerated
+            // SQL still textually references it, producing an unresolvable
+            // column reference downstream.
+            if !cols.is_empty() {
+                for f in &filters {
+                    for col in f.column_refs() {
+                        if !cols.contains(&col.name) {
+                            cols.push(col.name.clone());
+                        }
+                    }
+                }
+            }
 
             Some((filters, cols))
         }
@@ -1486,6 +1505,78 @@ mod tests {
                     .any(|t| t.trim_matches(',') == "id"),
             "column `id` must not appear in the outer SELECT projection; got: {}",
             rewritten
+        );
+    }
+
+    // DAG layout:
+    //
+    //   source (View)
+    //       │
+    //   staging (TempTable)   SELECT id, region, amount, is_active FROM source
+    //       │
+    //   table_a (Table)   SELECT region, amount FROM staging WHERE is_active
+    //
+    // `is_active` is referenced only in the filter, never selected. Because
+    // `OpaqueScanTable` reports `Exact` filter pushdown, DataFusion folds the
+    // predicate fully into `TableScan.filters` and does not require
+    // `is_active` to remain in `TableScan.projection`. Naively deriving the
+    // pruned column set from the projection alone (ignoring the filter) would
+    // drop `is_active` from the rewritten `staging` query while `table_a`'s
+    // query text still references it — producing an unresolvable column
+    // reference. The pass must keep `is_active` in `staging`'s projection.
+    #[tokio::test]
+    async fn test_filter_only_column_survives_projection_pruning() {
+        use crate::dag::SourceNode;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("is_active", DataType::Boolean, false),
+        ]));
+
+        let source = node("source", "SELECT * FROM raw", MaterializeMode::View, &[]);
+        let staging = node(
+            "staging",
+            "SELECT id, region, amount, is_active FROM source",
+            MaterializeMode::TempTable,
+            &["source"],
+        );
+        let table_a = node(
+            "table_a",
+            "SELECT region, amount FROM staging WHERE is_active",
+            MaterializeMode::Table,
+            &["staging"],
+        );
+
+        let mut dag = make_dag(vec![source, staging, table_a]);
+        dag.sources = vec![SourceNode {
+            name: "raw".to_string(),
+            schema: Arc::clone(&schema),
+        }];
+        pass().run(&mut dag).await.expect("pass should succeed");
+
+        let rewritten_node = dag.nodes.get("staging".to_string()).unwrap();
+        let rewritten = rewritten_node.query_text.clone();
+
+        assert!(
+            rewritten.contains("is_active"),
+            "column `is_active` (referenced only by a pushed-down filter) must \
+             survive projection pruning in the rewritten TempTable query; got: {}",
+            rewritten
+        );
+
+        // The schema recorded for the TempTable must also retain the column,
+        // since that schema governs what the materialized table actually has.
+        let schema = rewritten_node
+            .schema
+            .as_ref()
+            .expect("pushdown should have recorded a schema for staging");
+        assert!(
+            schema.field_with_name("is_active").is_ok(),
+            "recorded schema for staging must include `is_active`; got fields: {:?}",
+            schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
         );
     }
 
