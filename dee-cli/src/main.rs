@@ -107,10 +107,18 @@ pub struct OptCommand {
     /// materialization that improves performance.
     #[arg(long, default_value = "breadth")]
     hmp_strategy: CliHMPStrategy,
+    /// Disable running the PushdownPass before evaluating each HMP
+    /// materialization candidate. Enabled by default for more accurate cost
+    /// measurements.
+    #[arg(long, action)]
+    hmp_no_pushdown: bool,
     #[arg(long, action)]
     omp_exhaust: bool,
+    /// Disable running the PushdownPass before evaluating each OMP
+    /// materialization candidate. Enabled by default for more accurate cost
+    /// measurements.
     #[arg(long, action)]
-    omp_use_pushdown: bool,
+    omp_no_pushdown: bool,
     /// Write an HTML report explaining what each enabled pass did and why.
     /// Pass a path to choose the output file, e.g. `--explain=out.html`;
     /// bare `--explain` writes to `explain.html`.
