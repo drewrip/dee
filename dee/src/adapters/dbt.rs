@@ -17,6 +17,7 @@ pub struct DbtMetadata {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DbtNode {
     pub unique_id: String,
+    pub resource_type: String,
     pub depends_on: DbtDependsOn,
     pub compiled_code: Option<String>,
     pub raw_code: Option<String>,
@@ -52,9 +53,13 @@ impl From<DbtManifest> for DagFile {
     fn from(manifest: DbtManifest) -> Self {
         let mut nodes = Vec::new();
 
-        // Map to keep track of unique_id to relation_name mapping for dependency resolution
+        // Map to keep track of unique_id to relation_name mapping for dependency resolution.
+        // Test nodes are excluded entirely since they aren't part of the data lineage.
         let mut id_to_rel = HashMap::new();
         for (id, node) in &manifest.nodes {
+            if node.resource_type == "test" {
+                continue;
+            }
             if let Some(rel) = &node.relation_name {
                 id_to_rel.insert(id.clone(), rel.clone());
             } else {
@@ -70,6 +75,10 @@ impl From<DbtManifest> for DagFile {
         }
 
         for (id, node) in &manifest.nodes {
+            if node.resource_type == "test" {
+                continue;
+            }
+
             let query_text = node
                 .compiled_code
                 .as_ref()
@@ -87,7 +96,13 @@ impl From<DbtManifest> for DagFile {
                 .depends_on
                 .nodes
                 .iter()
-                .filter(|dep_id| manifest.nodes.contains_key(*dep_id))
+                .filter(|dep_id| {
+                    manifest
+                        .nodes
+                        .get(*dep_id)
+                        .map(|n| n.resource_type != "test")
+                        .unwrap_or(false)
+                })
                 .map(|dep_id| {
                     id_to_rel
                         .get(dep_id)
