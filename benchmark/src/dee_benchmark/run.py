@@ -8,7 +8,13 @@ import argparse
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from .plot import plot_data, plot_deep_dive, plot_hmp_iterations, plot_omp_iterations
+from .plot import (
+    plot_data,
+    plot_deep_dive,
+    plot_hmp_iterations,
+    plot_omp_iterations,
+    plot_pushdown_comparison,
+)
 
 
 def run_cmd(cmd, cwd=None, env=None, capture=True):
@@ -105,6 +111,175 @@ def generate_connections_json(src_project_dir, dest_project_dir, requested_db_ty
     return str(connections_json_path), final_target
 
 
+def setup_project(project_name, dag_bench_root, tmp_bench_dir, dee_cli_path, db_type, max_mem=None, threads=None):
+    """Copy a project into tmp_bench_dir, dbt-compile it, convert its manifest
+    into a dee DAG, and generate a connections.json for it.
+
+    Returns a dict with `dest_project_path`, `dag_json_path`, `connections_json`,
+    and `target` on success, or `None` if the project couldn't be set up
+    (already printed a warning/error explaining why).
+    """
+    src_project_path = Path(dag_bench_root) / "projects" / project_name
+    dest_project_path = tmp_bench_dir / project_name
+
+    if not src_project_path.exists():
+        print(f"Error: Project {project_name} not found at {src_project_path}")
+        return None
+
+    shutil.copytree(src_project_path, dest_project_path)
+
+    # 1. dbt compile
+    dbt_target = "dev" if db_type == "duckdb" else "postgres"
+    run_cmd(["dbt", "compile", "--target", dbt_target], cwd=dest_project_path)
+
+    manifest_path = dest_project_path / "target" / "manifest.json"
+    dag_json_path = dest_project_path / "dag.json"
+
+    # 2. convert
+    run_cmd(
+        [
+            dee_cli_path,
+            "convert",
+            "--format",
+            "dbt",
+            "-o",
+            str(dag_json_path),
+            str(manifest_path),
+        ]
+    )
+
+    connections_json, target = generate_connections_json(
+        src_project_path, dest_project_path, db_type, max_mem=max_mem, threads=threads
+    )
+    if not connections_json:
+        print(
+            f"Warning: Could not generate connections.json for {project_name} with type {db_type}"
+        )
+        return None
+
+    return {
+        "dest_project_path": dest_project_path,
+        "dag_json_path": dag_json_path,
+        "connections_json": connections_json,
+        "target": target,
+    }
+
+
+def build_opt_cmd(
+    dee_cli_path,
+    connections_json,
+    target,
+    output_path,
+    dag_json_path,
+    stats=True,
+    omp_top=None,
+    omp_node_centrality=None,
+    omp_exhaust=False,
+    omp_no_pushdown=False,
+    enable=None,
+    disable=None,
+    hmp_no_plan_dups=False,
+    hmp_max_runs=None,
+    hmp_top_cpu_time=None,
+    hmp_show_operators=None,
+    hmp_show_nodes=None,
+    hmp_normalize_with_cardinality=False,
+    hmp_strategy=None,
+    hmp_no_pushdown=False,
+    explain_path=None,
+):
+    """Build a `dee-cli opt` command line from the optimizer knobs shared by
+    both the standard single-DAG benchmark and the pushdown A/B comparison."""
+    opt_cmd = [
+        dee_cli_path,
+        "opt",
+        "--connections",
+        connections_json,
+        "--target",
+        target,
+        "-o",
+        str(output_path),
+        str(dag_json_path),
+    ]
+    if stats:
+        opt_cmd.insert(2, "--stats")
+    if omp_top:
+        opt_cmd.extend(["--omp-top", str(omp_top)])
+    if omp_node_centrality:
+        opt_cmd.extend(["--omp-node-centrality", omp_node_centrality])
+    if omp_exhaust:
+        opt_cmd.append("--omp-exhaust")
+    if omp_no_pushdown:
+        opt_cmd.append("--omp-no-pushdown")
+    if enable:
+        opt_cmd.extend(["--enable", enable])
+    if disable:
+        opt_cmd.extend(["--disable", disable])
+    if hmp_no_plan_dups:
+        opt_cmd.append("--hmp-no-plan-dups")
+    if hmp_max_runs:
+        opt_cmd.extend(["--hmp-max-runs", str(hmp_max_runs)])
+    if hmp_top_cpu_time is not None:
+        opt_cmd.extend(["--hmp-top-cpu-time", str(hmp_top_cpu_time)])
+    if hmp_show_operators is not None:
+        if hmp_show_operators:
+            opt_cmd.extend(["--hmp-show-operators", hmp_show_operators])
+        else:
+            opt_cmd.append("--hmp-show-operators")
+    if hmp_show_nodes is not None:
+        if hmp_show_nodes:
+            opt_cmd.extend(["--hmp-show-nodes", hmp_show_nodes])
+        else:
+            opt_cmd.append("--hmp-show-nodes")
+    if hmp_normalize_with_cardinality:
+        opt_cmd.append("--hmp-normalize-with-cardinality")
+    if hmp_strategy:
+        opt_cmd.extend(["--hmp-strategy", hmp_strategy])
+    if hmp_no_pushdown:
+        opt_cmd.append("--hmp-no-pushdown")
+    if explain_path:
+        opt_cmd.append(f"--explain={explain_path}")
+    return opt_cmd
+
+
+def run_multiple_times(dee_cli_path, connections_json, target, dag_path, iterations):
+    """Run a DAG `iterations` times (plus a ~10% warmup fraction that isn't
+    timed), returning the wall-clock seconds for each timed run."""
+    warmup_iters = int(iterations * 0.1)
+    if warmup_iters > 0:
+        print(f"  Running {warmup_iters} warmup iterations...")
+        for _ in range(warmup_iters):
+            run_cmd(
+                [
+                    dee_cli_path,
+                    "run",
+                    "--connections",
+                    connections_json,
+                    "--target",
+                    target,
+                    str(dag_path),
+                ]
+            )
+
+    times = []
+    for i in range(iterations):
+        print(f"  Iteration {i + 1}/{iterations}...")
+        start = time.time()
+        run_cmd(
+            [
+                dee_cli_path,
+                "run",
+                "--connections",
+                connections_json,
+                "--target",
+                target,
+                str(dag_path),
+            ]
+        )
+        times.append(time.time() - start)
+    return times
+
+
 def benchmark(
     config_file,
     dag_bench_root,
@@ -143,146 +318,61 @@ def benchmark(
 
     for project_name in projects_to_run:
         print(f"\n--- Benchmarking Project: {project_name} ---")
-        src_project_path = Path(dag_bench_root) / "projects" / project_name
-        dest_project_path = tmp_bench_dir / project_name
 
-        if not src_project_path.exists():
-            print(f"Error: Project {project_name} not found at {src_project_path}")
+        setup = setup_project(
+            project_name, dag_bench_root, tmp_bench_dir, dee_cli_path, db_type,
+            max_mem=max_mem, threads=threads,
+        )
+        if not setup:
             continue
 
-        shutil.copytree(src_project_path, dest_project_path)
-
-        # 1. dbt compile
-        dbt_target = "dev" if db_type == "duckdb" else "postgres"
-        run_cmd(["dbt", "compile", "--target", dbt_target], cwd=dest_project_path)
-
-        manifest_path = dest_project_path / "target" / "manifest.json"
-
-        dag_json_path = dest_project_path / "dag.json"
+        dest_project_path = setup["dest_project_path"]
+        dag_json_path = setup["dag_json_path"]
+        connections_json = setup["connections_json"]
+        target = setup["target"]
         opt_dag_json_path = dest_project_path / "dag_opt.json"
-
-        # 2. convert
-        run_cmd(
-            [
-                dee_cli_path,
-                "convert",
-                "--format",
-                "dbt",
-                "-o",
-                str(dag_json_path),
-                str(manifest_path),
-            ]
-        )
-
-        connections_json, target = generate_connections_json(
-            src_project_path, dest_project_path, db_type, max_mem=max_mem, threads=threads
-        )
-        if not connections_json:
-            print(
-                f"Warning: Could not generate connections.json for {project_name} with type {db_type}"
-            )
-            continue
 
         # 3. optimize
         print(f"Optimizing DAG for {project_name}...")
-        opt_cmd = [
-            dee_cli_path,
-            "opt",
-            "--stats",
-            "--connections",
-            connections_json,
-            "--target",
-            target,
-            "-o",
-            str(opt_dag_json_path),
-            str(dag_json_path),
-        ]
-        if omp_top:
-            opt_cmd.extend(["--omp-top", str(omp_top)])
-        if omp_node_centrality:
-            opt_cmd.extend(["--omp-node-centrality", omp_node_centrality])
-        if omp_exhaust:
-            opt_cmd.append("--omp-exhaust")
-        if omp_no_pushdown:
-            opt_cmd.append("--omp-no-pushdown")
-        if enable:
-            opt_cmd.extend(["--enable", enable])
-        if disable:
-            opt_cmd.extend(["--disable", disable])
-        if hmp_no_plan_dups:
-            opt_cmd.append("--hmp-no-plan-dups")
-        if hmp_max_runs:
-            opt_cmd.extend(["--hmp-max-runs", str(hmp_max_runs)])
-        if hmp_top_cpu_time is not None:
-            opt_cmd.extend(["--hmp-top-cpu-time", str(hmp_top_cpu_time)])
-        if hmp_show_operators is not None:
-            if hmp_show_operators:
-                opt_cmd.extend(["--hmp-show-operators", hmp_show_operators])
-            else:
-                opt_cmd.append("--hmp-show-operators")
-        if hmp_show_nodes is not None:
-            if hmp_show_nodes:
-                opt_cmd.extend(["--hmp-show-nodes", hmp_show_nodes])
-            else:
-                opt_cmd.append("--hmp-show-nodes")
-        if hmp_normalize_with_cardinality:
-            opt_cmd.append("--hmp-normalize-with-cardinality")
-        if hmp_strategy:
-            opt_cmd.extend(["--hmp-strategy", hmp_strategy])
-        if hmp_no_pushdown:
-            opt_cmd.append("--hmp-no-pushdown")
+        explain_path = None
         if explain_dir:
             explain_dir_path = Path(explain_dir)
             explain_dir_path.mkdir(parents=True, exist_ok=True)
-            opt_cmd.append(
-                f"--explain={explain_dir_path / f'{project_name}.html'}"
-            )
+            explain_path = explain_dir_path / f"{project_name}.html"
+
+        opt_cmd = build_opt_cmd(
+            dee_cli_path,
+            connections_json,
+            target,
+            opt_dag_json_path,
+            dag_json_path,
+            omp_top=omp_top,
+            omp_node_centrality=omp_node_centrality,
+            omp_exhaust=omp_exhaust,
+            omp_no_pushdown=omp_no_pushdown,
+            enable=enable,
+            disable=disable,
+            hmp_no_plan_dups=hmp_no_plan_dups,
+            hmp_max_runs=hmp_max_runs,
+            hmp_top_cpu_time=hmp_top_cpu_time,
+            hmp_show_operators=hmp_show_operators,
+            hmp_show_nodes=hmp_show_nodes,
+            hmp_normalize_with_cardinality=hmp_normalize_with_cardinality,
+            hmp_strategy=hmp_strategy,
+            hmp_no_pushdown=hmp_no_pushdown,
+            explain_path=explain_path,
+        )
 
         opt_stats_json = run_cmd(opt_cmd)
         opt_stats = json.loads(opt_stats_json)
-
-        def run_multiple_times(dag_path, iterations):
-            warmup_iters = int(iterations * 0.1)
-            if warmup_iters > 0:
-                print(f"  Running {warmup_iters} warmup iterations...")
-                for _ in range(warmup_iters):
-                    run_cmd(
-                        [
-                            dee_cli_path,
-                            "run",
-                            "--connections",
-                            connections_json,
-                            "--target",
-                            target,
-                            str(dag_path),
-                        ]
-                    )
-
-            times = []
-            for i in range(iterations):
-                print(f"  Iteration {i + 1}/{iterations}...")
-                start = time.time()
-                run_cmd(
-                    [
-                        dee_cli_path,
-                        "run",
-                        "--connections",
-                        connections_json,
-                        "--target",
-                        target,
-                        str(dag_path),
-                    ]
-                )
-                times.append(time.time() - start)
-            return times
 
         num_iters = n if deep_dive else 1
         print(
             f"Running {num_iters} iteration(s) for original and optimized versions..."
         )
 
-        original_times = run_multiple_times(dag_json_path, num_iters)
-        optimized_times = run_multiple_times(opt_dag_json_path, num_iters)
+        original_times = run_multiple_times(dee_cli_path, connections_json, target, dag_json_path, num_iters)
+        optimized_times = run_multiple_times(dee_cli_path, connections_json, target, opt_dag_json_path, num_iters)
 
         original_time = sum(original_times) / num_iters
         optimized_time = sum(optimized_times) / num_iters
@@ -299,6 +389,116 @@ def benchmark(
             result["original_distribution"] = original_times
             result["optimized_distribution"] = optimized_times
 
+        results.append(result)
+
+    return results
+
+
+def benchmark_pushdown_comparison(
+    config_file,
+    dag_bench_root,
+    dee_cli_path,
+    db_type,
+    n=5,
+    max_mem=None,
+    threads=None,
+    hmp_no_plan_dups=False,
+    hmp_max_runs=None,
+    hmp_top_cpu_time=None,
+    hmp_normalize_with_cardinality=False,
+    hmp_strategy=None,
+    regression_tolerance=0.02,
+):
+    """A/B benchmark: for every project in `config_file`, run HMP alone and
+    HMP+pushdown, then execute *both* resulting DAGs `n` times each (plus a
+    warmup fraction) to get a stable read on whether pushdown actually helps.
+
+    Both optimizer runs share the exact same HMP settings — the only
+    difference between them is whether the pushdown pass also runs — so any
+    runtime difference is attributable to pushdown itself, not to HMP making
+    a different materialization choice.
+    """
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+
+    projects_to_run = config.get("projects", [])
+    results = []
+
+    tmp_bench_dir = Path("tmp_projects_pushdown_compare")
+    if tmp_bench_dir.exists():
+        shutil.rmtree(tmp_bench_dir)
+    tmp_bench_dir.mkdir(parents=True)
+
+    for project_name in projects_to_run:
+        print(f"\n--- Comparing pushdown for Project: {project_name} ---")
+
+        setup = setup_project(
+            project_name, dag_bench_root, tmp_bench_dir, dee_cli_path, db_type,
+            max_mem=max_mem, threads=threads,
+        )
+        if not setup:
+            continue
+
+        dest_project_path = setup["dest_project_path"]
+        dag_json_path = setup["dag_json_path"]
+        connections_json = setup["connections_json"]
+        target = setup["target"]
+
+        hmp_only_dag_path = dest_project_path / "dag_hmp.json"
+        hmp_pushdown_dag_path = dest_project_path / "dag_hmp_pushdown.json"
+
+        hmp_kwargs = dict(
+            hmp_no_plan_dups=hmp_no_plan_dups,
+            hmp_max_runs=hmp_max_runs,
+            hmp_top_cpu_time=hmp_top_cpu_time,
+            hmp_normalize_with_cardinality=hmp_normalize_with_cardinality,
+            hmp_strategy=hmp_strategy,
+        )
+
+        print(f"Optimizing {project_name} with HMP only (no pushdown)...")
+        hmp_only_stats = json.loads(run_cmd(build_opt_cmd(
+            dee_cli_path, connections_json, target, hmp_only_dag_path, dag_json_path,
+            enable="hmp", **hmp_kwargs,
+        )))
+
+        print(f"Optimizing {project_name} with HMP + pushdown...")
+        hmp_pushdown_stats = json.loads(run_cmd(build_opt_cmd(
+            dee_cli_path, connections_json, target, hmp_pushdown_dag_path, dag_json_path,
+            enable="hmp,pushdown", **hmp_kwargs,
+        )))
+
+        print(f"Running {n} iteration(s) for HMP-only and HMP+pushdown DAGs...")
+        hmp_only_times = run_multiple_times(dee_cli_path, connections_json, target, hmp_only_dag_path, n)
+        hmp_pushdown_times = run_multiple_times(dee_cli_path, connections_json, target, hmp_pushdown_dag_path, n)
+
+        hmp_only_arr = np.array(hmp_only_times)
+        hmp_pushdown_arr = np.array(hmp_pushdown_times)
+
+        hmp_only_mean = hmp_only_arr.mean()
+        hmp_pushdown_mean = hmp_pushdown_arr.mean()
+        speedup = hmp_only_mean / hmp_pushdown_mean if hmp_pushdown_mean > 0 else 0
+
+        # A speedup below (1 - tolerance) means pushdown made this project's
+        # DAG measurably *slower* than HMP alone — the one outcome pushdown
+        # should never produce, so flag it plainly rather than let it hide
+        # in an average.
+        is_regression = speedup < (1 - regression_tolerance)
+
+        result = {
+            "project": project_name,
+            "hmp_only_time": hmp_only_mean,
+            "hmp_pushdown_time": hmp_pushdown_mean,
+            "hmp_only_median": float(np.median(hmp_only_arr)),
+            "hmp_pushdown_median": float(np.median(hmp_pushdown_arr)),
+            "hmp_only_std": float(hmp_only_arr.std()),
+            "hmp_pushdown_std": float(hmp_pushdown_arr.std()),
+            "speedup": speedup,
+            "is_regression": bool(is_regression),
+            "hmp_only_distribution": hmp_only_times,
+            "hmp_pushdown_distribution": hmp_pushdown_times,
+            "hmp_only_stats": hmp_only_stats,
+            "hmp_pushdown_stats": hmp_pushdown_stats,
+        }
         results.append(result)
 
     return results
@@ -333,6 +533,40 @@ def visualize(results):
     plot_data(results, plot_path)
 
 
+def visualize_pushdown_comparison(results):
+    if not results:
+        print("No results to visualize.")
+        return
+
+    df = pd.DataFrame(results)
+    print("\nPushdown A/B Comparison Results:")
+    cols = ["project", "hmp_only_time", "hmp_pushdown_time", "speedup", "is_regression"]
+    print(df[cols].to_string())
+
+    print("\nPer-project distributions:")
+    for r in results:
+        print(f"Project {r['project']}:")
+        for label, key in [
+            ("HMP only", "hmp_only_distribution"),
+            ("HMP + pushdown", "hmp_pushdown_distribution"),
+        ]:
+            arr = np.array(r[key])
+            print(
+                f"  {label}: mean={arr.mean():.4f}s, median={np.median(arr):.4f}s, "
+                f"min={arr.min():.4f}s, max={arr.max():.4f}s, std={arr.std():.4f}s"
+            )
+
+    regressions = [r["project"] for r in results if r["is_regression"]]
+    if regressions:
+        print(
+            f"\nWARNING: pushdown made these projects SLOWER than HMP alone: {regressions}"
+        )
+    else:
+        print("\nPushdown never made any project slower than HMP alone.")
+
+    plot_pushdown_comparison(results, "pushdown_comparison.png")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to yaml config file")
@@ -348,10 +582,29 @@ def main():
         help="Run optimized and original versions multiple times to compare distributions",
     )
     parser.add_argument(
+        "--compare-pushdown",
+        action="store_true",
+        help=(
+            "Run a separate A/B benchmark comparing HMP alone vs HMP+pushdown for every "
+            "project in --config, each run --n times for a stable comparison. Ignores "
+            "--enable/--disable/--omp-*/--deep-dive."
+        ),
+    )
+    parser.add_argument(
         "--n",
         type=int,
         default=5,
-        help="Number of iterations per version when --deep-dive is enabled",
+        help="Number of iterations per version when --deep-dive or --compare-pushdown is enabled",
+    )
+    parser.add_argument(
+        "--regression-tolerance",
+        type=float,
+        default=0.02,
+        help=(
+            "Fractional tolerance (default 0.02 = 2%%) below which HMP+pushdown being "
+            "slower than HMP alone is treated as noise rather than a real regression. "
+            "Only used with --compare-pushdown."
+        ),
     )
     parser.add_argument(
         "--max-mem",
@@ -472,6 +725,30 @@ def main():
             f"Error: dee-cli not found at {dee_cli}. Please build the project or set DEE_PATH."
         )
         exit(1)
+
+    if args.compare_pushdown:
+        results = benchmark_pushdown_comparison(
+            args.config,
+            dag_bench,
+            dee_cli,
+            args.db_type,
+            n=max(args.n, 2),
+            max_mem=args.max_mem,
+            threads=args.threads,
+            hmp_no_plan_dups=args.hmp_no_plan_dups,
+            hmp_max_runs=args.hmp_max_runs,
+            hmp_top_cpu_time=args.hmp_top_cpu_time,
+            hmp_normalize_with_cardinality=args.hmp_normalize_with_cardinality,
+            hmp_strategy=args.hmp_strategy,
+            regression_tolerance=args.regression_tolerance,
+        )
+        visualize_pushdown_comparison(results)
+
+        results_path = Path("pushdown_comparison_results.json")
+        with open(results_path, "w") as f:
+            json.dump(results, f, indent=4)
+        print(f"Results saved to {results_path.absolute()}")
+        return
 
     results = benchmark(
         args.config,

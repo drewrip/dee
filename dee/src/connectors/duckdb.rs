@@ -64,6 +64,11 @@ fn collect_scan_pushdowns(node: &ExplainNode, out: &mut HashMap<String, Pushdown
             }
         }
         for f in &node.extra_info.filters {
+            // DuckDB reports internal runtime filters (e.g. "optional: Dynamic
+            // Filter (overall_rank)") that aren't real predicates to push down.
+            if f.starts_with("optional:") {
+                continue;
+            }
             if !entry.filters.contains(f) {
                 entry.filters.push(f.clone());
             }
