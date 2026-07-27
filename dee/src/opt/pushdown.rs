@@ -1,24 +1,13 @@
 use async_trait::async_trait;
-use datafusion::{
-    arrow::datatypes::SchemaRef,
-    catalog::Session,
-    common::{
-        Column, TableReference,
-        tree_node::{Transformed, TreeNode},
-    },
-    datasource::{TableProvider, empty::EmptyTable, view::ViewTable},
-    logical_expr::{
-        Expr, LogicalPlan, TableProviderFilterPushDown, TableType,
-        utils::{conjunction, disjunction},
-    },
-    physical_plan::ExecutionPlan,
-    prelude::SessionContext,
-    sql::unparser::Unparser,
-};
+use duckdb::arrow::datatypes::SchemaRef;
 use log::{debug, trace, warn};
+use polyglot_sql::{
+    dialects::DialectType,
+    expressions::{Expression, Null, Select},
+    traversal::ExpressionWalk,
+};
 use std::{
     collections::{HashMap, HashSet},
-    marker::PhantomData,
     sync::Arc,
 };
 
@@ -26,187 +15,17 @@ use crate::{
     connectors::Connector,
     dag::MaterializeMode,
     executor::Executor,
-    opt::common::{
-        build_opaque_context, create_logical_plan_with_stubs, dialect_for_db, is_transitive_dep,
-        register_table_any, validate,
-    },
+    opt::common::dialect_for_db,
     opt::{
         Dag, Explain, OptimizerError, OptimizerPass,
         explain::{render_card_grid, render_ranked_table},
     },
 };
 
-/// A schema-only [`TableProvider`] that declares `Exact` filter pushdown
-/// support for every predicate.
-///
-/// Registering the TempTable under analysis with this provider causes
-/// DataFusion's optimizer to push both filter predicates AND column projections
-/// directly into the [`TableScan`](datafusion::logical_expr::LogicalPlan::TableScan)
-/// node rather than leaving them as separate plan nodes above the scan.  We
-/// can then read `TableScan.filters` and `TableScan.projection` to recover
-/// exactly what would be pushed down to the TempTable.
-#[derive(Debug)]
-pub(crate) struct OpaqueScanTable {
-    schema: SchemaRef,
-}
-
-impl OpaqueScanTable {
-    pub(crate) fn new(schema: SchemaRef) -> Self {
-        Self { schema }
-    }
-}
-
-#[async_trait]
-impl TableProvider for OpaqueScanTable {
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
-        // Declare every predicate as Exact so DataFusion moves filters fully
-        // into TableScan.filters and removes the Filter nodes above the scan.
-        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        // Schema-only table — delegate to EmptyTable for the execution plan.
-        EmptyTable::new(Arc::clone(&self.schema))
-            .scan(_state, projection, _filters, _limit)
-            .await
-    }
-}
-
-/// Inline the SQL query of `source` (a View node) into `target` (a Table or
-/// TempTable node), returning the DataFusion [`LogicalPlan`] for `target` with
-/// every reference to `source` replaced by `source`'s own query.
-///
-/// Steps:
-/// 1. Build a [`SessionContext`] and register each DAG source table with its
-///    Arrow schema so the planner has type information.
-/// 2. Walk the DAG in topological order, registering every node that `target`
-///    transitively depends on as a [`ViewTable`] (backed by the node's planned
-///    [`LogicalPlan`]).  This means `source` is registered as a view whose
-///    definition is its own `query_text`.
-/// 3. Parse and plan `target`'s `query_text`.  DataFusion resolves the
-///    `source` reference through the catalog and folds the view definition
-///    inline, giving back a fully-inlined [`LogicalPlan`].
-pub async fn inline<C>(
-    dag: &Dag,
-    source: &str,
-    target: &str,
-    conn: &C,
-) -> Result<LogicalPlan, OptimizerError>
-where
-    C: Connector + Send + Sync,
-{
-    let target_node = dag
-        .nodes
-        .get(target.to_string())
-        .ok_or_else(|| OptimizerError::Exec(format!("target node '{target}' not found")))?;
-
-    // Verify that `source` exists and is reachable from `target`.
-    if dag.nodes.get(source.to_string()).is_none() {
-        return Err(OptimizerError::Exec(format!(
-            "source node '{source}' not found"
-        )));
-    }
-    if !is_transitive_dep(dag, target, source) {
-        return Err(OptimizerError::Exec(format!(
-            "source node '{source}' is not a transitive dependency of target '{target}'"
-        )));
-    }
-
-    let ctx = SessionContext::new();
-
-    // Register every DAG source (raw tables) with its schema so that the
-    // planner can resolve column types when building logical plans.
-    for src in &dag.sources {
-        register_table_any(
-            &ctx,
-            &src.name,
-            Arc::new(EmptyTable::new(Arc::clone(&src.schema))),
-        )?;
-    }
-
-    // Walk nodes in topological order and register each one that `target`
-    // transitively depends on as a ViewTable.  We stop after registering
-    // `source` — nodes that `target` doesn't depend on are irrelevant.
-    let topo = dag.nodes.topological_sort();
-    for node_id in &topo {
-        if node_id == target {
-            break;
-        }
-
-        let node = match dag.nodes.get(node_id.clone()) {
-            Some(n) => n,
-            None => continue,
-        };
-
-        // Skip nodes that are not in `target`'s transitive dependency set.
-        if !is_transitive_dep(dag, target, node_id) {
-            continue;
-        }
-
-        // If the connector can provide a schema for this node (it has already
-        // been materialized as a table/temp table), prefer that so the planner
-        // gets accurate types.  Otherwise fall back to planning the SQL text.
-        let plan = if matches!(
-            node.materialize,
-            MaterializeMode::Table | MaterializeMode::TempTable
-        ) {
-            if let Some(Ok(schema)) = conn.get_schema(node_id.clone()).await {
-                register_table_any(&ctx, node_id, Arc::new(EmptyTable::new(schema)))?;
-                continue;
-            } else {
-                create_logical_plan_with_stubs(&ctx, &node.query_text)
-                    .await
-                    .map_err(|e| {
-                        OptimizerError::Exec(format!("failed to plan node '{node_id}': {e}"))
-                    })?
-            }
-        } else {
-            create_logical_plan_with_stubs(&ctx, &node.query_text)
-                .await
-                .map_err(|e| {
-                    OptimizerError::Exec(format!("failed to plan node '{node_id}': {e}"))
-                })?
-        };
-
-        register_table_any(
-            &ctx,
-            node_id,
-            Arc::new(ViewTable::new(plan, Some(node.query_text.clone()))),
-        )?;
-    }
-
-    // Plan `target`'s query.  DataFusion resolves the `source` reference
-    // through the catalog and folds the view definition inline automatically.
-    create_logical_plan_with_stubs(&ctx, &target_node.query_text)
-        .await
-        .map_err(|e| OptimizerError::Exec(format!("failed to plan target '{target}': {e}")))
-}
-
 /// Extract the bare (unquoted, unqualified) table name from a node ID that may
 /// be a one-, two-, or three-part quoted identifier such as
 /// `"warehouse"."main"."stg_accounts"`.
-///
-/// Used to produce a safe SQL alias when falling back to text-based subquery
-/// inlining inside [`graph_minor`].
 fn bare_table_name(node_id: &str) -> String {
-    // Split on `.` and take the last segment, then strip surrounding `"`.
     node_id
         .split('.')
         .last()
@@ -216,153 +35,486 @@ fn bare_table_name(node_id: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// pushdown helpers
+// Dead-column elimination
+//
+// When a TempTable's rewritten schema is pruned to only the columns a
+// downstream frontier query actually needs, that frontier's own SQL text can
+// still contain a *nested* subquery selecting extra columns from the
+// TempTable that were never propagated further up (e.g. `SELECT x.a FROM
+// (SELECT a, b, c FROM staging) x` — `b`/`c` are dead beyond that subquery).
+// If we don't also prune those references, the frontier's own SQL breaks at
+// bind time once the TempTable no longer physically has those columns.
+//
+// This targets exactly that case: for every *nested* SELECT (never the
+// outermost statement — its own projection list is the frontier's real
+// output, not a "dead" intermediate) whose FROM clause is a single, unjoined
+// reference to `source`, prune its projection list down to `keep` (the
+// authoritative column set computed from the connector's pushdown analysis).
 // ---------------------------------------------------------------------------
 
-/// Walk an optimized [`LogicalPlan`] tree and extract the filter predicates and
-/// projected-column names from the [`TableScan`] node for `source_id`.
+/// Return the name of the *physical source column* a SELECT-list item reads,
+/// if and only if that item is a plain pass-through column reference —
+/// `Expression::Column`, or `Expression::Alias` wrapping one (e.g. `a AS
+/// foo`, which still reads physical column `a`; the rename is preserved,
+/// only the keep/drop decision is based on `a`).
 ///
-/// Because the opaque TempTable is registered with [`OpaqueScanTable`] which
-/// declares `Exact` filter pushdown support, DataFusion's optimizer moves all
-/// predicate and projection information directly into the `TableScan` node.
-/// We therefore read only from there — no need to collect filters from
-/// surrounding `Filter` nodes in the tree.
-///
-/// Returns `Some((filters, projected_column_names))` when the scan is found,
-/// `None` otherwise.
-fn extract_pushdowns(plan: &LogicalPlan, source_id: &str) -> Option<(Vec<Expr>, Vec<String>)> {
-    match plan {
-        // Target scan found — read filters and projection directly from it.
-        // Use resolved_eq so that a fully-qualified node ID like
-        // `"warehouse"."main"."account_health"` matches a TableScan whose
-        // table_name was parsed as Full { catalog, schema, table }.
-        LogicalPlan::TableScan(ts)
-            if ts.table_name.resolved_eq(&TableReference::from(source_id)) =>
-        {
-            let filters: Vec<Expr> = ts
-                .filters
-                .iter()
-                .flat_map(|f| split_conjunction(f))
-                .collect();
-
-            // Translate the projection (column index list) into column names.
-            let mut cols: Vec<String> = match &ts.projection {
-                Some(indices) => {
-                    let full_fields = ts.source.schema().fields().clone();
-                    indices
-                        .iter()
-                        .filter_map(|&i| full_fields.get(i).map(|f| f.name().clone()))
-                        .collect()
-                }
-                // No explicit projection → all columns needed.
-                None => vec![],
-            };
-
-            // Because `OpaqueScanTable` declares `Exact` filter pushdown support,
-            // DataFusion folds predicates fully into `ts.filters` and does not
-            // require their referenced columns to remain in `ts.projection` (it
-            // trusts the provider to have applied the filter itself). If we
-            // don't add those columns back here, a predicate like `is_active`
-            // that isn't otherwise selected/joined-on can be pruned from the
-            // rewritten source's column list while the frontier's regenerated
-            // SQL still textually references it, producing an unresolvable
-            // column reference downstream.
-            if !cols.is_empty() {
-                for f in &filters {
-                    for col in f.column_refs() {
-                        if !cols.contains(&col.name) {
-                            cols.push(col.name.clone());
-                        }
-                    }
-                }
-            }
-
-            Some((filters, cols))
-        }
-
-        // Recurse into every input branch, accumulating across all matches.
-        // A single query can reference the same table more than once (self-join,
-        // UNION, CTE expanded twice), producing multiple TableScan nodes for
-        // the same source_id.  find_map would silently drop all but the first.
-        other => {
-            let mut all_filters: Vec<Expr> = vec![];
-            let mut all_cols: Vec<String> = vec![];
-            let mut found = false;
-            for child in other.inputs() {
-                if let Some((filters, cols)) = extract_pushdowns(child, source_id) {
-                    all_filters.extend(filters);
-                    all_cols.extend(cols);
-                    found = true;
-                }
-            }
-            if found {
-                Some((all_filters, all_cols))
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// Split a possibly-conjunctive [`Expr`] into its individual AND clauses.
-fn split_conjunction(expr: &Expr) -> Vec<Expr> {
+/// Returns `None` for anything else — computed expressions, aggregates,
+/// function calls, `CASE`, `*`, literals, ... — which are always left
+/// untouched: `keep`/`required_cols` only ever contains `source`'s own
+/// physical column names, so testing a *computed* column's output alias
+/// (e.g. `mean_temp` in `avg(avg_temp) AS mean_temp`) against that set would
+/// almost always miss and wrongly drop it.
+fn column_output_name(expr: &Expression) -> Option<String> {
     match expr {
-        Expr::BinaryExpr(b) if matches!(b.op, datafusion::logical_expr::Operator::And) => {
-            let mut parts = split_conjunction(&b.left);
-            parts.extend(split_conjunction(&b.right));
-            parts
-        }
-        other => vec![other.clone()],
+        Expression::Column(col) => Some(col.name.name.clone()),
+        Expression::Alias(alias) => match &alias.this {
+            Expression::Column(col) => Some(col.name.name.clone()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
-/// Strips table qualifiers from every `Column` reference inside `expr`.
-///
-/// The optimizer emits predicates like `staging.region = 'US'`; when we
-/// re-apply those predicates to `source`'s own base plan (whose output columns
-/// are unqualified or carry a different qualifier) the planner would reject the
-/// expression.  Removing the qualifier makes the column name resolve against
-/// whatever relation is in scope.
-fn strip_table_qualifier(expr: Expr) -> Expr {
-    expr.transform_down(|e| match e {
-        Expr::Column(col) => Ok(Transformed::yes(Expr::Column(Column::from_name(col.name)))),
-        other => Ok(Transformed::no(other)),
-    })
-    // transform_down is infallible here; unwrap is safe.
-    .unwrap()
-    .data
+/// `true` if any of `select`'s own SELECT-list items is a `*`/`table.*` star.
+fn select_has_star(select: &Select) -> bool {
+    select
+        .expressions
+        .iter()
+        .any(|e| matches!(e, Expression::Star(_)))
 }
 
-/// Pushes down predicates and projections from the frontier materializing nodes
-/// into the TempTable node `source`, returning the rewritten SQL for `source`.
+/// `true` if `select` has exactly one, unjoined FROM source and that source
+/// is a direct reference to `bare_source` — the only shape this pass will
+/// prune, so it never has to reason about join ambiguity or DISTINCT/`*`.
+fn is_single_unjoined_source(select: &Select, bare_source: &str) -> bool {
+    if !select.joins.is_empty() || select.distinct || select.distinct_on.is_some() {
+        return false;
+    }
+    if select_has_star(select) {
+        return false;
+    }
+    match &select.from {
+        Some(from) if from.expressions.len() == 1 => matches!(
+            &from.expressions[0],
+            Expression::Table(t) if t.name.name.eq_ignore_ascii_case(bare_source)
+        ),
+        _ => false,
+    }
+}
+
+/// `true` if any of `select`'s FROM/JOIN targets is a direct reference to
+/// `bare_source` (regardless of how many other sources/joins are present).
+fn select_scans_source(select: &Select, bare_source: &str) -> bool {
+    let is_match = |e: &Expression| matches!(e, Expression::Table(t) if t.name.name.eq_ignore_ascii_case(bare_source));
+    select
+        .from
+        .as_ref()
+        .map(|f| f.expressions.iter().any(is_match))
+        .unwrap_or(false)
+        || select.joins.iter().any(|j| is_match(&j.this))
+}
+
+/// Every column `select` references *outside* of a bare pass-through
+/// select-list position — i.e. inside WHERE/GROUP BY/HAVING/ORDER BY/JOIN-ON,
+/// or inside a select-list item that computes something (an aggregate,
+/// function call, arithmetic, `CASE`, ...) rather than just reading a column
+/// straight through. [`prune_dead_source_columns`] only ever rewrites bare
+/// pass-through select-list items (see `column_output_name`) — everywhere
+/// else is always left exactly as written, so every column referenced there
+/// must always survive pruning of `source`'s own schema.
+fn columns_needed_regardless(select: &Select) -> HashSet<String> {
+    let mut trimmed = select.clone();
+    trimmed
+        .expressions
+        .retain(|e| column_output_name(e).is_none());
+    polyglot_sql::ast_transforms::get_column_names(&Expression::Select(Box::new(trimmed)))
+        .into_iter()
+        .collect()
+}
+
+/// Return every column name referenced by a scan of `source` in `sql` that
+/// [`prune_dead_source_columns`] will *not* rewrite. These columns must
+/// survive projection pruning of `source` even if the connector's own
+/// analysis reports them as unused overall, since we won't touch the text
+/// that still references them. Two cases:
 ///
-/// For each node in `frontier_materializes(source)`:
-/// 1. The DataFusion logical optimizer is run on that node's plan (with
-///    `source` registered as an opaque scan so the optimizer surfaces any
-///    predicates/projections it can push into `source`).
-/// 2. Filter predicates adjacent to the `source` scan are collected and
-///    combined across all frontier nodes with a logical **OR**.
-/// 3. Projected columns are collected and **unioned** across all frontier
-///    nodes (so every consumer's required columns are present).
+/// - A select eligible for pruning (single, unjoined, no `DISTINCT`/`*`):
+///   only its bare pass-through select-list items are actually subject to
+///   the prune/keep decision (see [`columns_needed_regardless`]) —
+///   everything else in it always survives regardless.
+/// - A select *not* eligible for pruning (joined, `DISTINCT`, or the
+///   outermost statement, which is never pruned regardless of shape):
+///   nothing in it is ever rewritten, so *every* column it references
+///   always survives.
 ///
-/// The combined filter and projection are then applied to `source`'s own
-/// query.  When DataFusion can plan the source query, the result is a fully
-/// optimized [`LogicalPlan`] unparsed back to SQL.  When the source query
-/// uses dialect-specific functions DataFusion cannot plan (e.g. DuckDB's
-/// `date_diff`), the wrapper is constructed directly as a SQL string so the
-/// original query is preserved verbatim.
+/// Returns `None` if pruning `source`'s projection must be abandoned
+/// entirely for this frontier: a `SELECT *`/`table.*` anywhere touching a
+/// scan of `source` (e.g. `SELECT pp.*, ... FROM source AS pp`) needs *every*
+/// column, and unlike a plain column reference, a star gives us no column
+/// names to collect at all — there's nothing a keep-list could represent.
+///
+/// Where it *can* return a concrete set, this is intentionally over-broad
+/// when it can't cleanly attribute a column to `source` specifically (e.g.
+/// inside a join) — it just returns every column name in scope, and the
+/// caller only keeps the ones that actually exist in `source`'s schema, so a
+/// false positive here costs a little pruning, never correctness.
+fn collect_unprunable_source_columns(
+    sql: &str,
+    source_id: &str,
+    dialect: DialectType,
+) -> Option<HashSet<String>> {
+    let bare_source = bare_table_name(source_id);
+    let mut out = HashSet::new();
+    let Ok(root) = polyglot_sql::parse_one(sql, dialect) else {
+        return Some(out);
+    };
+
+    // The outermost statement's own scan of `source` is never rewritten
+    // regardless of shape — even a bare pass-through column there must
+    // always survive.
+    if let Expression::Select(root_select) = &root {
+        if select_scans_source(root_select, &bare_source) {
+            if select_has_star(root_select) {
+                return None;
+            }
+            out.extend(polyglot_sql::ast_transforms::get_column_names(&root));
+        }
+    }
+
+    for node in root.dfs() {
+        if let Expression::Select(select) = node {
+            if !select_scans_source(select, &bare_source) {
+                continue;
+            }
+            if select_has_star(select) {
+                return None;
+            }
+            if is_single_unjoined_source(select, &bare_source) {
+                out.extend(columns_needed_regardless(select));
+            } else {
+                out.extend(polyglot_sql::ast_transforms::get_column_names(node));
+            }
+        }
+    }
+
+    Some(out)
+}
+
+/// Descend into every FROM/JOIN/CTE position of `select` (but never mutate
+/// `select`'s own projection list) so nested derived tables get pruned.
+fn descend_into_from_positions(select: &mut Select, bare_source: &str, keep: &HashSet<String>) {
+    if let Some(mut from) = select.from.take() {
+        from.expressions = from
+            .expressions
+            .into_iter()
+            .map(|e| prune_derived_table(e, bare_source, keep))
+            .collect();
+        select.from = Some(from);
+    }
+    for join in select.joins.iter_mut() {
+        let taken = std::mem::replace(&mut join.this, Expression::Null(Null));
+        join.this = prune_derived_table(taken, bare_source, keep);
+    }
+    if let Some(with) = select.with.as_mut() {
+        for cte in with.ctes.iter_mut() {
+            let taken = std::mem::replace(&mut cte.this, Expression::Null(Null));
+            cte.this = prune_derived_table(taken, bare_source, keep);
+        }
+    }
+}
+
+/// Applied to an expression sitting in a FROM/JOIN/CTE position: recurse into
+/// its own nested derived tables first (bottom-up), then, if this expression
+/// is itself a single unjoined scan of `bare_source`, prune its projection
+/// list down to `keep`.
+fn prune_derived_table(expr: Expression, bare_source: &str, keep: &HashSet<String>) -> Expression {
+    // A parenthesized derived table (`FROM (SELECT ...) AS alias`) parses as
+    // `Expression::Subquery`, wrapping the actual `Select` in `.this`. Unwrap
+    // it, recurse/prune the inner Select, then rewrap so the alias survives.
+    if let Expression::Subquery(mut sub) = expr {
+        sub.this = prune_derived_table(sub.this, bare_source, keep);
+        return Expression::Subquery(sub);
+    }
+
+    let Expression::Select(mut select) = expr else {
+        return expr;
+    };
+
+    descend_into_from_positions(&mut select, bare_source, keep);
+
+    if is_single_unjoined_source(&select, bare_source) {
+        select
+            .expressions
+            .retain(|e| column_output_name(e).map(|n| keep.contains(&n)).unwrap_or(true));
+        if select.expressions.is_empty() {
+            // Safety net: never produce an empty SELECT list.
+            select.expressions.push(Expression::Star(
+                polyglot_sql::expressions::Star {
+                    table: None,
+                    except: None,
+                    replace: None,
+                    rename: None,
+                    trailing_comments: vec![],
+                    span: None,
+                },
+            ));
+        }
+    }
+
+    Expression::Select(select)
+}
+
+/// Inline `view_sql` (the query text of `view_id`) into `table_sql` by
+/// replacing every AST-level table reference to `view_id` with a
+/// parenthesized, aliased subquery wrapping `view_sql` — the AST-based
+/// counterpart of a plain `str::replace`.
+///
+/// Operating on the parsed AST (rather than raw substring substitution)
+/// avoids matching `view_id`'s name where it merely appears as a substring
+/// of an unrelated, longer identifier, and lets the original table's alias
+/// (or, if it had none, its own name — so any qualified column references
+/// elsewhere in the query keep resolving) carry over onto the new subquery
+/// precisely, rather than by accident of leftover trailing text.
+///
+/// Every occurrence of `view_id` in `table_sql` is replaced (matching
+/// `str::replace`'s multi-occurrence behavior for self-joins etc.), each
+/// getting its own independent copy of `view_sql`'s AST.
+///
+/// Returns `None` if `table_sql` or `view_sql` doesn't parse, if
+/// regenerating the rewritten AST fails, or if `view_id` was not found
+/// anywhere in `table_sql` — callers fall back to plain string substitution
+/// in all of those cases.
+fn inline_view_ast(
+    table_sql: &str,
+    view_id: &str,
+    view_sql: &str,
+    dialect: DialectType,
+) -> Option<String> {
+    let bare_view = bare_table_name(view_id);
+    let table_expr = polyglot_sql::parse_one(table_sql, dialect).ok()?;
+    let view_expr = polyglot_sql::parse_one(view_sql, dialect).ok()?;
+
+    let replaced_any = std::cell::Cell::new(false);
+    let rewritten = polyglot_sql::traversal::transform(table_expr, &|node| {
+        let Expression::Table(t) = &node else {
+            return Ok(Some(node));
+        };
+        if !t.name.name.eq_ignore_ascii_case(&bare_view) {
+            return Ok(Some(node));
+        }
+        replaced_any.set(true);
+        let alias = t
+            .alias
+            .clone()
+            .unwrap_or_else(|| polyglot_sql::expressions::Identifier::new(bare_view.clone()));
+        Ok(Some(Expression::Subquery(Box::new(
+            polyglot_sql::expressions::Subquery {
+                this: view_expr.clone(),
+                alias: Some(alias),
+                column_aliases: t.column_aliases.clone(),
+                alias_explicit_as: t.alias_explicit_as,
+                alias_keyword: None,
+                order_by: None,
+                limit: None,
+                offset: None,
+                distribute_by: None,
+                sort_by: None,
+                cluster_by: None,
+                lateral: false,
+                modifiers_inside: true,
+                trailing_comments: vec![],
+                inferred_type: None,
+            },
+        ))))
+    })
+    .ok()?;
+
+    if !replaced_any.get() {
+        return None;
+    }
+
+    polyglot_sql::generate(&rewritten, dialect).ok()
+}
+
+/// Rewrite `sql` so that every *nested* (non-outermost) SELECT statement
+/// scanning `source` directly (with no join, no `*`, no DISTINCT) has its
+/// projection list pruned to `keep_cols`. The outermost statement's own
+/// projection list is never touched — see the module-level doc comment.
+///
+/// Returns `None` if `sql` doesn't parse, or regenerating it fails; callers
+/// treat that as "leave this query's text unchanged" (safe — just misses an
+/// opportunity to prune, never breaks anything).
+fn prune_dead_source_columns(
+    sql: &str,
+    source_id: &str,
+    keep_cols: &[String],
+    dialect: DialectType,
+) -> Option<String> {
+    if keep_cols.is_empty() {
+        return None;
+    }
+    let bare_source = bare_table_name(source_id);
+    let keep: HashSet<String> = keep_cols.iter().cloned().collect();
+
+    let root = polyglot_sql::parse_one(sql, dialect).ok()?;
+    let Expression::Select(mut select) = root else {
+        return None;
+    };
+    descend_into_from_positions(&mut select, &bare_source, &keep);
+    polyglot_sql::generate(&Expression::Select(select), dialect).ok()
+}
+
+/// Extract the column names referenced by a raw SQL predicate string (as
+/// returned by [`Connector::pushdown`]'s `filters`), by parsing it as a
+/// standalone `WHERE` clause. Used to make sure a column needed only by a
+/// pushed-down filter (never itself selected) still survives projection
+/// pruning of `source`.
+fn filter_referenced_columns(filter: &str, dialect: DialectType) -> Vec<String> {
+    let wrapped = format!("SELECT 1 WHERE {filter}");
+    match polyglot_sql::parse_one(&wrapped, dialect) {
+        Ok(expr) => polyglot_sql::ast_transforms::get_column_names(&expr),
+        Err(_) => vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scratch DAG materialization
+// ---------------------------------------------------------------------------
+
+/// Materialize every node of `dag` as a real table under an isolated scratch
+/// name, in topological order, with every cross-node reference in each
+/// node's query text rewritten to the corresponding scratch name — so the
+/// connector's own query planner (e.g. DuckDB's `EXPLAIN`) can analyze any
+/// node's query in isolation via [`Connector::pushdown`], regardless of
+/// which other not-yet-materialized DAG nodes it references.
+///
+/// This must materialize *every* node, not just the one(s) about to be
+/// analyzed: a TempTable's own query text (or a frontier's) can reference
+/// another TempTable that isn't a real relation under its original name
+/// either — e.g. two landing-pad TempTables where one transitively depends
+/// on the other. Analyzing them one at a time, each with its own ad hoc
+/// scratch table, breaks the moment one references the other.
+///
+/// Each scratch relation is a real TABLE regardless of the source node's own
+/// `MaterializeMode` (even for what will eventually be a View) — DuckDB's
+/// planner sees straight through views (inlining them), so a scratch VIEW
+/// would attribute a scan to whatever's underneath it rather than to the
+/// scratch relation itself. In practice `dag` here is always a
+/// `graph_minor`-reduced DAG with no View nodes left, so this is moot, but
+/// materializing as a table is the correct choice either way.
+///
+/// Returns a map from every original node ID to its scratch relation name;
+/// pass it to [`pushdown`] and, when done, to [`cleanup_scratch_dag`].
+pub async fn materialize_scratch_dag<C>(
+    dag: &Dag,
+    conn: &C,
+) -> Result<HashMap<String, String>, OptimizerError>
+where
+    C: Connector + Send + Sync,
+{
+    let topo = dag.nodes.topological_sort();
+    let scratch_names: HashMap<String, String> = topo
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), format!("dee_tmp_pushdown_all_{i}")))
+        .collect();
+
+    let mut sorted_ids: Vec<&String> = scratch_names.keys().collect();
+    sorted_ids.sort_by_key(|id| std::cmp::Reverse(id.len()));
+
+    for id in &topo {
+        let node = dag.nodes.get(id.clone()).ok_or_else(|| {
+            OptimizerError::Exec(format!("materialize_scratch_dag: node '{id}' not found"))
+        })?;
+
+        let mut query = node.query_text.clone();
+        for other_id in &sorted_ids {
+            query = query.replace(other_id.as_str(), &scratch_names[*other_id]);
+        }
+
+        conn.new_relation(MaterializeMode::Table, scratch_names[id].clone(), query)
+            .await
+            .map_err(|e| {
+                OptimizerError::Exec(format!(
+                    "materialize_scratch_dag: failed to create scratch relation for '{id}': {e}"
+                ))
+            })?;
+    }
+
+    Ok(scratch_names)
+}
+
+/// Drop every scratch relation created by [`materialize_scratch_dag`], in
+/// reverse topological order (sinks first) so nothing is dropped while
+/// something else still (transitively) depends on it. Best-effort — a
+/// failure to drop one relation is logged but doesn't stop the rest.
+pub async fn cleanup_scratch_dag<C>(dag: &Dag, scratch_names: &HashMap<String, String>, conn: &C)
+where
+    C: Connector + Send + Sync,
+{
+    let mut topo = dag.nodes.topological_sort();
+    topo.reverse();
+    for id in &topo {
+        let Some(scratch_name) = scratch_names.get(id) else {
+            continue;
+        };
+        if let Err(e) = conn
+            .drop_relation(MaterializeMode::Table, scratch_name.clone())
+            .await
+        {
+            warn!("cleanup_scratch_dag: failed to drop scratch relation '{scratch_name}': {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pushdown
+// ---------------------------------------------------------------------------
+
 /// Return type for [`pushdown`]: the rewritten source SQL and schema, plus
-/// the optimizer-regenerated SQL for each frontier node that was successfully
-/// unparsed (keyed by node ID).
+/// dead-column-pruned SQL for any frontier node whose nested references to
+/// `source` needed adjusting to match the source's new, narrower schema.
 pub struct PushdownResult {
     pub source_sql: String,
     pub source_schema: SchemaRef,
-    /// Optimizer-regenerated SQL for each frontier node, keyed by node ID.
-    /// Only entries where `plan_to_sql` succeeded are included.
+    /// Pruned SQL for each frontier node whose text changed, keyed by node ID.
     pub frontier_sql: HashMap<String, String>,
 }
 
-pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, OptimizerError> {
+/// Pushes down predicates and projections from the frontier materializing
+/// nodes into the TempTable node `source`, returning the rewritten SQL for
+/// `source`.
+///
+/// `scratch_names` must map every node ID in `dag` to an already-materialized
+/// scratch relation (see [`materialize_scratch_dag`]) — every reference to
+/// any DAG node, not just `source`, is rewritten to its scratch counterpart
+/// before being handed to the connector, since `source`'s own query text (or
+/// a frontier's) may reference *other* TempTables that aren't real relations
+/// under their original names either.
+///
+/// For each node in `frontier_materializes(source)`:
+/// 1. The frontier node's query text (rewritten so every DAG node reference
+///    resolves to its scratch relation) is analyzed via [`Connector::pushdown`].
+/// 2. Filter predicates are combined across all frontier nodes with a
+///    logical **OR** (each frontier's own predicates are AND-ed together
+///    first, matching how DuckDB's `Filters` already reports each predicate
+///    as a separate conjunct).
+/// 3. Projected columns are collected and **unioned** across all frontier
+///    nodes, plus any column referenced only by a pushed-down filter, so
+///    every consumer's required columns are present.
+///
+/// The combined filter and projection are then applied to `source`'s own
+/// query by wrapping it as a subquery — the original query text is preserved
+/// verbatim, only the outermost `SELECT`/`WHERE` are added.
+pub async fn pushdown<C>(
+    dag: &Dag,
+    source: &str,
+    conn: &C,
+    scratch_names: &HashMap<String, String>,
+) -> Result<PushdownResult, OptimizerError>
+where
+    C: Connector + Send + Sync,
+{
     let source_node = dag
         .nodes
         .get(source.to_string())
@@ -374,8 +526,7 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
         )));
     }
 
-    // Use the pre-resolved schema from resolve_schemas — no DataFusion planning
-    // or connector calls needed here.
+    // Use the pre-resolved schema from resolve_schemas.
     let source_schema: SchemaRef = source_node
         .schema
         .as_ref()
@@ -387,27 +538,42 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
         })?
         .clone();
 
-    // Build a dialect-aware unparser for this DAG's SQL dialect.
-    // `Unparser` is not `Send`, so we hold only the dialect (which is Send+Sync)
-    // and create short-lived `Unparser` instances at each use site.
     let dialect = dialect_for_db(&dag.db);
-
-    // Collect filter predicates (one list per frontier node) and the union of
-    // required columns across all frontier nodes.
     let frontier: HashSet<String> = dag.nodes.frontier_materializes(source);
 
-    // per-frontier-node filter predicates (each entry = the filters for one node)
-    let mut per_node_filters: Vec<Vec<Expr>> = Vec::new();
-    // union of projected columns across all frontier nodes
-    let mut required_cols: HashSet<String> = HashSet::new();
-    let mut any_node_needs_all_cols = false;
-    // optimizer-regenerated SQL for each frontier node (best-effort)
-    let mut frontier_sql: HashMap<String, String> = HashMap::new();
+    if frontier.is_empty() {
+        debug!("pushdown '{source}': no materializing frontier, nothing to push down");
+        return Ok(PushdownResult {
+            source_sql: source_node.query_text.clone(),
+            source_schema: Arc::clone(&source_schema),
+            frontier_sql: HashMap::new(),
+        });
+    }
 
     trace!(
         "  source '{}' query text =\n{}",
         source_node.id, source_node.query_text,
     );
+
+    let scratch_name = scratch_names.get(source).cloned().ok_or_else(|| {
+        OptimizerError::Exec(format!(
+            "pushdown: no scratch relation registered for '{source}'; \
+             call materialize_scratch_dag before running pushdown"
+        ))
+    })?;
+
+    // Every DAG node reference in a query, sorted longest-first so a shorter
+    // ID that happens to be a substring of a longer one is never matched
+    // first (mirrors the same trick used in `executor::resolve_schemas` and
+    // `graph_minor`).
+    let mut sorted_ids: Vec<&String> = scratch_names.keys().collect();
+    sorted_ids.sort_by_key(|id| std::cmp::Reverse(id.len()));
+
+    // per-frontier-node filter predicates (each entry = the filters for one node)
+    let mut per_node_filters: Vec<Vec<String>> = Vec::new();
+    // union of projected columns across all frontier nodes
+    let mut required_cols: HashSet<String> = HashSet::new();
+    let mut any_node_needs_all_cols = false;
 
     for n_id in &frontier {
         trace!("trying to pushdown frontier node {} into {}", n_id, source);
@@ -422,84 +588,79 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
             n_node.id, n_node.query_text,
         );
 
-        let ctx = build_opaque_context(dag, n_id, source, Arc::clone(&source_schema))?;
-
-        let raw_plan = create_logical_plan_with_stubs(&ctx, &n_node.query_text)
-            .await
-            .map_err(|e| {
-                OptimizerError::Exec(format!(
-                    "pushdown: failed to plan frontier node '{n_id}': {e}"
-                ))
-            })?;
-
-        let opt_plan = ctx.state().optimize(&raw_plan).map_err(|e| {
-            OptimizerError::Exec(format!(
-                "pushdown: failed to optimize frontier node '{n_id}': {e}"
-            ))
-        })?;
-
-        trace!(
-            "  frontier '{n_id}': optimized plan =\n{}",
-            opt_plan.display_indent()
-        );
-
-        // Validate the optimized plan before converting it to SQL.  If the
-        // physical planner rejects it the regenerated SQL would be invalid;
-        // skip this frontier node's SQL update and leave query_text unchanged.
-        if let Err(e) = validate(&ctx, &opt_plan).await {
-            warn!(
-                "pushdown: skipping SQL regeneration for frontier '{n_id}', \
-                 optimized plan failed validation: {e}"
-            );
-        } else {
-            // Regenerate the frontier node's SQL from the optimized plan.
-            // Failure is non-fatal — we simply omit this node from the
-            // returned map and leave its query_text unchanged.
-            match Unparser::new(dialect.as_ref()).plan_to_sql(&opt_plan) {
-                Ok(stmt) => {
-                    frontier_sql.insert(n_id.clone(), stmt.to_string());
-                }
-                Err(e) => {
-                    warn!("pushdown: could not regenerate SQL for frontier '{n_id}': {e}");
-                }
-            }
+        let mut rewritten_query = n_node.query_text.clone();
+        for id in &sorted_ids {
+            rewritten_query = rewritten_query.replace(id.as_str(), &scratch_names[*id]);
         }
 
-        match extract_pushdowns(&opt_plan, source) {
-            Some((filters, cols)) => {
-                let unparser = Unparser::new(dialect.as_ref());
-                let filter_strs: Vec<String> = filters
-                    .iter()
-                    .filter_map(|f| unparser.expr_to_sql(&strip_table_qualifier(f.clone())).ok())
-                    .map(|e| e.to_string())
-                    .collect();
-                if filter_strs.is_empty() {
-                    trace!("  frontier '{n_id}': no filter predicates found");
-                } else {
-                    trace!(
-                        "  frontier '{n_id}': predicates = [{}]",
-                        filter_strs.join(", ")
-                    );
-                }
-                if cols.is_empty() {
+        let pushdown_map = match conn.pushdown(&rewritten_query).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "pushdown: connector pushdown failed for frontier '{n_id}': {e}, \
+                     assuming all columns needed"
+                );
+                any_node_needs_all_cols = true;
+                continue;
+            }
+        };
+
+        match pushdown_map.and_then(|m| m.get(&scratch_name).cloned()) {
+            Some(info) => {
+                if info.projections.is_empty() {
                     trace!("  frontier '{n_id}': needs all columns");
                     any_node_needs_all_cols = true;
                 } else {
                     trace!(
                         "  frontier '{n_id}': projected columns = [{}]",
-                        cols.join(", ")
+                        info.projections.join(", ")
                     );
-                    required_cols.extend(cols);
+                    required_cols.extend(info.projections.iter().cloned());
                 }
-                if !filters.is_empty() {
-                    per_node_filters.push(filters);
+
+                // Filter-only columns (e.g. `WHERE is_active` when
+                // `is_active` is never selected) must survive projection
+                // pruning even though DuckDB's own `Projections` list
+                // excludes them.
+                for f in &info.filters {
+                    required_cols.extend(filter_referenced_columns(f, dialect));
+                }
+
+                if info.filters.is_empty() {
+                    trace!("  frontier '{n_id}': no filter predicates found");
+                } else {
+                    trace!("  frontier '{n_id}': predicates = [{}]", info.filters.join(", "));
+                    per_node_filters.push(info.filters);
                 }
             }
-            // Scan for source not found in this frontier node's plan — treat
-            // conservatively: assume all columns needed, no filter extractable.
             None => {
                 trace!(
-                    "  frontier '{n_id}': source scan not found in plan, assuming all columns needed"
+                    "  frontier '{n_id}': scratch scan not found in connector pushdown result, \
+                     assuming all columns needed"
+                );
+                any_node_needs_all_cols = true;
+            }
+        }
+
+        // Safety net: the connector's own pushdown analysis is (correctly)
+        // dead-column-aware — it may legitimately report a column as unused
+        // even though it's still selected inside a *joined* (or DISTINCT/`*`)
+        // nested scan of `source`, one `prune_dead_source_columns` won't
+        // rewrite later. Any such column must still survive pruning of
+        // `source`'s schema, or that untouched text will fail to bind.
+        match collect_unprunable_source_columns(&n_node.query_text, source, dialect) {
+            Some(unprunable) if !unprunable.is_empty() => {
+                trace!(
+                    "  frontier '{n_id}': columns kept regardless (referenced by an un-prunable scan) = [{}]",
+                    unprunable.iter().cloned().collect::<Vec<_>>().join(", ")
+                );
+                required_cols.extend(unprunable);
+            }
+            Some(_) => {}
+            None => {
+                trace!(
+                    "  frontier '{n_id}': a `SELECT *`/`table.*` touches a scan of '{source}', \
+                     assuming all columns needed"
                 );
                 any_node_needs_all_cols = true;
             }
@@ -507,14 +668,22 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
     }
 
     // Build the combined filter: OR of each frontier node's AND-conjunction.
-    // Strip table qualifiers so the expressions resolve against the source's
-    // own output schema rather than the opaque scan's qualified columns.
-    let combined_filter: Option<Expr> = {
-        let per_node_conjunctions: Vec<Expr> = per_node_filters
+    let combined_filter: Option<String> = {
+        let per_node_conjunctions: Vec<String> = per_node_filters
             .into_iter()
-            .filter_map(|fs| conjunction(fs.into_iter().map(strip_table_qualifier)))
+            .map(|fs| fs.join(" AND "))
             .collect();
-        disjunction(per_node_conjunctions)
+        match per_node_conjunctions.len() {
+            0 => None,
+            1 => per_node_conjunctions.into_iter().next(),
+            _ => Some(
+                per_node_conjunctions
+                    .into_iter()
+                    .map(|f| format!("({f})"))
+                    .collect::<Vec<_>>()
+                    .join(" OR "),
+            ),
+        }
     };
 
     // Build the combined projection: union of required columns.
@@ -539,8 +708,26 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
         return Ok(PushdownResult {
             source_sql: source_node.query_text.clone(),
             source_schema: Arc::clone(&source_schema),
-            frontier_sql,
+            frontier_sql: HashMap::new(),
         });
+    }
+
+    // Prune dead columns from every frontier query's nested references to
+    // `source` so their SQL text stays consistent with source's new,
+    // narrower materialized schema (see the module-level doc comment).
+    let mut frontier_sql: HashMap<String, String> = HashMap::new();
+    if let Some(cols) = &projection_cols {
+        for n_id in &frontier {
+            let Some(n_node) = dag.nodes.get(n_id.clone()) else {
+                continue;
+            };
+            if let Some(pruned) = prune_dead_source_columns(&n_node.query_text, source, cols, dialect)
+            {
+                if pruned != n_node.query_text {
+                    frontier_sql.insert(n_id.clone(), pruned);
+                }
+            }
+        }
     }
 
     // Construct the final SQL by wrapping the original query as a subquery and
@@ -550,18 +737,16 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
     let alias = bare_table_name(source);
 
     let col_list = match &projection_cols {
-        Some(cols) if !cols.is_empty() => cols.join(", "),
+        Some(cols) if !cols.is_empty() => cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
         _ => "*".to_string(),
     };
 
-    let where_clause = match combined_filter {
-        Some(expr) => {
-            let sql_expr = Unparser::new(dialect.as_ref())
-                .expr_to_sql(&strip_table_qualifier(expr))
-                .map_err(|e| {
-                    OptimizerError::Exec(format!("pushdown: expr_to_sql for '{source}': {e}"))
-                })?;
-            let filter_str = sql_expr.to_string();
+    let where_clause = match &combined_filter {
+        Some(filter_str) => {
             debug!("pushdown '{source}': pushing filter  → {filter_str}");
             format!(" WHERE {filter_str}")
         }
@@ -588,7 +773,7 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
     // otherwise it is identical to the pre-rewrite schema.
     let new_schema: SchemaRef = match &projection_cols {
         Some(cols) if !cols.is_empty() => {
-            use datafusion::arrow::datatypes::Schema;
+            use duckdb::arrow::datatypes::Schema;
             let fields: Vec<_> = cols
                 .iter()
                 .filter_map(|name| source_schema.field_with_name(name).ok().cloned())
@@ -615,14 +800,16 @@ pub async fn pushdown(dag: &Dag, source: &str) -> Result<PushdownResult, Optimiz
 /// Algorithm (repeated until no views remain):
 /// 1. Find all `(view v, non-view table t)` edges where `t` directly depends
 ///    on `v`.
-/// 2. For each such pair: inline `v`'s query into `t` with [`inline`], update
-///    `t.query_text`, drop the edge `t → v`, and add edges from `t` to every
-///    node that `v` itself depends on (so `t` retains `v`'s transitive deps).
+/// 2. For each such pair: inline `v`'s query into `t` by substituting the
+///    view's name for a parenthesized subquery, update `t.query_text`, drop
+///    the edge `t → v`, and add edges from `t` to every node that `v` itself
+///    depends on (so `t` retains `v`'s transitive deps).
 /// 3. Any `View` that has become a sink (nothing depends on it any more) is
 ///    removed from the graph together with all of its in-edges.
 /// 4. Repeat until no `View` nodes are left.
 pub async fn graph_minor(dag: &Dag) -> Result<Dag, OptimizerError> {
     let mut minor = dag.clone();
+    let dialect = dialect_for_db(&dag.db);
 
     loop {
         // Collect all (view_id, table_id) pairs where a non-view node
@@ -667,7 +854,6 @@ pub async fn graph_minor(dag: &Dag) -> Result<Dag, OptimizerError> {
                 })?
                 .query_text
                 .clone();
-            let alias = bare_table_name(view_id);
             let current_table_sql = minor
                 .nodes
                 .get(table_id.clone())
@@ -684,14 +870,17 @@ pub async fn graph_minor(dag: &Dag) -> Result<Dag, OptimizerError> {
                 )));
             }
 
-            // Wrap the view's SQL in a subquery and replace the view reference.
-            // We do NOT add an explicit AS alias here: if the original SQL uses
-            // a table alias (e.g. `FROM "warehouse"."main"."stg_accounts" a`),
-            // that alias `a` is preserved in-place after the substitution,
-            // giving `FROM (view_sql) a`.  Adding an extra `AS "view_name"`
-            // would create two consecutive aliases, which is invalid SQL.
-            let _ = alias; // alias derived but not used in substitution
-            let new_sql = current_table_sql.replace(view_id.as_str(), &format!("({view_sql})"));
+            // Wrap the view's SQL in a subquery and replace the view reference
+            // at the AST level (see `inline_view_ast`), falling back to plain
+            // string substitution if the SQL doesn't parse under polyglot-sql
+            // (e.g. an exotic dialect-specific construct) — the fallback
+            // preserves whatever alias followed the view's name in the
+            // original text (or none, if it had none), matching the prior
+            // behavior of this pass exactly.
+            let new_sql = inline_view_ast(&current_table_sql, view_id, &view_sql, dialect)
+                .unwrap_or_else(|| {
+                    current_table_sql.replace(view_id.as_str(), &format!("({view_sql})"))
+                });
 
             // 2a. Update the table's query text.
             {
@@ -787,11 +976,10 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    _conn: Arc<C>,
+    conn: Arc<C>,
     engine: Arc<E>,
     /// Data collected during the last `run()`, used by `Explain::explain`.
     explain_data: Option<PushdownExplainData>,
-    _phantom: PhantomData<C>,
 }
 
 /// Everything `Explain::explain` needs to describe what the last `run()`
@@ -810,10 +998,9 @@ where
 {
     pub fn new(conn: Arc<C>, engine: Arc<E>) -> Self {
         Self {
-            _conn: conn,
+            conn,
             engine,
             explain_data: None,
-            _phantom: PhantomData,
         }
     }
 }
@@ -883,11 +1070,24 @@ where
         );
         stats.insert("temp_tables_count".into(), temp_table_ids.len().to_string());
 
+        // Materialize every node of the graph minor as a real scratch table
+        // up front, once, so pushdown() can analyze any node's query in
+        // isolation regardless of which other (not-yet-materialized)
+        // TempTables it references — see `materialize_scratch_dag`'s doc
+        // comment for why this can't be done one TempTable at a time.
+        debug!("PushdownPass: materializing scratch DAG for analysis");
+        let scratch_names = materialize_scratch_dag(&minor, self.conn.as_ref())
+            .await
+            .map_err(|e| {
+                OptimizerError::Exec(format!(
+                    "PushdownPass: failed to materialize scratch DAG: {e}"
+                ))
+            })?;
+
         // Step 3+4 — for each TempTable, run pushdown on the minor DAG.
-        // pushdown() returns the rewritten source SQL *and* the
-        // optimizer-regenerated SQL for each frontier node (computed from the
-        // same optimized LogicalPlans used for filter/projection extraction).
-        // Apply all of them to both the working minor and the original DAG.
+        // pushdown() returns the rewritten source SQL *and* dead-column-pruned
+        // SQL for any frontier node whose text needed adjusting. Apply all of
+        // them to both the working minor and the original DAG.
         let mut rewrites: usize = 0;
         let mut outcomes: Vec<(String, String)> = Vec::new();
         for node_id in &temp_table_ids {
@@ -902,7 +1102,7 @@ where
 
             debug!("PushdownPass: running pushdown on '{node_id}'");
 
-            let result = match pushdown(&minor, node_id).await {
+            let result = match pushdown(&minor, node_id, self.conn.as_ref(), &scratch_names).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("PushdownPass: skipping '{node_id}', pushdown failed: {e}");
@@ -911,16 +1111,16 @@ where
                 }
             };
 
-            // Apply optimizer-regenerated SQL for frontier nodes first so that
+            // Apply dead-column-pruned SQL for frontier nodes first so that
             // both DAGs reflect the clean, canonical SQL before the source node
             // is updated.
-            for (frontier_id, reopt_sql) in &result.frontier_sql {
-                debug!("PushdownPass: updating frontier '{frontier_id}' with regenerated SQL");
+            for (frontier_id, pruned_sql) in &result.frontier_sql {
+                debug!("PushdownPass: updating frontier '{frontier_id}' with pruned SQL");
                 if let Some(n) = dag.nodes.get_mut(frontier_id.clone()) {
-                    n.query_text = reopt_sql.clone();
+                    n.query_text = pruned_sql.clone();
                 }
                 if let Some(n) = minor.nodes.get_mut(frontier_id.clone()) {
-                    n.query_text = reopt_sql.clone();
+                    n.query_text = pruned_sql.clone();
                 }
             }
 
@@ -961,6 +1161,9 @@ where
 
             rewrites += 1;
         }
+
+        debug!("PushdownPass: cleaning up scratch DAG");
+        cleanup_scratch_dag(&minor, &scratch_names, self.conn.as_ref()).await;
 
         stats.insert("rewrites_applied".into(), rewrites.to_string());
         debug!("PushdownPass: complete — {rewrites} rewrite(s) applied");
@@ -1021,122 +1224,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::{Connector, ConnectorError};
-    use crate::dag::{Dag, MaterializeMode, TransformNode};
-    use crate::executor::{ExecStats, Executor, ExecutorError};
+    use crate::connectors::duckdb::{DuckDBConfig, DuckDBConnection};
+    use crate::dag::{Dag, MaterializeMode, SourceNode, TransformNode};
+    use crate::executor::{Executor, SimpleEngine};
     use crate::graph::Graph;
-    use async_trait::async_trait;
-    use chrono::Utc;
-    use datafusion::arrow::datatypes::SchemaRef;
-    use std::collections::{HashMap, HashSet};
-    use tokio::sync::watch;
+    use std::collections::HashMap;
 
     // ------------------------------------------------------------------
-    // Stub connector/executor — PushdownPass stores them behind PhantomData
-    // and never calls their methods.
+    // Helpers — real in-memory DuckDB connector + the real SimpleEngine, so
+    // these tests exercise the exact same code path production runs.
     // ------------------------------------------------------------------
 
-    #[derive(Debug, Default)]
-    struct StubConnector;
-
-    #[async_trait]
-    impl Connector for StubConnector {
-        type Config = ();
-        type Connection = StubConnector;
-
-        async fn new(_: ()) -> Result<Arc<Self::Connection>, ConnectorError> {
-            Ok(Arc::new(StubConnector))
-        }
-        async fn execute(&self, _: String) -> Result<usize, ConnectorError> {
-            Ok(0)
-        }
-        async fn new_relation(
-            &self,
-            _: MaterializeMode,
-            _: String,
-            _: String,
-        ) -> Result<usize, ConnectorError> {
-            Ok(0)
-        }
-        async fn drop_relation(
-            &self,
-            _: MaterializeMode,
-            _: String,
-        ) -> Result<usize, ConnectorError> {
-            Ok(0)
-        }
-        async fn get_schema(&self, _: String) -> Option<Result<SchemaRef, ConnectorError>> {
-            None
-        }
+    async fn in_memory_conn() -> Arc<DuckDBConnection> {
+        let config = DuckDBConfig::new_from_path(":memory:".to_string());
+        DuckDBConnection::new(config).await.unwrap()
     }
-
-    struct StubExecutor;
-
-    #[async_trait]
-    impl Executor<StubConnector> for StubExecutor {
-        type ExecutionEngine = StubExecutor;
-
-        fn new(_: Arc<StubConnector>) -> Result<StubExecutor, ExecutorError> {
-            Ok(StubExecutor)
-        }
-        async fn run(&self, _: &Dag) -> Result<ExecStats, ExecutorError> {
-            let now = Utc::now();
-            Ok(ExecStats {
-                start: now,
-                finish: now,
-                duration: chrono::TimeDelta::zero(),
-                node_stats: Default::default(),
-                system_samples: vec![],
-            })
-        }
-        async fn cleanup(&self, _: &Dag) -> Result<usize, ExecutorError> {
-            Ok(0)
-        }
-        fn cancel_sender(&self) -> Arc<watch::Sender<bool>> {
-            Arc::new(watch::channel(false).0)
-        }
-        async fn resolve_schemas(&self, dag: &mut Dag) -> Result<(), ExecutorError> {
-            // In tests we use DataFusion to derive schemas (no live DB).
-            // Walk nodes in topological order, building a SessionContext as we go.
-            use crate::opt::common::{create_logical_plan_with_stubs, register_table_any};
-            use datafusion::datasource::empty::EmptyTable;
-            use datafusion::datasource::view::ViewTable;
-            use datafusion::prelude::SessionContext;
-
-            let ctx = SessionContext::new();
-            for src in &dag.sources {
-                register_table_any(
-                    &ctx,
-                    &src.name,
-                    Arc::new(EmptyTable::new(Arc::clone(&src.schema))),
-                )
-                .map_err(|e| ExecutorError::Exec(e.to_string()))?;
-            }
-
-            let topo = dag.nodes.topological_sort();
-            let mut planned: Vec<(String, datafusion::arrow::datatypes::SchemaRef)> = Vec::new();
-            for node_id in &topo {
-                let node = dag.nodes.get(node_id.clone()).unwrap();
-                let plan = create_logical_plan_with_stubs(&ctx, &node.query_text)
-                    .await
-                    .map_err(|e| ExecutorError::Exec(format!("resolve_schemas test stub: {e}")))?;
-                let schema = Arc::new(plan.schema().as_arrow().clone());
-                register_table_any(&ctx, node_id, Arc::new(ViewTable::new(plan, None)))
-                    .map_err(|e| ExecutorError::Exec(e.to_string()))?;
-                planned.push((node_id.clone(), schema));
-            }
-            for (node_id, schema) in planned {
-                if let Some(n) = dag.nodes.get_mut(node_id) {
-                    n.schema = Some(schema);
-                }
-            }
-            Ok(())
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
 
     fn make_dag(nodes: Vec<TransformNode>) -> Dag {
         let mut graph = Graph::new(HashMap::new());
@@ -1160,8 +1262,20 @@ mod tests {
         }
     }
 
-    fn pass() -> PushdownPass<StubConnector, StubExecutor> {
-        PushdownPass::new(Arc::new(StubConnector), Arc::new(StubExecutor))
+    /// Create `orders` as a real table in `conn`, then run PushdownPass on a
+    /// DAG whose only source is `orders`.
+    async fn setup_orders_table(conn: &DuckDBConnection) {
+        conn.execute(
+            "CREATE TABLE orders AS SELECT \
+                range AS order_id, \
+                CASE WHEN range % 2 = 0 THEN 'US' ELSE 'EU' END AS region, \
+                range * 1.5 AS amount, \
+                'open' AS status \
+             FROM range(20)"
+                .to_string(),
+        )
+        .await
+        .unwrap();
     }
 
     // ------------------------------------------------------------------
@@ -1170,7 +1284,7 @@ mod tests {
 
     // DAG layout:
     //
-    //   raw (View)
+    //   orders (source, real table)
     //       │
     //   staging (TempTable)   ← no TABLE downstream, no optimization needed
     //       ├──► summary (View)
@@ -1181,26 +1295,15 @@ mod tests {
     // The pass must leave the TempTable query unchanged.
     #[tokio::test]
     async fn test_temp_table_with_only_view_consumers_is_unchanged() {
-        use crate::dag::SourceNode;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let conn = in_memory_conn().await;
+        setup_orders_table(&conn).await;
+        let engine = SimpleEngine::new(Arc::clone(&conn)).unwrap();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("amount", DataType::Float64, false),
-            Field::new("status", DataType::Utf8, false),
-        ]));
-
-        let raw = node(
-            "raw",
-            "SELECT id, amount, status FROM source_table",
-            MaterializeMode::View,
-            &[],
-        );
-        let temp = node(
+        let staging = node(
             "staging",
-            "SELECT id, amount, status FROM raw",
+            "SELECT order_id, region, amount, status FROM orders",
             MaterializeMode::TempTable,
-            &["raw"],
+            &[],
         );
         let summary = node(
             "summary",
@@ -1215,10 +1318,10 @@ mod tests {
             &["staging"],
         );
 
-        let mut dag = make_dag(vec![raw, temp, summary, report]);
+        let mut dag = make_dag(vec![staging, summary, report]);
         dag.sources = vec![SourceNode {
-            name: "source_table".to_string(),
-            schema,
+            name: "orders".to_string(),
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
         }];
         let original = dag
             .nodes
@@ -1227,7 +1330,8 @@ mod tests {
             .query_text
             .clone();
 
-        pass().run(&mut dag).await.expect("pass should succeed");
+        let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::new(engine));
+        pass.run(&mut dag).await.expect("pass should succeed");
 
         assert_eq!(
             dag.nodes.get("staging".to_string()).unwrap().query_text,
@@ -1238,46 +1342,42 @@ mod tests {
 
     // DAG layout:
     //
-    //   source (View)
+    //   orders (source, real table)
     //       │
-    //   staging (TempTable)
+    //   staging (TempTable)   SELECT order_id, region, amount, status FROM orders
     //       │
-    //   final_table (Table)   SELECT region, total FROM staging WHERE region = 'US'
+    //   final_table (Table)   SELECT region, amount FROM staging WHERE region = 'US'
     //
     // There is a TABLE downstream, so the pass should push down the filter
-    // `region = 'US'` that the Table applies.  Projection pruning is governed
-    // by what the Table's query actually selects.
+    // `region = 'US'` that the Table applies, and prune `status` (never
+    // referenced downstream) from staging's projection.
     #[tokio::test]
-    async fn test_filter_pushed_into_temp_table_with_single_table_downstream() {
-        use crate::dag::SourceNode;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    async fn test_filter_and_projection_pushed_into_temp_table() {
+        let conn = in_memory_conn().await;
+        setup_orders_table(&conn).await;
+        let engine = SimpleEngine::new(Arc::clone(&conn)).unwrap();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("region", DataType::Utf8, false),
-            Field::new("total", DataType::Float64, false),
-        ]));
-
-        let source = node("source", "SELECT * FROM raw", MaterializeMode::View, &[]);
         let staging = node(
             "staging",
-            "SELECT id, region, total FROM source",
+            "SELECT order_id, region, amount, status FROM orders",
             MaterializeMode::TempTable,
-            &["source"],
+            &[],
         );
         let sink = node(
             "final_table",
-            "SELECT region, total FROM staging WHERE region = 'US'",
+            "SELECT region, amount FROM staging WHERE region = 'US'",
             MaterializeMode::Table,
             &["staging"],
         );
 
-        let mut dag = make_dag(vec![source, staging, sink]);
+        let mut dag = make_dag(vec![staging, sink]);
         dag.sources = vec![SourceNode {
-            name: "raw".to_string(),
-            schema,
+            name: "orders".to_string(),
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
         }];
-        pass().run(&mut dag).await.expect("pass should succeed");
+
+        let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::new(engine));
+        pass.run(&mut dag).await.expect("pass should succeed");
 
         let rewritten = dag
             .nodes
@@ -1286,125 +1386,63 @@ mod tests {
             .query_text
             .clone();
 
-        // plan_to_sql qualifies column names (e.g. "raw"."region") so we check
-        // for the literal value that must appear in the WHERE predicate.
         assert!(
             rewritten.contains("'US'"),
             "filter predicate 'US' should be pushed into the TempTable; got: {}",
             rewritten
         );
-    }
 
-    // DAG layout:
-    //
-    //   source (View)
-    //       │
-    //   staging (TempTable)
-    //       ├──► table_a (Table)   SELECT amount FROM staging WHERE region = 'US'
-    //       └──► table_b (Table)   SELECT amount FROM staging WHERE region = 'US'
-    //
-    // Both Table consumers share the same filter.  The pass should push it
-    // into the TempTable.
-    #[tokio::test]
-    async fn test_common_filter_pushed_when_multiple_table_consumers_agree() {
-        use crate::dag::SourceNode;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount", DataType::Float64, false),
-        ]));
-
-        let source = node("source", "SELECT * FROM raw", MaterializeMode::View, &[]);
-        let staging = node(
-            "staging",
-            "SELECT id, region, amount FROM source",
-            MaterializeMode::TempTable,
-            &["source"],
-        );
-        let table_a = node(
-            "table_a",
-            "SELECT amount FROM staging WHERE region = 'US'",
-            MaterializeMode::Table,
-            &["staging"],
-        );
-        let table_b = node(
-            "table_b",
-            "SELECT amount FROM staging WHERE region = 'US'",
-            MaterializeMode::Table,
-            &["staging"],
-        );
-
-        let mut dag = make_dag(vec![source, staging, table_a, table_b]);
-        dag.sources = vec![SourceNode {
-            name: "raw".to_string(),
-            schema,
-        }];
-        pass().run(&mut dag).await.expect("pass should succeed");
-
-        let rewritten = dag
-            .nodes
-            .get("staging".to_string())
-            .unwrap()
-            .query_text
-            .clone();
-
+        let outer_select = rewritten.split("FROM (").next().unwrap_or("");
         assert!(
-            rewritten.contains("'US'"),
-            "filter predicate 'US' should be pushed when all Table consumers agree; got: {}",
+            !outer_select.contains("status"),
+            "column `status` should be absent from the outer SELECT projection; got: {}",
             rewritten
         );
     }
 
     // DAG layout:
     //
-    //   source (View)
+    //   orders (source, real table)
     //       │
     //   staging (TempTable)
-    //       ├──► table_a (Table)   SELECT amount FROM staging WHERE region = 'US'
-    //       └──► table_b (Table)   SELECT amount FROM staging WHERE region = 'EU'
+    //       ├──► table_a (Table)   SELECT order_id, amount FROM staging WHERE region = 'US'
+    //       └──► table_b (Table)   SELECT order_id, amount FROM staging WHERE region = 'EU'
     //
-    // The two Table consumers apply different filters.  The pass should push
-    // down the logical OR of all consumer filters so that every row any Table
-    // needs is still present in the TempTable.
+    // Two frontier Tables with *different* region filters.  The pass must OR
+    // the two predicates so that both consumers' rows survive.
     #[tokio::test]
     async fn test_different_filters_across_table_consumers_are_pushed_as_or() {
-        use crate::dag::SourceNode;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let conn = in_memory_conn().await;
+        setup_orders_table(&conn).await;
+        let engine = SimpleEngine::new(Arc::clone(&conn)).unwrap();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount", DataType::Float64, false),
-        ]));
-
-        let source = node("source", "SELECT * FROM raw", MaterializeMode::View, &[]);
         let staging = node(
             "staging",
-            "SELECT id, region, amount FROM source",
+            "SELECT order_id, region, amount, status FROM orders",
             MaterializeMode::TempTable,
-            &["source"],
+            &[],
         );
         let table_a = node(
             "table_a",
-            "SELECT amount FROM staging WHERE region = 'US'",
+            "SELECT order_id, amount FROM staging WHERE region = 'US'",
             MaterializeMode::Table,
             &["staging"],
         );
         let table_b = node(
             "table_b",
-            "SELECT amount FROM staging WHERE region = 'EU'",
+            "SELECT order_id, amount FROM staging WHERE region = 'EU'",
             MaterializeMode::Table,
             &["staging"],
         );
 
-        let mut dag = make_dag(vec![source, staging, table_a, table_b]);
+        let mut dag = make_dag(vec![staging, table_a, table_b]);
         dag.sources = vec![SourceNode {
-            name: "raw".to_string(),
-            schema,
+            name: "orders".to_string(),
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
         }];
-        pass().run(&mut dag).await.expect("pass should succeed");
+
+        let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::new(engine));
+        pass.run(&mut dag).await.expect("pass should succeed");
 
         let rewritten = dag
             .nodes
@@ -1423,159 +1461,132 @@ mod tests {
             "filters from different Table consumers must be combined with OR; got: {}",
             rewritten
         );
+
+        let outer_select = rewritten.split("FROM (").next().unwrap_or("");
+        assert!(
+            !outer_select.contains("status"),
+            "column `status` should be absent from the outer SELECT projection; got: {}",
+            rewritten
+        );
     }
 
+    // Regression test for a real-world failure: two landing-pad TempTables
+    // where one's own query text references the *other* (not just its
+    // frontier consumer's). `temp_b` is upstream of `temp_a`, and `temp_a`'s
+    // query scans `temp_b` directly — neither is a real relation under its
+    // original name at analysis time, so pushdown() must materialize the
+    // *whole* graph minor as scratch tables up front (not one TempTable at a
+    // time) or creating temp_a's own scratch table fails outright.
+    //
     // DAG layout:
     //
-    //   source (View)
+    //   orders (source, real table)
     //       │
-    //   staging (TempTable)
-    //       ├──► table_a (Table)   SELECT region, amount FROM staging WHERE region = 'US'
-    //       └──► table_b (Table)   SELECT region, amount FROM staging WHERE region = 'EU'
-    //
-    // Both Table consumers select the same column subset `region, amount` —
-    // the TempTable can be pruned to only those columns (plus whatever the OR
-    // filter requires, which is already covered).  The unused column `id`
-    // should not appear in the rewritten query.
+    //   temp_b (TempTable)   SELECT order_id, region, amount FROM orders
+    //       │
+    //   temp_a (TempTable)   SELECT order_id, region, amount FROM temp_b
+    //       │
+    //   sink (Table)         SELECT amount FROM temp_a WHERE region = 'US'
     #[tokio::test]
-    async fn test_projection_pruned_to_union_of_columns_needed_by_table_consumers() {
-        use crate::dag::SourceNode;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    async fn test_pushdown_pass_handles_temp_table_referencing_another_temp_table() {
+        let conn = in_memory_conn().await;
+        setup_orders_table(&conn).await;
+        let engine = SimpleEngine::new(Arc::clone(&conn)).unwrap();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount", DataType::Float64, false),
-        ]));
-
-        let source = node("source", "SELECT * FROM raw", MaterializeMode::View, &[]);
-        let staging = node(
-            "staging",
-            "SELECT id, region, amount FROM source",
+        let temp_b = node(
+            "temp_b",
+            "SELECT order_id, region, amount FROM orders",
             MaterializeMode::TempTable,
-            &["source"],
+            &[],
         );
-        let table_a = node(
-            "table_a",
-            "SELECT region, amount FROM staging WHERE region = 'US'",
-            MaterializeMode::Table,
-            &["staging"],
+        let temp_a = node(
+            "temp_a",
+            "SELECT order_id, region, amount FROM temp_b",
+            MaterializeMode::TempTable,
+            &["temp_b"],
         );
-        let table_b = node(
-            "table_b",
-            "SELECT region, amount FROM staging WHERE region = 'EU'",
+        let sink = node(
+            "sink",
+            "SELECT amount FROM temp_a WHERE region = 'US'",
             MaterializeMode::Table,
-            &["staging"],
+            &["temp_a"],
         );
 
-        let mut dag = make_dag(vec![source, staging, table_a, table_b]);
+        let mut dag = make_dag(vec![temp_b, temp_a, sink]);
         dag.sources = vec![SourceNode {
-            name: "raw".to_string(),
-            schema: Arc::clone(&schema),
+            name: "orders".to_string(),
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
         }];
-        pass().run(&mut dag).await.expect("pass should succeed");
 
-        let rewritten = dag
-            .nodes
-            .get("staging".to_string())
-            .unwrap()
-            .query_text
-            .clone();
+        let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::new(engine));
+        pass.run(&mut dag)
+            .await
+            .expect("pass should succeed even when one TempTable's query references another");
 
-        // The combined OR filter must be present.
+        let rewritten = dag.nodes.get("temp_a".to_string()).unwrap().query_text.clone();
         assert!(
-            rewritten.contains("'US'") && rewritten.contains("'EU'"),
-            "OR filter predicates must be pushed into the TempTable query; got: {}",
-            rewritten
-        );
-        assert!(
-            rewritten.contains("OR"),
-            "filter predicates must be combined with OR; got: {}",
-            rewritten
-        );
-
-        // `id` is not needed by either consumer — it must not appear in the
-        // outer SELECT projection.  It may still appear inside the preserved
-        // inner subquery, but the outer SELECT determines what gets materialised.
-        let outer_proj = rewritten.split("FROM (").next().unwrap_or("");
-        assert!(
-            !outer_proj.contains("\"id\"")
-                && !outer_proj
-                    .split_whitespace()
-                    .any(|t| t.trim_matches(',') == "id"),
-            "column `id` must not appear in the outer SELECT projection; got: {}",
-            rewritten
+            rewritten.contains("'US'"),
+            "filter should be pushed into temp_a; got: {rewritten}"
         );
     }
 
     // DAG layout:
     //
-    //   source (View)
+    //   orders (source, real table)
     //       │
-    //   staging (TempTable)   SELECT id, region, amount, is_active FROM source
+    //   staging (TempTable)   SELECT order_id, region, amount, status FROM orders
     //       │
-    //   table_a (Table)   SELECT region, amount FROM staging WHERE is_active
+    //   table_a (Table)   SELECT region, amount FROM staging WHERE status = 'open'
     //
-    // `is_active` is referenced only in the filter, never selected. Because
-    // `OpaqueScanTable` reports `Exact` filter pushdown, DataFusion folds the
-    // predicate fully into `TableScan.filters` and does not require
-    // `is_active` to remain in `TableScan.projection`. Naively deriving the
-    // pruned column set from the projection alone (ignoring the filter) would
-    // drop `is_active` from the rewritten `staging` query while `table_a`'s
-    // query text still references it — producing an unresolvable column
-    // reference. The pass must keep `is_active` in `staging`'s projection.
+    // `status` is referenced only in the filter, never selected downstream.
+    // The pass must keep `status` in staging's projection since the pushed
+    // filter still needs it, even though DuckDB's own scan-level `Projections`
+    // doesn't count it as "selected".
     #[tokio::test]
     async fn test_filter_only_column_survives_projection_pruning() {
-        use crate::dag::SourceNode;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let conn = in_memory_conn().await;
+        setup_orders_table(&conn).await;
+        let engine = SimpleEngine::new(Arc::clone(&conn)).unwrap();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount", DataType::Float64, false),
-            Field::new("is_active", DataType::Boolean, false),
-        ]));
-
-        let source = node("source", "SELECT * FROM raw", MaterializeMode::View, &[]);
         let staging = node(
             "staging",
-            "SELECT id, region, amount, is_active FROM source",
+            "SELECT order_id, region, amount, status FROM orders",
             MaterializeMode::TempTable,
-            &["source"],
+            &[],
         );
         let table_a = node(
             "table_a",
-            "SELECT region, amount FROM staging WHERE is_active",
+            "SELECT region, amount FROM staging WHERE status = 'open'",
             MaterializeMode::Table,
             &["staging"],
         );
 
-        let mut dag = make_dag(vec![source, staging, table_a]);
+        let mut dag = make_dag(vec![staging, table_a]);
         dag.sources = vec![SourceNode {
-            name: "raw".to_string(),
-            schema: Arc::clone(&schema),
+            name: "orders".to_string(),
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
         }];
-        pass().run(&mut dag).await.expect("pass should succeed");
+
+        let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::new(engine));
+        pass.run(&mut dag).await.expect("pass should succeed");
 
         let rewritten_node = dag.nodes.get("staging".to_string()).unwrap();
         let rewritten = rewritten_node.query_text.clone();
 
         assert!(
-            rewritten.contains("is_active"),
-            "column `is_active` (referenced only by a pushed-down filter) must \
+            rewritten.contains("status"),
+            "column `status` (referenced only by a pushed-down filter) must \
              survive projection pruning in the rewritten TempTable query; got: {}",
             rewritten
         );
 
-        // The schema recorded for the TempTable must also retain the column,
-        // since that schema governs what the materialized table actually has.
         let schema = rewritten_node
             .schema
             .as_ref()
             .expect("pushdown should have recorded a schema for staging");
         assert!(
-            schema.field_with_name("is_active").is_ok(),
-            "recorded schema for staging must include `is_active`; got fields: {:?}",
+            schema.field_with_name("status").is_ok(),
+            "recorded schema for staging must include `status`; got fields: {:?}",
             schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
         );
     }
@@ -1586,7 +1597,7 @@ mod tests {
 
     // DAG layout:
     //
-    //   raw (source, arrow schema)
+    //   raw (source)
     //    │
     //   cleaned (View)   SELECT id, amount FROM raw WHERE amount > 0
     //    │
@@ -1599,16 +1610,9 @@ mod tests {
     //   - `summary`'s query_text should no longer reference `cleaned` by name
     #[tokio::test]
     async fn test_graph_minor_single_view_inlined_into_table() {
-        use crate::dag::SourceNode;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("amount", DataType::Float64, false),
-        ]));
         let source = SourceNode {
             name: "raw".to_string(),
-            schema,
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
         };
 
         let cleaned = node(
@@ -1629,7 +1633,6 @@ mod tests {
 
         let minor = graph_minor(&dag).await.expect("graph_minor should succeed");
 
-        // No views should remain.
         let view_count = minor
             .nodes
             .nodes()
@@ -1637,7 +1640,6 @@ mod tests {
             .count();
         assert_eq!(view_count, 0, "result DAG must contain no View nodes");
 
-        // summary must still be present as a Table.
         let summary_node = minor
             .nodes
             .get("summary".to_string())
@@ -1647,16 +1649,11 @@ mod tests {
             "summary must remain a Table"
         );
 
-        // The view's filter logic must be present in the inlined query.
         assert!(
-            summary_node.query_text.contains("amount > 0")
-                || summary_node.query_text.contains("amount > 0.0"),
+            summary_node.query_text.contains("amount > 0"),
             "inlined query must contain the view's filter predicate; got: {}",
             summary_node.query_text
         );
-        // `cleaned` must no longer exist as an independent table reference —
-        // it should appear only as a subquery alias (if at all), meaning `FROM
-        // cleaned` without a surrounding subquery is gone.
         assert!(
             !summary_node
                 .query_text
@@ -1682,16 +1679,9 @@ mod tests {
     //   - `output` should be the only node and reference neither view by name.
     #[tokio::test]
     async fn test_graph_minor_chained_views_all_inlined() {
-        use crate::dag::SourceNode;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("val", DataType::Int64, false),
-        ]));
         let source = SourceNode {
             name: "raw".to_string(),
-            schema,
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
         };
 
         let step_one = node(
@@ -1730,13 +1720,11 @@ mod tests {
             .get("output".to_string())
             .expect("output Table must survive");
 
-        // The chained filter must be present in the fully-inlined query.
         assert!(
             output_node.query_text.contains("val > 0"),
             "inlined query must contain the chained filter predicate; got: {}",
             output_node.query_text
         );
-        // Neither view should appear as a bare FROM target any more.
         assert!(
             !output_node
                 .query_text
@@ -1755,37 +1743,80 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // pushdown tests
-    // ------------------------------------------------------------------
+    // DAG layout:
+    //
+    //   raw (source)
+    //    │
+    //   orders (View)   SELECT id, amount FROM raw WHERE amount > 0
+    //    │
+    //   summary (Table)  SELECT o.id, o.amount, x.tag
+    //                    FROM orders o
+    //                    JOIN customer_orders x ON x.order_id = o.id
+    //
+    // `summary` references a view named `orders` AND an unrelated table whose
+    // name merely *contains* "orders" as a substring (`customer_orders`). A
+    // naive `str::replace("orders", ...)` would corrupt `customer_orders` by
+    // replacing the embedded substring too. The AST-based inlining must only
+    // touch the actual `orders` table reference.
+    #[tokio::test]
+    async fn test_graph_minor_does_not_corrupt_substring_matching_table_name() {
+        let source = SourceNode {
+            name: "raw".to_string(),
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
+        };
 
-    use crate::dag::SourceNode;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let orders = node(
+            "orders",
+            "SELECT id, amount FROM raw WHERE amount > 0",
+            MaterializeMode::View,
+            &[],
+        );
+        let summary = node(
+            "summary",
+            "SELECT o.id, o.amount, x.tag FROM orders o \
+             JOIN customer_orders x ON x.order_id = o.id",
+            MaterializeMode::Table,
+            &["orders"],
+        );
+
+        let mut dag = make_dag(vec![orders, summary]);
+        dag.sources = vec![source];
+
+        let minor = graph_minor(&dag).await.expect("graph_minor should succeed");
+
+        let summary_node = minor
+            .nodes
+            .get("summary".to_string())
+            .expect("summary Table must still exist");
+
+        // The unrelated table must survive completely intact — not have its
+        // name mangled by a substring match against "orders".
+        assert!(
+            summary_node.query_text.contains("customer_orders"),
+            "unrelated table 'customer_orders' must not be corrupted; got: {}",
+            summary_node.query_text
+        );
+        // The view's own filter must be inlined.
+        assert!(
+            summary_node.query_text.contains("amount > 0"),
+            "inlined query must contain the view's filter predicate; got: {}",
+            summary_node.query_text
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // pushdown() unit tests (called directly, not through the whole pass)
+    // ------------------------------------------------------------------
 
     /// Build a minimal DAG with one raw source, one TempTable, and one or more
-    /// Table sinks, with schemas resolved via `StubExecutor` so `pushdown` can
-    /// be called directly.
+    /// Table sinks, with schemas resolved against a real in-memory DuckDB
+    /// connection so `pushdown` can be called directly.
     async fn orders_dag(
+        conn: &Arc<DuckDBConnection>,
         staging_query: &str,
         sinks: Vec<(&str, &str)>, // (node_id, query_text)
     ) -> Dag {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("order_id", DataType::Int64, false),
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount", DataType::Float64, false),
-            Field::new("status", DataType::Utf8, false),
-        ]));
-        let source = SourceNode {
-            name: "orders".to_string(),
-            schema,
-        };
-
-        let staging = node(
-            "staging",
-            staging_query,
-            MaterializeMode::TempTable,
-            &[], // raw source is not a graph node
-        );
+        let staging = node("staging", staging_query, MaterializeMode::TempTable, &[]);
 
         let mut all_nodes = vec![staging];
         for (id, query) in &sinks {
@@ -1793,8 +1824,13 @@ mod tests {
         }
 
         let mut dag = make_dag(all_nodes);
-        dag.sources = vec![source];
-        StubExecutor
+        dag.sources = vec![SourceNode {
+            name: "orders".to_string(),
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
+        }];
+        let engine: SimpleEngine<DuckDBConnection> =
+            SimpleEngine::new(Arc::clone(conn)).expect("SimpleEngine::new should not fail");
+        engine
             .resolve_schemas(&mut dag)
             .await
             .expect("resolve_schemas should succeed in test");
@@ -1803,7 +1839,7 @@ mod tests {
 
     // DAG layout:
     //
-    //   orders (raw source, schema: order_id, region, amount, status)
+    //   orders (raw source, real table)
     //       │
     //   staging (TempTable)   SELECT * FROM orders
     //       │
@@ -1811,14 +1847,15 @@ mod tests {
     //
     // The single frontier Table filters on `region = 'US'` and projects only
     // `order_id` and `amount`.  The `pushdown` function should produce a plan
-    // for `staging` that:
-    //   - Applies `region = 'US'` as a filter (the optimizer has no reason to
-    //     weaken it when there is only one consumer).
-    //   - Projects only the columns actually needed: `order_id` and `amount`.
-    //     (`region` is needed for the filter itself; `status` is unreferenced.)
+    // for `staging` that applies that filter and prunes to those columns
+    // (`region` survives for the filter; `status` is unreferenced).
     #[tokio::test]
     async fn test_pushdown_single_table_filter_and_projection() {
+        let conn = in_memory_conn().await;
+        setup_orders_table(&conn).await;
+
         let dag = orders_dag(
+            &conn,
             "SELECT order_id, region, amount, status FROM orders",
             vec![(
                 "us_orders",
@@ -1827,19 +1864,22 @@ mod tests {
         )
         .await;
 
+        let scratch_names = materialize_scratch_dag(&dag, conn.as_ref())
+            .await
+            .expect("materialize_scratch_dag should succeed");
+
         let PushdownResult {
             source_sql: sql, ..
-        } = pushdown(&dag, "staging")
+        } = pushdown(&dag, "staging", conn.as_ref(), &scratch_names)
             .await
             .expect("pushdown should succeed");
+
+        cleanup_scratch_dag(&dag, &scratch_names, conn.as_ref()).await;
 
         assert!(
             sql.contains("US"),
             "optimized SQL must contain the filter predicate 'US'; got:\n{sql}"
         );
-        // `status` must not appear in the outer SELECT projection.  It will
-        // still be present in the preserved inner subquery, but the outer
-        // SELECT determines what the TempTable actually materialises.
         let outer_select = sql.split("FROM (").next().unwrap_or("");
         assert!(
             !outer_select.contains("status"),
@@ -1849,7 +1889,7 @@ mod tests {
 
     // DAG layout:
     //
-    //   orders (raw source)
+    //   orders (raw source, real table)
     //       │
     //   staging (TempTable)   SELECT * FROM orders
     //       ├──► us_orders (Table)   SELECT order_id, amount FROM staging WHERE region = 'US'
@@ -1857,11 +1897,13 @@ mod tests {
     //
     // Two frontier Tables with *different* region filters.  The `pushdown`
     // function must OR the two predicates so that both consumers' rows survive.
-    // Both consumers select the same columns (`order_id`, `amount`), so the
-    // projection can still be pruned — `status` is not needed by either.
     #[tokio::test]
     async fn test_pushdown_multiple_tables_filters_combined_with_or() {
+        let conn = in_memory_conn().await;
+        setup_orders_table(&conn).await;
+
         let dag = orders_dag(
+            &conn,
             "SELECT order_id, region, amount, status FROM orders",
             vec![
                 (
@@ -1876,26 +1918,145 @@ mod tests {
         )
         .await;
 
+        let scratch_names = materialize_scratch_dag(&dag, conn.as_ref())
+            .await
+            .expect("materialize_scratch_dag should succeed");
+
         let PushdownResult {
             source_sql: sql, ..
-        } = pushdown(&dag, "staging")
+        } = pushdown(&dag, "staging", conn.as_ref(), &scratch_names)
             .await
             .expect("pushdown should succeed");
 
-        // Both filter arms must appear in the SQL.
-        assert!(
-            sql.contains("US"),
-            "SQL must contain the 'US' filter arm; got:\n{sql}"
-        );
-        assert!(
-            sql.contains("EU"),
-            "SQL must contain the 'EU' filter arm; got:\n{sql}"
-        );
-        // `status` must not appear in the outer SELECT projection.
+        cleanup_scratch_dag(&dag, &scratch_names, conn.as_ref()).await;
+
+        assert!(sql.contains("US"), "SQL must contain the 'US' filter arm; got:\n{sql}");
+        assert!(sql.contains("EU"), "SQL must contain the 'EU' filter arm; got:\n{sql}");
         let outer_select = sql.split("FROM (").next().unwrap_or("");
         assert!(
             !outer_select.contains("status"),
             "column `status` should be absent from the outer SELECT projection; got:\n{sql}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Dead-column pruning unit tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_prune_dead_source_columns_removes_unused_nested_column() {
+        let sql = r#"SELECT x."a" FROM (SELECT "a", "b", "c" FROM "staging") AS x"#;
+        let pruned = prune_dead_source_columns(
+            sql,
+            "staging",
+            &["a".to_string()],
+            DialectType::DuckDB,
+        )
+        .expect("should prune");
+        assert!(pruned.contains('a'));
+        assert!(!pruned.contains('b'), "got: {pruned}");
+        assert!(!pruned.contains('c'), "got: {pruned}");
+    }
+
+    // Regression test for a real benchmark failure: a nested SELECT that
+    // computes an *aggregate* over a source column (not a plain pass-through)
+    // must never be pruned based on the aggregate's own output alias, since
+    // that alias (`mean_temp`) will never match any of `staging`'s physical
+    // column names (`avg_temp`) — a naive alias-based check would wrongly
+    // drop it even though it's the CTE's entire reason for existing.
+    #[test]
+    fn test_prune_dead_source_columns_never_drops_computed_aggregate_columns() {
+        let sql = r#"WITH stats AS (
+            SELECT device_id, AVG(avg_temp) AS mean_temp, STDDEV(avg_temp) AS std_temp
+            FROM "staging"
+            GROUP BY device_id
+        )
+        SELECT h.device_id, s.mean_temp, s.std_temp
+        FROM "staging" AS h JOIN stats AS s USING (device_id)"#;
+
+        // `keep_cols` only contains `device_id` and `avg_temp` — the CTE's
+        // computed `mean_temp`/`std_temp` outputs are correctly absent from
+        // this list (they aren't physical columns of `staging` at all), but
+        // that must not cause them to be pruned from the CTE's SELECT list.
+        let pruned = prune_dead_source_columns(
+            sql,
+            "staging",
+            &["device_id".to_string(), "avg_temp".to_string()],
+            DialectType::DuckDB,
+        )
+        .expect("should parse/regenerate");
+
+        assert!(
+            pruned.contains("mean_temp") && pruned.contains("std_temp"),
+            "computed aggregate columns must never be pruned; got: {pruned}"
+        );
+    }
+
+    // Regression test for a real benchmark failure: `SELECT pp.*, ...` needs
+    // every column of `staging` (via the star), but `get_column_names` never
+    // enumerates the physical columns a star expands to, so a naive
+    // safety-net that only looks at `Expression::Column` nodes would miss
+    // this entirely and let genuinely-needed columns get pruned away.
+    #[test]
+    fn test_collect_unprunable_source_columns_bails_out_on_star() {
+        let sql = r#"SELECT pp.*, ROW_NUMBER() OVER (ORDER BY x) AS rn FROM "staging" AS pp"#;
+        let result = collect_unprunable_source_columns(sql, "staging", DialectType::DuckDB);
+        assert!(
+            result.is_none(),
+            "a star touching a scan of source must force 'need all columns'; got: {result:?}"
+        );
+    }
+
+    // Regression test for a real benchmark failure: `avg(avg_voltage) AS
+    // avg_voltage` is a single, unjoined (i.e. "prunable"-shaped) scan of
+    // `staging`, but the select-list item computes an aggregate rather than
+    // passing a column straight through — `avg_voltage` (the argument) must
+    // still be treated as needed even though the select's *shape* would
+    // otherwise be eligible for pruning, and even though the output alias
+    // happens to share its name with the underlying physical column.
+    #[test]
+    fn test_collect_unprunable_source_columns_keeps_aggregate_arguments_in_prunable_select() {
+        let sql = r#"SELECT region, AVG(avg_voltage) AS avg_voltage FROM "staging" GROUP BY region"#;
+        let cols = collect_unprunable_source_columns(sql, "staging", DialectType::DuckDB)
+            .expect("no star present, should return a concrete set");
+        assert!(
+            cols.contains("avg_voltage"),
+            "aggregate argument must be kept regardless; got: {cols:?}"
+        );
+        assert!(
+            cols.contains("region"),
+            "GROUP BY column must be kept regardless; got: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn test_prune_dead_source_columns_never_touches_outermost_select() {
+        // staging is scanned directly at the top level here — nothing "above"
+        // this statement to prune against, so it must be left untouched even
+        // though `keep_cols` is narrower than what's selected.
+        let sql = r#"SELECT "a", "b" FROM "staging""#;
+        let pruned = prune_dead_source_columns(
+            sql,
+            "staging",
+            &["a".to_string()],
+            DialectType::DuckDB,
+        )
+        .expect("should parse/regenerate");
+        assert!(pruned.contains('b'), "outermost SELECT must be untouched; got: {pruned}");
+    }
+
+    #[test]
+    fn test_prune_dead_source_columns_skips_joined_scan() {
+        // staging appears in a JOIN here — the conservative pruning pass must
+        // leave it alone rather than risk ambiguous column attribution.
+        let sql = r#"SELECT x."a" FROM (SELECT "a", "b" FROM "staging" JOIN "other" ON "a" = "id") AS x"#;
+        let pruned = prune_dead_source_columns(
+            sql,
+            "staging",
+            &["a".to_string()],
+            DialectType::DuckDB,
+        )
+        .expect("should parse/regenerate");
+        assert!(pruned.contains('b'), "joined scan must be left untouched; got: {pruned}");
     }
 }

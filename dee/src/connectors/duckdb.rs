@@ -1,15 +1,78 @@
 use crate::{
-    connectors::{Connector, ConnectorError},
+    connectors::{Connector, ConnectorError, PushdownInfo},
     dag::MaterializeMode,
 };
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use duckdb::arrow::datatypes::SchemaRef;
 use duckdb::{Config, DuckdbConnectionManager, params};
 use log::{info, trace};
 use r2d2::Pool;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, process::Command, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, process::Command, sync::Arc, time::Duration};
 use tempfile;
+
+/// Shape of a single node in DuckDB's `EXPLAIN (FORMAT JSON)` output, just
+/// enough of it to find scan operators and read back what they pushed down.
+#[derive(Deserialize, Debug, Default)]
+struct ExplainNode {
+    #[serde(default)]
+    children: Vec<ExplainNode>,
+    #[serde(default)]
+    extra_info: ExplainExtraInfo,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct ExplainExtraInfo {
+    #[serde(rename = "Table")]
+    table: Option<String>,
+    #[serde(rename = "Projections", default, deserialize_with = "string_or_vec")]
+    projections: Vec<String>,
+    #[serde(rename = "Filters", default, deserialize_with = "string_or_vec")]
+    filters: Vec<String>,
+}
+
+/// DuckDB's `EXPLAIN (FORMAT JSON)` serializes a single-element
+/// `Projections`/`Filters` list as a bare string rather than a one-element
+/// array, so this accepts either shape.
+fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+    Ok(match StringOrVec::deserialize(deserializer)? {
+        StringOrVec::Single(s) => vec![s],
+        StringOrVec::Multiple(v) => v,
+    })
+}
+
+/// Walk `node` and its children, recording the pushed-down projections and
+/// filters of every scan operator (identified by the presence of a `Table`
+/// key in `extra_info`) into `out`, keyed by the relation's bare name (any
+/// catalog/schema qualification DuckDB reports is stripped).
+fn collect_scan_pushdowns(node: &ExplainNode, out: &mut HashMap<String, PushdownInfo>) {
+    if let Some(table) = &node.extra_info.table {
+        let relation = table.rsplit('.').next().unwrap_or(table).to_string();
+        let entry = out.entry(relation).or_default();
+        for p in &node.extra_info.projections {
+            if !entry.projections.contains(p) {
+                entry.projections.push(p.clone());
+            }
+        }
+        for f in &node.extra_info.filters {
+            if !entry.filters.contains(f) {
+                entry.filters.push(f.clone());
+            }
+        }
+    }
+    for child in &node.children {
+        collect_scan_pushdowns(child, out);
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DuckDBConfig {
@@ -290,6 +353,45 @@ impl Connector for DuckDBConnection {
         }
     }
 
+    async fn pushdown(
+        &self,
+        query_text: &str,
+    ) -> Result<Option<HashMap<String, PushdownInfo>>, ConnectorError> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
+
+        let explain_query = format!("EXPLAIN (FORMAT JSON) {}", query_text);
+        let mut stmt = conn.prepare(&explain_query).map_err(|e| {
+            ConnectorError::Execute(format!("Failed to prepare explain: {}", e))
+        })?;
+
+        let json_str: String = stmt
+            .query_row([], |row| {
+                let col_count = row.as_ref().column_count();
+                if col_count >= 2 {
+                    row.get(1)
+                } else {
+                    row.get(0)
+                }
+            })
+            .map_err(|e| ConnectorError::Execute(format!("Failed to execute explain: {}", e)))?;
+
+        let plans: Vec<ExplainNode> = serde_json::from_str(&json_str).map_err(|e| {
+            ConnectorError::Execute(format!(
+                "Failed to parse explain JSON: {e} - json:\n{json_str}"
+            ))
+        })?;
+
+        let mut result: HashMap<String, PushdownInfo> = HashMap::new();
+        for plan in &plans {
+            collect_scan_pushdowns(plan, &mut result);
+        }
+
+        Ok(Some(result))
+    }
+
     async fn sample_system_memory_usage(&self) -> Result<Option<u64>, ConnectorError> {
         let conn = self
             .pool
@@ -329,5 +431,86 @@ mod tests {
         let cpu = sample_process_cpu_usage(std::process::id()).unwrap();
         assert!(cpu.is_some());
         assert!(cpu.unwrap() >= 0.0);
+    }
+
+    async fn in_memory_conn() -> Arc<DuckDBConnection> {
+        let config = DuckDBConfig::new_from_path(":memory:".to_string());
+        DuckDBConnection::new(config).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_pushdown_reports_filter_and_projection() {
+        let conn = in_memory_conn().await;
+        conn.execute(
+            "CREATE TABLE t AS SELECT range AS a, range*2 AS b, range*3 AS c FROM range(100)"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let result = conn
+            .pushdown("SELECT a, b FROM t WHERE a > 10 AND c < 50")
+            .await
+            .unwrap()
+            .expect("duckdb connector should support pushdown");
+
+        let t = result.get("t").expect("scan of t should be reported");
+        assert_eq!(t.projections, vec!["a", "b"]);
+        assert_eq!(t.filters.len(), 2);
+        assert!(t.filters.iter().any(|f| f.contains('a')));
+        assert!(t.filters.iter().any(|f| f.contains('c')));
+    }
+
+    #[tokio::test]
+    async fn test_pushdown_single_projection_and_filter_not_treated_as_chars() {
+        let conn = in_memory_conn().await;
+        conn.execute("CREATE TABLE t AS SELECT range AS a FROM range(10)".to_string())
+            .await
+            .unwrap();
+
+        let result = conn
+            .pushdown("SELECT a FROM t WHERE a > 5")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let t = result.get("t").unwrap();
+        assert_eq!(t.projections, vec!["a"]);
+        assert_eq!(t.filters, vec!["a>5"]);
+    }
+
+    #[tokio::test]
+    async fn test_pushdown_sees_through_views_to_base_table() {
+        let conn = in_memory_conn().await;
+        conn.execute(
+            "CREATE TABLE t AS SELECT range AS a, range*2 AS b, range*3 AS c FROM range(100)"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        conn.execute("CREATE VIEW v AS SELECT a, b, c FROM t WHERE a > 5".to_string())
+            .await
+            .unwrap();
+
+        let result = conn.pushdown("SELECT a FROM v").await.unwrap().unwrap();
+
+        // Only the base table shows up; the view is inlined by DuckDB's planner.
+        assert!(result.contains_key("t"));
+        assert!(!result.contains_key("v"));
+        assert_eq!(result["t"].projections, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn test_pushdown_no_filter_reports_empty_filters() {
+        let conn = in_memory_conn().await;
+        conn.execute("CREATE TABLE t AS SELECT range AS a FROM range(10)".to_string())
+            .await
+            .unwrap();
+
+        let result = conn.pushdown("SELECT a FROM t").await.unwrap().unwrap();
+
+        let t = result.get("t").unwrap();
+        assert_eq!(t.projections, vec!["a"]);
+        assert!(t.filters.is_empty());
     }
 }

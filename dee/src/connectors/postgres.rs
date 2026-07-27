@@ -3,7 +3,7 @@ use crate::{
     dag::MaterializeMode,
 };
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use duckdb::arrow::datatypes::SchemaRef;
 use serde::{Deserialize, Serialize};
 use sqlx::{
     ConnectOptions, Executor, PgPool, Row,

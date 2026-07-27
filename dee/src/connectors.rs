@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
-use std::sync::Arc;
+use ::duckdb::arrow::datatypes::SchemaRef;
+use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 
 use crate::dag::MaterializeMode;
@@ -15,6 +15,18 @@ pub enum ConnectorError {
     Create(String),
     #[error("couldn't execute query against connector - {0}")]
     Execute(String),
+}
+
+/// What can be pushed down into a single relation, as reported by a
+/// connector's native query planner (e.g. DuckDB's `EXPLAIN (FORMAT JSON)`).
+///
+/// `projections` are the column names the plan actually reads from the
+/// relation; `filters` are raw SQL predicate strings (in the connector's own
+/// dialect) that the plan applies directly against a scan of the relation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushdownInfo {
+    pub projections: Vec<String>,
+    pub filters: Vec<String>,
 }
 
 #[async_trait]
@@ -50,6 +62,20 @@ pub trait Connector {
     ) -> Result<usize, ConnectorError>;
 
     async fn get_schema(&self, name: String) -> Option<Result<SchemaRef, ConnectorError>>;
+
+    /// Ask the connector's own query planner what can be pushed down into
+    /// each relation `query_text` scans, keyed by relation name.
+    ///
+    /// Returns `Ok(None)` when the connector has no native way to answer
+    /// this (e.g. Postgres today). Returns `Ok(Some(map))` — possibly with
+    /// an empty map if the query scans no relations directly (e.g. a
+    /// constant-only `SELECT`) — when the connector could analyze the query.
+    async fn pushdown(
+        &self,
+        _query_text: &str,
+    ) -> Result<Option<HashMap<String, PushdownInfo>>, ConnectorError> {
+        Ok(None)
+    }
 
     async fn sample_system_cpu_usage(&self) -> Result<Option<f64>, ConnectorError> {
         Ok(None)
