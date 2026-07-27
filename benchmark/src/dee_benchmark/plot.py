@@ -154,6 +154,55 @@ def plot_deep_dive(results, output_path):
     print(f"\nDeep dive visualization saved to {output_path}")
 
 
+def plot_pushdown_comparison(results, output_path):
+    """Bar chart comparing HMP-only vs HMP+pushdown mean runtime per project,
+    from `benchmark_pushdown_comparison`'s results (each a dict with
+    `hmp_only_distribution` / `hmp_pushdown_distribution` lists of per-run
+    wall-clock seconds)."""
+    if not results:
+        print("No results to plot.")
+        return
+
+    projects = [r["project"] for r in results]
+    hmp_only_means = [np.mean(r["hmp_only_distribution"]) for r in results]
+    hmp_pushdown_means = [np.mean(r["hmp_pushdown_distribution"]) for r in results]
+    hmp_only_stds = [np.std(r["hmp_only_distribution"]) for r in results]
+    hmp_pushdown_stds = [np.std(r["hmp_pushdown_distribution"]) for r in results]
+
+    x = np.arange(len(projects))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    bars_only = ax.bar(
+        x - width / 2, hmp_only_means, width, yerr=hmp_only_stds,
+        label="HMP only", color="darkorange", capsize=4,
+    )
+    bars_pushdown = ax.bar(
+        x + width / 2, hmp_pushdown_means, width, yerr=hmp_pushdown_stds,
+        label="HMP + pushdown", color="steelblue", capsize=4,
+    )
+
+    for i, r in enumerate(results):
+        speedup = r["speedup"]
+        color = "red" if r["is_regression"] else "green"
+        top = max(hmp_only_means[i] + hmp_only_stds[i], hmp_pushdown_means[i] + hmp_pushdown_stds[i])
+        ax.text(
+            x[i], top, f"{speedup:.2f}x", ha="center", va="bottom",
+            fontweight="bold", color=color,
+        )
+
+    ax.set_ylabel("Mean Runtime (s)")
+    ax.set_title("HMP Only vs HMP + Pushdown Runtime by Project")
+    ax.set_xticks(x)
+    ax.set_xticklabels(projects, rotation=45, ha="right")
+    ax.legend()
+    ax.grid(True, axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout()
+
+    plt.savefig(output_path)
+    print(f"\nPushdown comparison visualization saved to {output_path}")
+
+
 def _plot_pass_iterations(results, output_path, pass_name):
     if not results:
         print("No results to plot.")
