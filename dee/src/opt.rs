@@ -16,7 +16,6 @@ use crate::{
     dag::Dag,
     executor::Executor,
     opt::{
-        common::validate_dag,
         hmp::{HMPPass, HMPStrategy},
         omp::{OMPCentrality, OMPPass},
         pushdown::PushdownPass,
@@ -185,9 +184,6 @@ where
             if self.stats_on_passes {
                 stats.insert("HMPPass".to_string(), Arc::new(res));
             }
-            if let Err(e) = validate_dag(dag).await {
-                warn!("HMPPass produced an invalid DAG: {e}");
-            }
         } else {
             debug!("skipping HMP pass");
         }
@@ -209,9 +205,6 @@ where
             if self.stats_on_passes {
                 stats.insert("OMPPass".to_string(), Arc::new(res));
             }
-            if let Err(e) = validate_dag(dag).await {
-                warn!("OMPPass produced an invalid DAG: {e}");
-            }
         } else {
             debug!("skipping OMP pass");
         }
@@ -226,9 +219,6 @@ where
             }
             if self.stats_on_passes {
                 stats.insert("PushdownPass".to_string(), Arc::new(res));
-            }
-            if let Err(e) = validate_dag(dag).await {
-                warn!("PushdownPass produced an invalid DAG: {e}");
             }
         } else {
             debug!("skipping Pushdown pass");

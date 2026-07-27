@@ -2,9 +2,6 @@
 members = ["dee", "dee-cli"]
 resolver = "3"
 
-[patch."https://github.com/drewrip/datafusion.git"]
-datafusion = { path = "../datafusion/datafusion/core" }
-
 [workspace.package]
 authors = ["Drew Ripberger <aripberg@cs.cmu.edu>"]
 version = "0.1.0"

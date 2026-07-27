@@ -19,6 +19,34 @@ use crate::{
     profile::SystemUsageSample,
 };
 
+/// Split a possibly-qualified, possibly double-quoted SQL identifier (e.g.
+/// `foo`, `"schema".foo`, `"cat"."schema"."foo bar"`) into its dot-separated
+/// parts, stripping quotes and unescaping doubled quotes (`""` -> `"`) within
+/// quoted parts. A `.` inside a quoted part is not treated as a separator.
+fn split_qualified_identifier(id: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = id.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                if in_quotes && chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = !in_quotes;
+                }
+            }
+            '.' if !in_quotes => parts.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    parts.push(current);
+    parts
+}
+
 #[derive(Error, Debug)]
 pub enum ExecutorError {
     #[error("couldn't execute DAG - {0}")]
@@ -353,21 +381,22 @@ where
     async fn resolve_schemas(&self, dag: &mut Dag) -> Result<(), ExecutorError> {
         const PREFIX: &str = "dee_tmp_";
 
-        // Use DataFusion's TableReference parser to handle any quoting style,
-        // then re-quote every part with double quotes so the result is always a
+        // Parse a possibly-qualified, possibly-quoted identifier (e.g.
+        // `"cat"."schema"."table"`) into its dot-separated parts, then
+        // re-quote every part with double quotes so the result is always a
         // valid DuckDB qualified identifier.
         let prefixed_name = |id: &str| -> String {
-            use datafusion::common::TableReference;
-            match TableReference::from(id) {
-                TableReference::Full { catalog, schema, table } => {
+            match split_qualified_identifier(id).as_slice() {
+                [catalog, schema, table] => {
                     format!("\"{catalog}\".\"{schema}\".\"{PREFIX}{table}\"")
                 }
-                TableReference::Partial { schema, table } => {
+                [schema, table] => {
                     format!("\"{schema}\".\"{PREFIX}{table}\"")
                 }
-                TableReference::Bare { table } => {
+                [table] => {
                     format!("{PREFIX}{table}")
                 }
+                _ => format!("{PREFIX}{id}"),
             }
         };
 
@@ -482,7 +511,7 @@ where
 
         // Step 2 — fetch schemas for all nodes.
         debug!("resolve_schemas: fetching schemas for {} node(s)", topo.len());
-        let mut resolved_nodes: Vec<(String, datafusion::arrow::datatypes::SchemaRef)> = Vec::new();
+        let mut resolved_nodes: Vec<(String, duckdb::arrow::datatypes::SchemaRef)> = Vec::new();
         for orig_id in &topo {
             let tmp_id = &rename_map[orig_id];
             match self.conn.get_schema(tmp_id.clone()).await {
@@ -509,7 +538,7 @@ where
 
         // Step 2b — fetch schemas for all sources.
         debug!("resolve_schemas: fetching schemas for {} source(s)", dag.sources.len());
-        let mut resolved_sources: Vec<datafusion::arrow::datatypes::SchemaRef> = Vec::new();
+        let mut resolved_sources: Vec<duckdb::arrow::datatypes::SchemaRef> = Vec::new();
         for (src, tmp_name) in dag.sources.iter().zip(source_tmp_names.iter()) {
             match self.conn.get_schema(tmp_name.clone()).await {
                 Some(Ok(schema)) => {
@@ -569,4 +598,62 @@ pub struct NodeStats {
     pub finish: DateTime<Utc>,
     pub duration: TimeDelta,
     pub plan: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_qualified_identifier;
+
+    #[test]
+    fn splits_bare_identifier() {
+        assert_eq!(split_qualified_identifier("foo"), vec!["foo"]);
+    }
+
+    #[test]
+    fn splits_partial_identifier() {
+        assert_eq!(
+            split_qualified_identifier("schema.foo"),
+            vec!["schema", "foo"]
+        );
+    }
+
+    #[test]
+    fn splits_full_identifier() {
+        assert_eq!(
+            split_qualified_identifier("cat.schema.foo"),
+            vec!["cat", "schema", "foo"]
+        );
+    }
+
+    #[test]
+    fn strips_quotes_from_parts() {
+        assert_eq!(
+            split_qualified_identifier("\"schema\".\"foo\""),
+            vec!["schema", "foo"]
+        );
+    }
+
+    #[test]
+    fn dot_inside_quotes_is_not_a_separator() {
+        assert_eq!(
+            split_qualified_identifier("\"schema\".\"foo.bar\""),
+            vec!["schema", "foo.bar"]
+        );
+    }
+
+    #[test]
+    fn unescapes_doubled_quotes_inside_quoted_part() {
+        assert_eq!(
+            split_qualified_identifier("\"foo \"\"bar\"\"\""),
+            vec!["foo \"bar\""]
+        );
+    }
+
+    #[test]
+    fn mixed_quoted_and_bare_parts() {
+        assert_eq!(
+            split_qualified_identifier("cat.\"My Schema\".foo"),
+            vec!["cat", "My Schema", "foo"]
+        );
+    }
 }

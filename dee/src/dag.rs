@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use std::collections::HashSet;
 
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use duckdb::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use thiserror::Error;
 
 use crate::{
