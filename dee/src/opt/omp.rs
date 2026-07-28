@@ -148,15 +148,18 @@ where
             .map(|r| r.duration.num_milliseconds() as f32)
             .map_err(|e| OptimizerError::Exec(format!("baseline run failed: {e}")))?;
 
-        // Only nodes with more than one downstream consumer benefit from
-        // materialization (out-degree > 1). Rank the survivors by the chosen
-        // centrality metric; in Paths mode, out-degree is still the filter —
-        // paths-to-sinks is only used to break ties among qualifying nodes.
+        // Only nodes with more than one downstream consumer (out-degree > 1)
+        // AND more than one downstream path reaching a TABLE/TEMP_TABLE node
+        // benefit from materialization — otherwise there's nothing to
+        // deduplicate. Rank the survivors by the chosen centrality metric;
+        // in Paths mode, these two checks are still the filter — paths-to-sinks
+        // is only used a second time to break ties among qualifying nodes.
         let mut candidates: Vec<(String, usize)> = dag
             .nodes
             .nodes()
             .map(|n| (n.id.clone(), dag.nodes.out_degree(&n.id)))
             .filter(|(_, out_degree)| *out_degree > 1)
+            .filter(|(id, _)| dag.nodes.paths_to_sinks(id) > 1)
             .map(|(id, out_degree)| {
                 let rank = match self.centrality {
                     OMPCentrality::OutDegree => out_degree,
@@ -471,7 +474,7 @@ where
         {cards}
         <div class="panel">
           <h2>Why these nodes were considered</h2>
-          <div class="subtle">Only nodes with more than one downstream consumer (out-degree &gt; 1) can benefit from materialization. Candidates are ranked by {centrality_label}; the working set is the top {top_n} of them.</div>
+          <div class="subtle">Only nodes with more than one downstream consumer (out-degree &gt; 1) and more than one downstream path to a TABLE/TEMP_TABLE node can benefit from materialization. Candidates are ranked by {centrality_label}; the working set is the top {top_n} of them.</div>
           {candidate_table}
         </div>
         <div class="panel">
