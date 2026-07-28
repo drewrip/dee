@@ -95,6 +95,9 @@ where
     hmp_strategy: HMPStrategy,
     /// HMP: use pushdown before each candidate evaluation
     hmp_use_pushdown: bool,
+    /// HMP: number of hypotheses the `Greedy` strategy's beam search keeps
+    /// alive at each step.
+    hmp_beam_width: usize,
     /// Pushdown pass
     run_pushdown_pass: bool,
     /// Result stats
@@ -134,6 +137,7 @@ where
             hmp_normalize_with_cardinality: config.hmp_normalize_with_cardinality,
             hmp_strategy: config.hmp_strategy,
             hmp_use_pushdown: config.hmp_use_pushdown,
+            hmp_beam_width: config.hmp_beam_width,
             run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
             explain_enabled: config.explain,
@@ -175,6 +179,7 @@ where
                 self.hmp_normalize_with_cardinality,
                 self.hmp_strategy,
                 self.hmp_use_pushdown,
+                self.hmp_beam_width,
             );
             let res = pass.run(dag).await?;
             if self.explain_enabled {
@@ -244,6 +249,9 @@ pub struct OptimizerConfig {
     pub hmp_normalize_with_cardinality: bool,
     pub hmp_strategy: HMPStrategy,
     pub hmp_use_pushdown: bool,
+    /// HMP: number of hypotheses the `Greedy` strategy's beam search keeps
+    /// alive at each step. Unused by the `Breadth` strategy.
+    pub hmp_beam_width: usize,
     pub run_pushdown_pass: bool,
     /// Collect an `Explain` HTML section from each pass during `run()`.
     pub explain: bool,
@@ -266,6 +274,7 @@ impl Default for OptimizerConfig {
             hmp_normalize_with_cardinality: false,
             hmp_strategy: HMPStrategy::default(),
             hmp_use_pushdown: true,
+            hmp_beam_width: 2,
             run_pushdown_pass: false,
             explain: false,
         }
@@ -372,6 +381,13 @@ impl OptimizerConfig {
 
     pub fn with_hmp_use_pushdown(mut self, use_pushdown: bool) -> Self {
         self.hmp_use_pushdown = use_pushdown;
+        self
+    }
+
+    /// Number of hypotheses the `Greedy` strategy's beam search keeps alive
+    /// at each step. Unused by the `Breadth` strategy.
+    pub fn with_hmp_beam_width(mut self, beam_width: usize) -> Self {
+        self.hmp_beam_width = beam_width.max(1);
         self
     }
 

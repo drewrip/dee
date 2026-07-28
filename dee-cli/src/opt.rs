@@ -39,6 +39,7 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
         .with_hmp_show_operators(opt_cmd.hmp_show_operators)
         .with_hmp_show_nodes(opt_cmd.hmp_show_nodes)
         .with_hmp_normalize_with_cardinality(opt_cmd.hmp_normalize_with_cardinality)
+        .with_hmp_beam_width(opt_cmd.hmp_beam_width)
         .with_explain(opt_cmd.explain.is_some());
 
     if let Some(enabled_passes) = opt_cmd.enable {

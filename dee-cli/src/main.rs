@@ -107,6 +107,10 @@ pub struct OptCommand {
     /// materialization that improves performance.
     #[arg(long, default_value = "breadth")]
     hmp_strategy: CliHMPStrategy,
+    /// Number of hypotheses the `greedy` strategy's beam search keeps alive
+    /// at each step. Unused by the `breadth` strategy.
+    #[arg(long, default_value_t = 2)]
+    hmp_beam_width: usize,
     /// Disable running the PushdownPass before evaluating each HMP
     /// materialization candidate. Enabled by default for more accurate cost
     /// measurements.
