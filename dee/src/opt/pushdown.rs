@@ -3,7 +3,7 @@ use duckdb::arrow::datatypes::SchemaRef;
 use log::{debug, trace, warn};
 use polyglot_sql::{
     dialects::DialectType,
-    expressions::{Expression, Null, Select},
+    expressions::{Expression, Null, Select, With},
     traversal::ExpressionWalk,
 };
 use std::{
@@ -166,20 +166,20 @@ fn collect_unprunable_source_columns(
     let bare_source = bare_table_name(source_id);
     let mut out = HashSet::new();
     let Ok(root) = polyglot_sql::parse_one(sql, dialect) else {
-        return Some(out);
+        // Can't analyze what we can't parse — fail closed like the `SELECT
+        // *`/`table.*` case, not open like "this frontier needs nothing".
+        return None;
     };
 
-    // The outermost statement's own scan of `source` is never rewritten
-    // regardless of shape — even a bare pass-through column there must
-    // always survive.
-    if let Expression::Select(root_select) = &root {
-        if select_scans_source(root_select, &bare_source) {
-            if select_has_star(root_select) {
-                return None;
-            }
-            out.extend(polyglot_sql::ast_transforms::get_column_names(&root));
-        }
-    }
+    // Every "top-level" select — the root itself, or a branch reached from
+    // it purely through UNION (never through a nested subquery/derived-table
+    // FROM position) — has its own projection list left untouched by
+    // `prune_dead_source_columns` no matter its shape (see
+    // `prune_root_query`), so any such select that directly scans `source`
+    // needs every column it references to survive, not just its bare
+    // pass-through columns.
+    let mut top_level_selects = HashSet::new();
+    collect_top_level_select_ptrs(&root, &mut top_level_selects);
 
     for node in root.dfs() {
         if let Expression::Select(select) = node {
@@ -189,7 +189,9 @@ fn collect_unprunable_source_columns(
             if select_has_star(select) {
                 return None;
             }
-            if is_single_unjoined_source(select, &bare_source) {
+            if top_level_selects.contains(&(node as *const Expression)) {
+                out.extend(polyglot_sql::ast_transforms::get_column_names(&root));
+            } else if is_single_unjoined_source(select, &bare_source) {
                 out.extend(columns_needed_regardless(select));
             } else {
                 out.extend(polyglot_sql::ast_transforms::get_column_names(node));
@@ -198,6 +200,49 @@ fn collect_unprunable_source_columns(
     }
 
     Some(out)
+}
+
+/// Collect the identities of every "top-level" select reachable from `expr`
+/// by descending only through `UNION`/`INTERSECT`/`EXCEPT` branches — i.e.
+/// every select whose own output row shape is part of the frontier query's
+/// final result, never a droppable intermediate. `prune_root_query` never
+/// rewrites these selects' own projection lists (only their FROM/JOIN/CTE
+/// positions), matching the guarantee the plain root-`Select` case already
+/// relied on before `UNION` support existed here.
+fn collect_top_level_select_ptrs<'a>(
+    expr: &'a Expression,
+    out: &mut HashSet<*const Expression>,
+) {
+    match expr {
+        Expression::Select(_) => {
+            out.insert(expr as *const Expression);
+        }
+        Expression::Union(u) => {
+            collect_top_level_select_ptrs(&u.left, out);
+            collect_top_level_select_ptrs(&u.right, out);
+        }
+        Expression::Intersect(i) => {
+            collect_top_level_select_ptrs(&i.left, out);
+            collect_top_level_select_ptrs(&i.right, out);
+        }
+        Expression::Except(e) => {
+            collect_top_level_select_ptrs(&e.left, out);
+            collect_top_level_select_ptrs(&e.right, out);
+        }
+        _ => {}
+    }
+}
+
+/// Prune every CTE's definition in `with` (if any) as a derived table — same
+/// treatment as a FROM/JOIN position, since a CTE's body is exactly that,
+/// just referenced by name instead of inline.
+fn prune_with_ctes(with: &mut Option<With>, bare_source: &str, keep: &HashSet<String>) {
+    if let Some(with) = with.as_mut() {
+        for cte in with.ctes.iter_mut() {
+            let taken = std::mem::replace(&mut cte.this, Expression::Null(Null));
+            cte.this = prune_derived_table(taken, bare_source, keep);
+        }
+    }
 }
 
 /// Descend into every FROM/JOIN/CTE position of `select` (but never mutate
@@ -215,18 +260,19 @@ fn descend_into_from_positions(select: &mut Select, bare_source: &str, keep: &Ha
         let taken = std::mem::replace(&mut join.this, Expression::Null(Null));
         join.this = prune_derived_table(taken, bare_source, keep);
     }
-    if let Some(with) = select.with.as_mut() {
-        for cte in with.ctes.iter_mut() {
-            let taken = std::mem::replace(&mut cte.this, Expression::Null(Null));
-            cte.this = prune_derived_table(taken, bare_source, keep);
-        }
-    }
+    prune_with_ctes(&mut select.with, bare_source, keep);
 }
 
 /// Applied to an expression sitting in a FROM/JOIN/CTE position: recurse into
 /// its own nested derived tables first (bottom-up), then, if this expression
 /// is itself a single unjoined scan of `bare_source`, prune its projection
 /// list down to `keep`.
+///
+/// `UNION`/`INTERSECT`/`EXCEPT` branches are recursed into structurally
+/// (their own output rows are never pruned — same as this function never
+/// touching a `Select`'s own projection list beyond the single-unjoined-scan
+/// case — only their FROM/JOIN/CTE positions), matching
+/// [`collect_top_level_select_ptrs`]'s notion of which selects are eligible.
 fn prune_derived_table(expr: Expression, bare_source: &str, keep: &HashSet<String>) -> Expression {
     // A parenthesized derived table (`FROM (SELECT ...) AS alias`) parses as
     // `Expression::Subquery`, wrapping the actual `Select` in `.this`. Unwrap
@@ -234,6 +280,38 @@ fn prune_derived_table(expr: Expression, bare_source: &str, keep: &HashSet<Strin
     if let Expression::Subquery(mut sub) = expr {
         sub.this = prune_derived_table(sub.this, bare_source, keep);
         return Expression::Subquery(sub);
+    }
+
+    match expr {
+        // `Union`/`Intersect`/`Except` implement `Drop` (to iteratively
+        // flatten deeply left-recursive chains), which forbids partially
+        // moving out of `.left`/`.right` — take each field via
+        // `mem::replace` first instead.
+        Expression::Union(mut u) => {
+            let left = std::mem::replace(&mut u.left, Expression::Null(Null));
+            let right = std::mem::replace(&mut u.right, Expression::Null(Null));
+            u.left = prune_derived_table(left, bare_source, keep);
+            u.right = prune_derived_table(right, bare_source, keep);
+            prune_with_ctes(&mut u.with, bare_source, keep);
+            return Expression::Union(u);
+        }
+        Expression::Intersect(mut i) => {
+            let left = std::mem::replace(&mut i.left, Expression::Null(Null));
+            let right = std::mem::replace(&mut i.right, Expression::Null(Null));
+            i.left = prune_derived_table(left, bare_source, keep);
+            i.right = prune_derived_table(right, bare_source, keep);
+            prune_with_ctes(&mut i.with, bare_source, keep);
+            return Expression::Intersect(i);
+        }
+        Expression::Except(mut e) => {
+            let left = std::mem::replace(&mut e.left, Expression::Null(Null));
+            let right = std::mem::replace(&mut e.right, Expression::Null(Null));
+            e.left = prune_derived_table(left, bare_source, keep);
+            e.right = prune_derived_table(right, bare_source, keep);
+            prune_with_ctes(&mut e.with, bare_source, keep);
+            return Expression::Except(e);
+        }
+        _ => {}
     }
 
     let Expression::Select(mut select) = expr else {
@@ -357,11 +435,54 @@ fn prune_dead_source_columns(
     let keep: HashSet<String> = keep_cols.iter().cloned().collect();
 
     let root = polyglot_sql::parse_one(sql, dialect).ok()?;
-    let Expression::Select(mut select) = root else {
-        return None;
-    };
-    descend_into_from_positions(&mut select, &bare_source, &keep);
-    polyglot_sql::generate(&Expression::Select(select), dialect).ok()
+    let pruned = prune_root_query(root, &bare_source, &keep)?;
+    polyglot_sql::generate(&pruned, dialect).ok()
+}
+
+/// Prune the FROM/JOIN/CTE positions of the outermost query `expr` — a
+/// `Select`, or a `UNION`/`INTERSECT`/`EXCEPT` of such — without ever
+/// mutating any top-level branch's own projection list, matching
+/// [`collect_top_level_select_ptrs`]'s notion of which selects are eligible
+/// for pruning. Returns `None` if `expr` is some other statement shape this
+/// pass doesn't know how to descend into (e.g. a bare `VALUES` list).
+fn prune_root_query(
+    expr: Expression,
+    bare_source: &str,
+    keep: &HashSet<String>,
+) -> Option<Expression> {
+    match expr {
+        Expression::Select(mut select) => {
+            descend_into_from_positions(&mut select, bare_source, keep);
+            Some(Expression::Select(select))
+        }
+        // See the `mem::replace` note in `prune_derived_table` — `Union`'s
+        // `Drop` impl forbids partially moving out of `.left`/`.right`.
+        Expression::Union(mut u) => {
+            let left = std::mem::replace(&mut u.left, Expression::Null(Null));
+            let right = std::mem::replace(&mut u.right, Expression::Null(Null));
+            u.left = prune_root_query(left, bare_source, keep)?;
+            u.right = prune_root_query(right, bare_source, keep)?;
+            prune_with_ctes(&mut u.with, bare_source, keep);
+            Some(Expression::Union(u))
+        }
+        Expression::Intersect(mut i) => {
+            let left = std::mem::replace(&mut i.left, Expression::Null(Null));
+            let right = std::mem::replace(&mut i.right, Expression::Null(Null));
+            i.left = prune_root_query(left, bare_source, keep)?;
+            i.right = prune_root_query(right, bare_source, keep)?;
+            prune_with_ctes(&mut i.with, bare_source, keep);
+            Some(Expression::Intersect(i))
+        }
+        Expression::Except(mut e) => {
+            let left = std::mem::replace(&mut e.left, Expression::Null(Null));
+            let right = std::mem::replace(&mut e.right, Expression::Null(Null));
+            e.left = prune_root_query(left, bare_source, keep)?;
+            e.right = prune_root_query(right, bare_source, keep)?;
+            prune_with_ctes(&mut e.with, bare_source, keep);
+            Some(Expression::Except(e))
+        }
+        _ => None,
+    }
 }
 
 /// Extract the column names referenced by a raw SQL predicate string (as
@@ -369,11 +490,16 @@ fn prune_dead_source_columns(
 /// standalone `WHERE` clause. Used to make sure a column needed only by a
 /// pushed-down filter (never itself selected) still survives projection
 /// pruning of `source`.
-fn filter_referenced_columns(filter: &str, dialect: DialectType) -> Vec<String> {
+///
+/// Returns `None` if `filter` doesn't parse — callers must treat that as
+/// "this predicate's columns are unknown," i.e. fail closed (assume all
+/// columns needed), never silently drop the predicate's columns from the
+/// keep-list.
+fn filter_referenced_columns(filter: &str, dialect: DialectType) -> Option<Vec<String>> {
     let wrapped = format!("SELECT 1 WHERE {filter}");
     match polyglot_sql::parse_one(&wrapped, dialect) {
-        Ok(expr) => polyglot_sql::ast_transforms::get_column_names(&expr),
-        Err(_) => vec![],
+        Ok(expr) => Some(polyglot_sql::ast_transforms::get_column_names(&expr)),
+        Err(_) => None,
     }
 }
 
@@ -623,7 +749,16 @@ where
                 // pruning even though DuckDB's own `Projections` list
                 // excludes them.
                 for f in &info.filters {
-                    required_cols.extend(filter_referenced_columns(f, dialect));
+                    match filter_referenced_columns(f, dialect) {
+                        Some(cols) => required_cols.extend(cols),
+                        None => {
+                            warn!(
+                                "pushdown: couldn't parse filter predicate '{f}' for frontier \
+                                 '{n_id}', assuming all columns needed"
+                            );
+                            any_node_needs_all_cols = true;
+                        }
+                    }
                 }
 
                 if info.filters.is_empty() {
@@ -2058,5 +2193,101 @@ mod tests {
         )
         .expect("should parse/regenerate");
         assert!(pruned.contains('b'), "joined scan must be left untouched; got: {pruned}");
+    }
+
+    // Regression test for a real benchmark failure: a bare pass-through
+    // column selected inside a UNION ALL branch (itself the root statement)
+    // must be treated exactly like the plain-root-Select case — never
+    // classified as "prunable" — since `prune_dead_source_columns` never
+    // rewrites a top-level branch's own projection list.
+    #[test]
+    fn test_collect_unprunable_source_columns_keeps_union_branch_passthrough_columns() {
+        let sql = r#"SELECT "a", "b" FROM "staging"
+                     UNION ALL
+                     SELECT "a", "b" FROM "other""#;
+        let cols = collect_unprunable_source_columns(sql, "staging", DialectType::DuckDB)
+            .expect("no star present, should return a concrete set");
+        assert!(
+            cols.contains("b"),
+            "a bare pass-through column in a top-level UNION branch must survive; got: {cols:?}"
+        );
+    }
+
+    // Same shape but as the actual rewriter: since the branch is top-level,
+    // pruning must leave its projection list untouched even though
+    // `keep_cols` is narrower than what's selected.
+    #[test]
+    fn test_prune_dead_source_columns_never_touches_union_branch() {
+        let sql = r#"SELECT "a", "b" FROM "staging"
+                     UNION ALL
+                     SELECT "a", "b" FROM "other""#;
+        let pruned = prune_dead_source_columns(
+            sql,
+            "staging",
+            &["a".to_string()],
+            DialectType::DuckDB,
+        )
+        .expect("should parse/regenerate");
+        assert!(pruned.contains('b'), "top-level UNION branch must be untouched; got: {pruned}");
+    }
+
+    // A nested (non-top-level) single-unjoined scan of `source` inside a
+    // UNION branch that itself lives inside a CTE must still get pruned —
+    // this is the "real" pruning opportunity a UNION-aware rewriter unlocks,
+    // not just a safety net.
+    #[test]
+    fn test_prune_dead_source_columns_prunes_nested_scan_inside_cte_union() {
+        let sql = r#"WITH combined AS (
+            SELECT "a", "b" FROM "staging"
+            UNION ALL
+            SELECT "a", "b" FROM "other"
+        )
+        SELECT c."a" FROM combined AS c"#;
+        let pruned = prune_dead_source_columns(
+            sql,
+            "staging",
+            &["a".to_string()],
+            DialectType::DuckDB,
+        )
+        .expect("should parse/regenerate");
+        assert!(
+            pruned.contains(r#"SELECT "a" FROM "staging""#),
+            "nested scan inside a CTE's UNION branch must be pruned to just 'a' \
+             (the 'other' branch's own 'b' column is untouched); got: {pruned}"
+        );
+    }
+
+    // The connector's own pushdown analysis (`DuckDB` EXPLAIN-based
+    // projection discovery) sees through this exact CTE/UNION nesting and
+    // will correctly report `b` as unused overall. The classifier must not
+    // re-flag `b` as unprunable here (only the two tests above's top-level
+    // branches deserve that), or genuine pruning opportunities regress.
+    #[test]
+    fn test_collect_unprunable_source_columns_treats_nested_cte_union_scan_as_prunable() {
+        let sql = r#"WITH combined AS (
+            SELECT "a", "b" FROM "staging"
+            UNION ALL
+            SELECT "a", "b" FROM "other"
+        )
+        SELECT c."a" FROM combined AS c"#;
+        let cols = collect_unprunable_source_columns(sql, "staging", DialectType::DuckDB)
+            .expect("no star present, should return a concrete set");
+        assert!(
+            !cols.contains("b"),
+            "nested scan inside a CTE's UNION branch is prunable; got: {cols:?}"
+        );
+    }
+
+    // Regression test: a filter predicate the connector can't attribute
+    // cleanly (e.g. because it references a construct our bundled SQL parser
+    // can't parse) must not silently vanish from the keep-list — the caller
+    // must be told to fail closed instead.
+    #[test]
+    fn test_filter_referenced_columns_none_on_parse_failure() {
+        assert!(filter_referenced_columns("((((", DialectType::DuckDB).is_none());
+        assert_eq!(
+            filter_referenced_columns("is_active", DialectType::DuckDB),
+            Some(vec!["is_active".to_string()])
+        );
     }
 }
