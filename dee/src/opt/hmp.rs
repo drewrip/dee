@@ -422,15 +422,16 @@ where
     }
 
     /// Build the `--hmp-show-nodes` ranking table: for every View with
-    /// out-degree > 1 (a branch point, the only kind of View that
-    /// materializing can actually deduplicate work for), sum the average
-    /// runtime of every operator that traces back to it via
-    /// `find_traced_views` (the same mapping the `--hmp-show-operators` table
-    /// uses). Sorted by `ranking_score`, descending -- this is also the order
-    /// `run()` searches down when picking which node to try materializing.
-    /// `ranking_score` is `total_cpu_time_s`, or (when
-    /// `normalize_with_cardinality` is set) `total_cpu_time_s` divided by the
-    /// View's estimated cardinality, from its EXPLAIN plan.
+    /// out-degree > 1 and more than one downstream path to a TABLE/TEMP_TABLE
+    /// node (a branch point, the only kind of View that materializing can
+    /// actually deduplicate work for), sum the average runtime of every
+    /// operator that traces back to it via `find_traced_views` (the same
+    /// mapping the `--hmp-show-operators` table uses). Sorted by
+    /// `ranking_score`, descending -- this is also the order `run()` searches
+    /// down when picking which node to try materializing. `ranking_score` is
+    /// `total_cpu_time_s`, or (when `normalize_with_cardinality` is set)
+    /// `total_cpu_time_s` divided by the View's estimated cardinality, from
+    /// its EXPLAIN plan.
     fn build_node_table(
         dag: &Dag,
         exec_stats: &ExecStats,
@@ -440,7 +441,7 @@ where
         let mut aggregate_cpu_time: HashMap<String, f64> = HashMap::new();
         for (op_key, (avg_runtime, _)) in op_stats {
             for view in Self::find_traced_views(dag, op_key, exec_stats) {
-                if dag.nodes.out_degree(&view) > 1 {
+                if dag.nodes.out_degree(&view) > 1 && dag.nodes.paths_to_sinks(&view) > 1 {
                     *aggregate_cpu_time.entry(view).or_insert(0.0) += avg_runtime;
                 }
             }
@@ -999,7 +1000,7 @@ where
         {cards}
         <div class="panel">
           <h2>Why these nodes were considered</h2>
-          <div class="subtle">Views with out-degree &gt; 1 are candidates because materializing them can deduplicate work repeated by every downstream consumer. They're ranked by the aggregate CPU time of every operator (from the baseline's EXPLAIN plans) traced back to them. The working set walks this ranking, accumulating nodes until it covers {:.0}% of the total ranked CPU time.</div>
+          <div class="subtle">Views with out-degree &gt; 1 and more than one downstream path to a TABLE/TEMP_TABLE node are candidates because materializing them can deduplicate work repeated by every downstream consumer. They're ranked by the aggregate CPU time of every operator (from the baseline's EXPLAIN plans) traced back to them. The working set walks this ranking, accumulating nodes until it covers {:.0}% of the total ranked CPU time.</div>
           {node_table}
         </div>
         <div class="panel">
