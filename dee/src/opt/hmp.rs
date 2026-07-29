@@ -41,7 +41,10 @@ where
 {
     conn: Arc<C>,
     engine: Arc<E>,
-    no_plan_dups: bool,
+    /// Rank VIEW candidates by the total cost of duplicate computation they
+    /// introduce downstream, instead of an estimated cost to run the VIEW
+    /// itself.
+    downstream_cost: bool,
     /// Max number of DAG re-runs to spend searching for materialization
     /// candidates. Each attempted materialization (successful or not) costs
     /// one run, in addition to the initial baseline run.
@@ -180,22 +183,28 @@ impl DuckDBPlan {
         &self,
         timing_map: &mut HashMap<OpKey, f64>,
         occurrence_map: &mut HashMap<OpKey, usize>,
-        no_plan_dups: bool,
-        plan_sigs: &mut HashSet<OpKey>,
     ) {
         if let Some(sig) = self.get_sig() {
             if let Some(t) = self.operator_timing {
                 *timing_map.entry(sig.clone()).or_insert(0.0) += t;
             }
-
-            if no_plan_dups {
-                plan_sigs.insert(sig);
-            } else {
-                *occurrence_map.entry(sig).or_insert(0) += 1;
-            }
+            *occurrence_map.entry(sig).or_insert(0) += 1;
         }
         for child in &self.children {
-            child.collect_operator_stats(timing_map, occurrence_map, no_plan_dups, plan_sigs);
+            child.collect_operator_stats(timing_map, occurrence_map);
+        }
+    }
+
+    /// Collect every `(operator signature, CPU cost)` pair in this plan tree,
+    /// one entry per occurrence (no de-duplication or averaging) -- used to
+    /// total the actual downstream cost of duplicate computation, rather
+    /// than an average cost per unique operator.
+    fn collect_operators(&self, out: &mut Vec<(OpKey, f64)>) {
+        if let (Some(sig), Some(t)) = (self.get_sig(), self.operator_timing) {
+            out.push((sig, t));
+        }
+        for child in &self.children {
+            child.collect_operators(out);
         }
     }
 
@@ -222,7 +231,7 @@ where
     pub fn new(
         conn: Arc<C>,
         engine: Arc<E>,
-        no_plan_dups: bool,
+        downstream_cost: bool,
         max_runs: usize,
         top_cpu_time: f64,
         show_operators: Option<String>,
@@ -235,7 +244,7 @@ where
         Self {
             conn,
             engine,
-            no_plan_dups,
+            downstream_cost,
             max_runs: max_runs.max(1),
             show_operators,
             show_nodes,
@@ -267,25 +276,7 @@ where
                 if let Some(node_stat) = exec_stats.node_stats.get(&node.id) {
                     if let Some(plan_str) = &node_stat.plan {
                         if let Ok(plan) = serde_json::from_str::<DuckDBPlan>(plan_str) {
-                            if self.no_plan_dups {
-                                let mut plan_sigs = HashSet::new();
-                                plan.collect_operator_stats(
-                                    &mut timing_map,
-                                    &mut occurrence_map,
-                                    true,
-                                    &mut plan_sigs,
-                                );
-                                for sig in plan_sigs {
-                                    *occurrence_map.entry(sig).or_insert(0) += 1;
-                                }
-                            } else {
-                                plan.collect_operator_stats(
-                                    &mut timing_map,
-                                    &mut occurrence_map,
-                                    false,
-                                    &mut HashSet::new(),
-                                );
-                            }
+                            plan.collect_operator_stats(&mut timing_map, &mut occurrence_map);
                         }
                     }
                 }
@@ -435,23 +426,18 @@ where
         sig.cardinality.parse::<f64>().ok()
     }
 
-    /// Build the `--hmp-show-nodes` ranking table: for every View with
-    /// out-degree > 1 and more than one downstream path to a TABLE/TEMP_TABLE
-    /// node (a branch point, the only kind of View that materializing can
-    /// actually deduplicate work for), sum the average runtime of every
-    /// operator that traces back to it via `find_traced_views` (the same
-    /// mapping the `--hmp-show-operators` table uses). Sorted by
-    /// `ranking_score`, descending -- this is also the order `run()` searches
-    /// down when picking which node to try materializing. `ranking_score` is
-    /// `total_cpu_time_s`, or (when `normalize_with_cardinality` is set)
-    /// `total_cpu_time_s` divided by the View's estimated cardinality, from
-    /// its EXPLAIN plan.
-    fn build_node_table(
+    /// Sum, for every View that is a branch point (out-degree > 1 and more
+    /// than one downstream path to a TABLE/TEMP_TABLE node -- the only kind
+    /// of View that materializing can actually deduplicate work for), the
+    /// average runtime of every operator that traces back to it via
+    /// `find_traced_views` (the same mapping the `--hmp-show-operators`
+    /// table uses). This approximates the cost of running the View once,
+    /// not the cost of the duplicate work it causes downstream.
+    fn aggregate_cpu_time_avg(
         dag: &Dag,
         exec_stats: &ExecStats,
         op_stats: &HashMap<OpKey, (f64, usize)>,
-        normalize_with_cardinality: bool,
-    ) -> Vec<NodeRankingRow> {
+    ) -> HashMap<String, f64> {
         let mut aggregate_cpu_time: HashMap<String, f64> = HashMap::new();
         for (op_key, (avg_runtime, _)) in op_stats {
             for view in Self::find_traced_views(dag, op_key, exec_stats) {
@@ -460,7 +446,57 @@ where
                 }
             }
         }
+        aggregate_cpu_time
+    }
 
+    /// For `--hmp-downstream-cost`: rather than averaging an operator's cost
+    /// across its occurrences, walk every occurrence of every operator in
+    /// every materialized TABLE's EXPLAIN ANALYZE plan, and add its actual
+    /// CPU cost to every branch-point View whose own EXPLAIN plan contains
+    /// that operator. This totals the real cost of the duplicate
+    /// computation a View introduces downstream, instead of estimating the
+    /// cost of running the View itself.
+    fn aggregate_downstream_cost(dag: &Dag, exec_stats: &ExecStats) -> HashMap<String, f64> {
+        let mut aggregate_cpu_time: HashMap<String, f64> = HashMap::new();
+        for node in dag.nodes.nodes() {
+            if !matches!(node.materialize, MaterializeMode::Table) {
+                continue;
+            }
+            let Some(node_stat) = exec_stats.node_stats.get(&node.id) else {
+                continue;
+            };
+            let Some(plan_str) = &node_stat.plan else {
+                continue;
+            };
+            let Ok(plan) = serde_json::from_str::<DuckDBPlan>(plan_str) else {
+                continue;
+            };
+
+            let mut operators = Vec::new();
+            plan.collect_operators(&mut operators);
+            for (op_key, cpu_cost) in operators {
+                for view in Self::find_traced_views(dag, &op_key, exec_stats) {
+                    if dag.nodes.out_degree(&view) > 1 && dag.nodes.paths_to_sinks(&view) > 1 {
+                        *aggregate_cpu_time.entry(view).or_insert(0.0) += cpu_cost;
+                    }
+                }
+            }
+        }
+        aggregate_cpu_time
+    }
+
+    /// Build the `--hmp-show-nodes` ranking table from a per-View aggregate
+    /// CPU time map (see `aggregate_cpu_time_avg` / `aggregate_downstream_cost`).
+    /// Sorted by `ranking_score`, descending -- this is also the order
+    /// `run()` searches down when picking which node to try materializing.
+    /// `ranking_score` is `total_cpu_time_s`, or (when
+    /// `normalize_with_cardinality` is set) `total_cpu_time_s` divided by the
+    /// View's estimated cardinality, from its EXPLAIN plan.
+    fn build_node_table(
+        exec_stats: &ExecStats,
+        aggregate_cpu_time: HashMap<String, f64>,
+        normalize_with_cardinality: bool,
+    ) -> Vec<NodeRankingRow> {
         let mut rows: Vec<(String, f64, Option<f64>, f64)> = aggregate_cpu_time
             .into_iter()
             .map(|(node, total_cpu_time_s)| {
@@ -506,8 +542,13 @@ where
         let mut score_counts: HashMap<String, usize> = HashMap::new();
 
         for (obs_dag, obs_stats) in observations {
-            let op_stats = self.operator_stats(obs_dag, obs_stats);
-            let ranking = Self::build_node_table(obs_dag, obs_stats, &op_stats, self.normalize_with_cardinality);
+            let aggregate_cpu_time = if self.downstream_cost {
+                Self::aggregate_downstream_cost(obs_dag, obs_stats)
+            } else {
+                let op_stats = self.operator_stats(obs_dag, obs_stats);
+                Self::aggregate_cpu_time_avg(obs_dag, obs_stats, &op_stats)
+            };
+            let ranking = Self::build_node_table(obs_stats, aggregate_cpu_time, self.normalize_with_cardinality);
             for row in ranking {
                 *score_sums.entry(row.node.clone()).or_insert(0.0) += row.ranking_score;
                 *score_counts.entry(row.node).or_insert(0) += 1;
@@ -683,12 +724,12 @@ where
         let op_stats = self.operator_stats(dag, &exec_stats);
         self.log_operator_table(dag, &exec_stats, &op_stats);
 
-        let node_ranking = Self::build_node_table(
-            dag,
-            &exec_stats,
-            &op_stats,
-            self.normalize_with_cardinality,
-        );
+        let aggregate_cpu_time = if self.downstream_cost {
+            Self::aggregate_downstream_cost(dag, &exec_stats)
+        } else {
+            Self::aggregate_cpu_time_avg(dag, &exec_stats, &op_stats)
+        };
+        let node_ranking = Self::build_node_table(&exec_stats, aggregate_cpu_time, self.normalize_with_cardinality);
         self.log_node_table(&node_ranking);
         let baseline_scores: HashMap<String, f64> = node_ranking
             .iter()
