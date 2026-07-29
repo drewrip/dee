@@ -74,8 +74,10 @@ where
     omp_early_termination: bool,
     /// OMP use pushdown before each candidate evaluation
     omp_use_pushdown: bool,
-    /// HMP no plan dups
-    hmp_no_plan_dups: bool,
+    /// HMP: rank VIEW candidates by the total cost of duplicate computation
+    /// they introduce downstream, instead of an estimated cost to run the
+    /// VIEW itself.
+    hmp_downstream_cost: bool,
     /// HMP max DAG runs to spend searching for materialization candidates
     hmp_max_runs: usize,
     /// HMP fraction of total operator CPU time used to build the working set
@@ -129,7 +131,7 @@ where
             omp_centrality: config.omp_centrality,
             omp_early_termination: config.omp_early_termination,
             omp_use_pushdown: config.omp_use_pushdown,
-            hmp_no_plan_dups: config.hmp_no_plan_dups,
+            hmp_downstream_cost: config.hmp_downstream_cost,
             hmp_max_runs: config.hmp_max_runs,
             hmp_top_cpu_time: config.hmp_top_cpu_time,
             hmp_show_operators: config.hmp_show_operators,
@@ -171,7 +173,7 @@ where
             let mut pass: HMPPass<C, E> = HMPPass::new(
                 self.conn.clone(),
                 self.engine.clone(),
-                self.hmp_no_plan_dups,
+                self.hmp_downstream_cost,
                 self.hmp_max_runs,
                 self.hmp_top_cpu_time,
                 self.hmp_show_operators.clone(),
@@ -241,7 +243,7 @@ pub struct OptimizerConfig {
     pub omp_centrality: OMPCentrality,
     pub omp_early_termination: bool,
     pub omp_use_pushdown: bool,
-    pub hmp_no_plan_dups: bool,
+    pub hmp_downstream_cost: bool,
     pub hmp_max_runs: usize,
     pub hmp_top_cpu_time: f64,
     pub hmp_show_operators: Option<String>,
@@ -266,7 +268,7 @@ impl Default for OptimizerConfig {
             omp_centrality: OMPCentrality::default(),
             omp_early_termination: true,
             omp_use_pushdown: true,
-            hmp_no_plan_dups: false,
+            hmp_downstream_cost: false,
             hmp_max_runs: 1,
             hmp_top_cpu_time: 0.5,
             hmp_show_operators: None,
@@ -336,8 +338,11 @@ impl OptimizerConfig {
         self
     }
 
-    pub fn with_hmp_no_plan_dups(mut self, no_dups: bool) -> Self {
-        self.hmp_no_plan_dups = no_dups;
+    /// Rank HMP VIEW candidates by the total cost of duplicate computation
+    /// they introduce downstream, instead of an estimated cost to run the
+    /// VIEW itself.
+    pub fn with_hmp_downstream_cost(mut self, downstream_cost: bool) -> Self {
+        self.hmp_downstream_cost = downstream_cost;
         self
     }
 

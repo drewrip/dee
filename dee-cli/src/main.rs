@@ -82,8 +82,13 @@ pub struct OptCommand {
     #[arg(long, value_delimiter = ',', conflicts_with = "enable")]
     disable: Option<Vec<String>>,
 
+    /// Rank HMP VIEW candidates by the total cost of the duplicate
+    /// computation they introduce downstream, instead of an estimated cost
+    /// to run the VIEW itself: for each operator in a materialized TABLE's
+    /// EXPLAIN ANALYZE plan, add its CPU cost to every candidate VIEW whose
+    /// own EXPLAIN plan contains that operator.
     #[arg(long, action)]
-    hmp_no_plan_dups: bool,
+    hmp_downstream_cost: bool,
     #[arg(long, default_value_t = 1)]
     hmp_max_runs: usize,
     #[arg(long, default_value_t = 0.5)]

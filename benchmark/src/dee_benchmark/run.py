@@ -178,7 +178,7 @@ def build_opt_cmd(
     omp_no_pushdown=False,
     enable=None,
     disable=None,
-    hmp_no_plan_dups=False,
+    hmp_downstream_cost=False,
     hmp_max_runs=None,
     hmp_top_cpu_time=None,
     hmp_show_operators=None,
@@ -215,8 +215,8 @@ def build_opt_cmd(
         opt_cmd.extend(["--enable", enable])
     if disable:
         opt_cmd.extend(["--disable", disable])
-    if hmp_no_plan_dups:
-        opt_cmd.append("--hmp-no-plan-dups")
+    if hmp_downstream_cost:
+        opt_cmd.append("--hmp-downstream-cost")
     if hmp_max_runs:
         opt_cmd.extend(["--hmp-max-runs", str(hmp_max_runs)])
     if hmp_top_cpu_time is not None:
@@ -295,7 +295,7 @@ def benchmark(
     omp_no_pushdown=False,
     enable=None,
     disable=None,
-    hmp_no_plan_dups=False,
+    hmp_downstream_cost=False,
     hmp_max_runs=None,
     hmp_top_cpu_time=None,
     hmp_show_operators=None,
@@ -352,7 +352,7 @@ def benchmark(
             omp_no_pushdown=omp_no_pushdown,
             enable=enable,
             disable=disable,
-            hmp_no_plan_dups=hmp_no_plan_dups,
+            hmp_downstream_cost=hmp_downstream_cost,
             hmp_max_runs=hmp_max_runs,
             hmp_top_cpu_time=hmp_top_cpu_time,
             hmp_show_operators=hmp_show_operators,
@@ -402,7 +402,7 @@ def benchmark_pushdown_comparison(
     n=5,
     max_mem=None,
     threads=None,
-    hmp_no_plan_dups=False,
+    hmp_downstream_cost=False,
     hmp_max_runs=None,
     hmp_top_cpu_time=None,
     hmp_normalize_with_cardinality=False,
@@ -448,7 +448,7 @@ def benchmark_pushdown_comparison(
         hmp_pushdown_dag_path = dest_project_path / "dag_hmp_pushdown.json"
 
         hmp_kwargs = dict(
-            hmp_no_plan_dups=hmp_no_plan_dups,
+            hmp_downstream_cost=hmp_downstream_cost,
             hmp_max_runs=hmp_max_runs,
             hmp_top_cpu_time=hmp_top_cpu_time,
             hmp_normalize_with_cardinality=hmp_normalize_with_cardinality,
@@ -644,9 +644,13 @@ def main():
         help="Comma-separated list of optimization passes to disable",
     )
     parser.add_argument(
-        "--hmp-no-plan-dups",
+        "--hmp-downstream-cost",
         action="store_true",
-        help="Disable duplicate operator counting within a single plan in HMPPass",
+        help=(
+            "Rank HMP VIEW candidates by the total cost of duplicate computation "
+            "they introduce downstream, instead of an estimated cost to run the "
+            "VIEW itself"
+        ),
     )
     parser.add_argument(
         "--hmp-max-runs",
@@ -735,7 +739,7 @@ def main():
             n=max(args.n, 2),
             max_mem=args.max_mem,
             threads=args.threads,
-            hmp_no_plan_dups=args.hmp_no_plan_dups,
+            hmp_downstream_cost=args.hmp_downstream_cost,
             hmp_max_runs=args.hmp_max_runs,
             hmp_top_cpu_time=args.hmp_top_cpu_time,
             hmp_normalize_with_cardinality=args.hmp_normalize_with_cardinality,
@@ -765,7 +769,7 @@ def main():
         omp_no_pushdown=args.omp_no_pushdown,
         enable=args.enable,
         disable=args.disable,
-        hmp_no_plan_dups=args.hmp_no_plan_dups,
+        hmp_downstream_cost=args.hmp_downstream_cost,
         hmp_max_runs=args.hmp_max_runs,
         hmp_top_cpu_time=args.hmp_top_cpu_time,
         hmp_show_operators=args.hmp_show_operators,
