@@ -44,7 +44,7 @@ def plot_data(results, output_path):
 
     # Plotting
     fig, ax = plt.subplots(figsize=(12, 7))
-    ax.boxplot(plot_data_points, labels=project_names)
+    ax.boxplot(plot_data_points, tick_labels=project_names)
 
     # Overlay raw points without jitter
     for i, attempts in enumerate(plot_data_points):
@@ -203,6 +203,49 @@ def plot_pushdown_comparison(results, output_path):
     print(f"\nPushdown comparison visualization saved to {output_path}")
 
 
+def _plot_iteration_resource_usage(ax, project_name, pass_name, iterations):
+    """Peak CPU%/memory per iteration, from each `IterationStat`'s
+    `system_samples` (only present when the optimizer ran with
+    `--profile-iterations`). Plotted on twin y-axes against iteration
+    number, next to the runtime-vs-iteration line so the two are directly
+    comparable."""
+    iters = [it["iteration"] for it in iterations if it.get("system_samples")]
+    peak_cpu = [
+        max((s.get("cpu_percent") or 0.0) for s in it["system_samples"])
+        for it in iterations
+        if it.get("system_samples")
+    ]
+    peak_mem = [
+        max((s.get("memory_bytes") or 0) for s in it["system_samples"])
+        for it in iterations
+        if it.get("system_samples")
+    ]
+
+    if not iters:
+        ax.text(0.5, 0.5, "No resource samples", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return
+
+    ax.plot(iters, peak_cpu, marker="o", color="steelblue", linewidth=2, markersize=6, label="Peak CPU (%)")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Peak CPU (%)", color="steelblue")
+    ax.tick_params(axis="y", labelcolor="steelblue")
+    ax.set_xticks(iters)
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+    ax2 = ax.twinx()
+    peak_mem_mb = [m / (1024 * 1024) for m in peak_mem]
+    ax2.plot(iters, peak_mem_mb, marker="s", color="darkorange", linewidth=2, markersize=6, label="Peak Memory (MB)")
+    ax2.set_ylabel("Peak Memory (MB)", color="darkorange")
+    ax2.tick_params(axis="y", labelcolor="darkorange")
+
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+
+    ax.set_title(f"{project_name}: {pass_name} Resource Usage over Iterations")
+
+
 def _plot_pass_iterations(results, output_path, pass_name):
     if not results:
         print("No results to plot.")
@@ -222,8 +265,19 @@ def _plot_pass_iterations(results, output_path, pass_name):
         print(f"No {pass_name} iteration data found to plot.")
         return
 
+    # `system_samples` per iteration is only present when the DAG was
+    # optimized with `--profile-iterations` (dee-benchmark passes this
+    # automatically whenever --profile is set). When present, add a second
+    # column per project plotting how CPU/memory usage moved across
+    # iterations, side by side with the runtime line.
+    has_profile = any(
+        it.get("system_samples") for _, iterations in pass_results for it in iterations
+    )
     n = len(pass_results)
-    fig, axes = plt.subplots(n, 1, figsize=(10, 4.5 * n), squeeze=False)
+    n_cols = 2 if has_profile else 1
+    fig, axes = plt.subplots(
+        n, n_cols, figsize=(10 * n_cols, 4.5 * n), squeeze=False
+    )
 
     for idx, (project_name, iterations) in enumerate(pass_results):
         ax = axes[idx][0]
@@ -275,6 +329,9 @@ def _plot_pass_iterations(results, output_path, pass_name):
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="steelblue"),
         )
 
+        if has_profile:
+            _plot_iteration_resource_usage(axes[idx][1], project_name, pass_name, iterations)
+
     plt.tight_layout()
     plt.savefig(output_path)
     print(f"\n{pass_name} iteration visualization saved to {output_path}")
@@ -286,6 +343,78 @@ def plot_hmp_iterations(results, output_path):
 
 def plot_omp_iterations(results, output_path):
     _plot_pass_iterations(results, output_path, "OMPPass")
+
+
+def plot_resource_usage(
+    results, output_path,
+    variant_a_key="original_resource_samples", variant_b_key="optimized_resource_samples",
+    variant_a_label="Original", variant_b_label="Optimized",
+):
+    """Per-project stacked subplots (one row per project, one column per
+    metric) plotting each variant's CPU/memory/disk timeseries, sampled by
+    `dee-cli run --profile` (see `run_multiple_times`). Every timed
+    iteration's timeseries is drawn as a translucent line so run-to-run
+    variance is visible; metrics with no data across all results (e.g.
+    Postgres, which doesn't report disk usage) are skipped entirely."""
+    projects_with_samples = [
+        r for r in results if r.get(variant_a_key) or r.get(variant_b_key)
+    ]
+    if not projects_with_samples:
+        print("No resource usage samples found to plot (re-run with --profile).")
+        return
+
+    candidate_metrics = [
+        ("cpu_percent", "CPU (%)"),
+        ("memory_bytes", "Memory (bytes)"),
+        ("disk_bytes", "Disk size (bytes)"),
+        ("read_bytes", "Disk read (bytes)"),
+        ("written_bytes", "Disk written (bytes)"),
+    ]
+
+    def metric_has_data(field):
+        for r in projects_with_samples:
+            for key in (variant_a_key, variant_b_key):
+                for iteration in r.get(key) or []:
+                    if any(s.get(field) is not None for s in iteration):
+                        return True
+        return False
+
+    active_metrics = [(field, label) for field, label in candidate_metrics if metric_has_data(field)]
+    if not active_metrics:
+        print("No resource usage samples found to plot (re-run with --profile).")
+        return
+
+    n_rows = len(projects_with_samples)
+    n_cols = len(active_metrics)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows), squeeze=False)
+
+    variants = [(variant_a_key, variant_a_label, "darkorange"), (variant_b_key, variant_b_label, "steelblue")]
+
+    for row, r in enumerate(projects_with_samples):
+        for col, (field, label) in enumerate(active_metrics):
+            ax = axes[row][col]
+            for key, variant_label, color in variants:
+                for i, iteration in enumerate(r.get(key) or []):
+                    xs = [s["elapsed_ms"] / 1000.0 for s in iteration if s.get(field) is not None]
+                    ys = [s[field] for s in iteration if s.get(field) is not None]
+                    if not xs:
+                        continue
+                    # Only label the first iteration per variant so the legend
+                    # doesn't grow with the number of iterations.
+                    ax.plot(
+                        xs, ys, color=color, alpha=0.5, linewidth=1.5,
+                        label=variant_label if i == 0 else None,
+                    )
+            ax.set_title(f"{r['project']} — {label}")
+            ax.set_xlabel("Elapsed (s)")
+            ax.set_ylabel(label)
+            ax.grid(True, linestyle="--", alpha=0.5)
+            if ax.get_legend_handles_labels()[0]:
+                ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_path)
+    print(f"\nResource usage visualization saved to {output_path}")
 
 
 def main():
@@ -315,6 +444,11 @@ def main():
         action="store_true",
         help="Generate the OMPPass runtime-over-iterations plot instead of the standard reduction plot",
     )
+    parser.add_argument(
+        "--resource-usage",
+        action="store_true",
+        help="Generate the CPU/memory/disk-over-time plot instead of the standard reduction plot",
+    )
 
     args = parser.parse_args()
 
@@ -331,6 +465,8 @@ def main():
         plot_hmp_iterations(results, args.output)
     elif args.omp_iterations:
         plot_omp_iterations(results, args.output)
+    elif args.resource_usage:
+        plot_resource_usage(results, args.output)
     else:
         plot_data(results, args.output)
 

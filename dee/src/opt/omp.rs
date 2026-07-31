@@ -7,13 +7,14 @@ use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 use crate::{
     connectors::Connector,
     dag::MaterializeMode,
-    executor::{Executor, ExecutorError},
+    executor::{Executor, ExecutorError, ProfilingConfig, SimpleEngine},
     opt::{
         Dag, Explain, OptimizerError, OptimizerPass,
         common::make_temp,
         explain::{render_bar_row, render_card_grid, render_ranked_table},
         pushdown::PushdownPass,
     },
+    profile::SystemUsageSample,
 };
 
 /// Runtime of a single plan attempted by the pass, in the order it was run.
@@ -26,6 +27,10 @@ use crate::{
 struct IterationStat {
     iteration: usize,
     runtime_ms: i64,
+    /// CPU/memory/disk timeseries sampled during this iteration's run.
+    /// Only populated when `profile_iterations` is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    system_samples: Vec<SystemUsageSample>,
 }
 
 /// One materialization plan attempt, used by `Explain::explain`.
@@ -69,6 +74,9 @@ where
     centrality: OMPCentrality,
     early_termination: bool,
     use_pushdown: bool,
+    /// Capture each iteration's CPU/memory/disk timeseries into its
+    /// `IterationStat`.
+    profile_iterations: bool,
     /// Data collected during the last `run()`, used by `Explain::explain`.
     explain_data: Option<OMPExplainData>,
     _phantom: PhantomData<C>,
@@ -86,6 +94,7 @@ where
         centrality: OMPCentrality,
         early_termination: bool,
         use_pushdown: bool,
+        profile_iterations: bool,
     ) -> Self {
         Self {
             conn,
@@ -94,6 +103,7 @@ where
             centrality,
             early_termination,
             use_pushdown,
+            profile_iterations,
             explain_data: None,
             _phantom: PhantomData,
         }
@@ -110,8 +120,17 @@ where
         debug!("Running OMPPass with centrality: {:?}", self.centrality);
         let mut stats = HashMap::new();
 
+        // Measure with a dedicated engine so profiling can be enabled for
+        // this pass's runs independent of whatever engine `self.engine`
+        // (used only for the pushdown pass below) was built with.
+        let mut engine = SimpleEngine::new(self.conn.clone())
+            .map_err(|e| OptimizerError::Exec(e.to_string()))?;
+        if self.profile_iterations {
+            engine = engine.with_profiling(ProfilingConfig::default());
+        }
+
         // Run the baseline using the DAG's current materialization configuration.
-        self.engine.cleanup(dag).await.unwrap();
+        engine.cleanup(dag).await.unwrap();
 
         // Pre-flight: drop any lp_* landing-pad artifacts left over from a
         // previous process invocation.  OMP adds lp_N nodes during evaluation
@@ -141,12 +160,11 @@ where
             }
         }
 
-        let baseline_cost = self
-            .engine
+        let baseline_stats = engine
             .run(dag)
             .await
-            .map(|r| r.duration.num_milliseconds() as f32)
             .map_err(|e| OptimizerError::Exec(format!("baseline run failed: {e}")))?;
+        let baseline_cost = baseline_stats.duration.num_milliseconds() as f32;
 
         // Only nodes with more than one downstream consumer (out-degree > 1)
         // AND more than one downstream path reaching a TABLE/TEMP_TABLE node
@@ -191,6 +209,11 @@ where
         let mut iterations: Vec<IterationStat> = vec![IterationStat {
             iteration: 1,
             runtime_ms: baseline_cost as i64,
+            system_samples: if self.profile_iterations {
+                baseline_stats.system_samples.clone()
+            } else {
+                Vec::new()
+            },
         }];
 
         let mut best_cost = baseline_cost;
@@ -237,7 +260,7 @@ where
 
             // Clean up whatever the previous trial materialized, including any
             // lp_* nodes that make_temp inserted into last_run_dag.
-            self.engine.cleanup(&last_run_dag).await.unwrap();
+            engine.cleanup(&last_run_dag).await.unwrap();
 
             // Build the candidate DAG for this combination.
             let mut work_dag = dag.clone();
@@ -264,8 +287,8 @@ where
                 }
             }
 
-            let current_cost = if self.early_termination {
-                let cancel_tx = self.engine.cancel_sender();
+            let (current_cost, current_samples) = if self.early_termination {
+                let cancel_tx = engine.cancel_sender();
                 cancel_tx.send(false).ok();
                 let budget_ms = best_cost as u64;
                 let cancel_tx_timer = Arc::clone(&cancel_tx);
@@ -273,10 +296,10 @@ where
                     tokio::time::sleep(std::time::Duration::from_millis(budget_ms)).await;
                     cancel_tx_timer.send(true).ok();
                 });
-                let result = self.engine.run(&work_dag).await;
+                let result = engine.run(&work_dag).await;
                 timer.abort();
                 match result {
-                    Ok(r) => r.duration.num_milliseconds() as f32,
+                    Ok(r) => (r.duration.num_milliseconds() as f32, r.system_samples),
                     Err(ExecutorError::Cancelled) => {
                         debug!("OMPPass: plan {} cancelled after {}ms budget", i + 1, budget_ms);
                         stats.insert(
@@ -290,6 +313,7 @@ where
                         iterations.push(IterationStat {
                             iteration: iterations.len() + 1,
                             runtime_ms: budget_ms as i64,
+                            system_samples: Vec::new(),
                         });
                         attempts.push(OMPAttempt {
                             label: format!("Plan {}: {}", i + 1, describe_plan(plan)),
@@ -305,17 +329,18 @@ where
                     }
                 }
             } else {
-                self.engine
+                let r = engine
                     .run(&work_dag)
                     .await
-                    .map(|r| r.duration.num_milliseconds() as f32)
-                    .map_err(|e| OptimizerError::Exec(format!("plan {} run failed: {e}", i + 1)))?
+                    .map_err(|e| OptimizerError::Exec(format!("plan {} run failed: {e}", i + 1)))?;
+                (r.duration.num_milliseconds() as f32, r.system_samples)
             };
 
             stats.insert(format!("attempt_{}", i + 1), current_cost.to_string());
             iterations.push(IterationStat {
                 iteration: iterations.len() + 1,
                 runtime_ms: current_cost as i64,
+                system_samples: current_samples,
             });
             attempts.push(OMPAttempt {
                 label: format!("Plan {}: {}", i + 1, describe_plan(plan)),
@@ -341,7 +366,7 @@ where
         // Drop whatever the last trial materialized (including any lp_* landing
         // pads).  Without this, those tables would persist in the DB across
         // process invocations and cause "already exists" errors on the next run.
-        self.engine.cleanup(&last_run_dag).await.unwrap();
+        engine.cleanup(&last_run_dag).await.unwrap();
 
         let change = (best_cost - baseline_cost) / baseline_cost;
         debug!(

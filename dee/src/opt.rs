@@ -100,6 +100,9 @@ where
     /// HMP: number of hypotheses the `Greedy` strategy's beam search keeps
     /// alive at each step.
     hmp_beam_width: usize,
+    /// Capture a CPU/memory/disk timeseries for every HMP/OMP candidate run
+    /// and attach it to that iteration's stats.
+    profile_iterations: bool,
     /// Pushdown pass
     run_pushdown_pass: bool,
     /// Result stats
@@ -140,6 +143,7 @@ where
             hmp_strategy: config.hmp_strategy,
             hmp_use_pushdown: config.hmp_use_pushdown,
             hmp_beam_width: config.hmp_beam_width,
+            profile_iterations: config.profile_iterations,
             run_pushdown_pass: config.run_pushdown_pass,
             stats_on_passes: false,
             explain_enabled: config.explain,
@@ -182,6 +186,7 @@ where
                 self.hmp_strategy,
                 self.hmp_use_pushdown,
                 self.hmp_beam_width,
+                self.profile_iterations,
             );
             let res = pass.run(dag).await?;
             if self.explain_enabled {
@@ -203,6 +208,7 @@ where
                 self.omp_centrality,
                 self.omp_early_termination,
                 self.omp_use_pushdown,
+                self.profile_iterations,
             );
             let res = pass.run(dag).await?;
             if self.explain_enabled {
@@ -254,6 +260,9 @@ pub struct OptimizerConfig {
     /// HMP: number of hypotheses the `Greedy` strategy's beam search keeps
     /// alive at each step. Unused by the `Breadth` strategy.
     pub hmp_beam_width: usize,
+    /// Capture a CPU/memory/disk timeseries for every HMP/OMP candidate run
+    /// and attach it to that iteration's stats.
+    pub profile_iterations: bool,
     pub run_pushdown_pass: bool,
     /// Collect an `Explain` HTML section from each pass during `run()`.
     pub explain: bool,
@@ -277,6 +286,7 @@ impl Default for OptimizerConfig {
             hmp_strategy: HMPStrategy::default(),
             hmp_use_pushdown: true,
             hmp_beam_width: 2,
+            profile_iterations: false,
             run_pushdown_pass: false,
             explain: false,
         }
@@ -393,6 +403,13 @@ impl OptimizerConfig {
     /// at each step. Unused by the `Breadth` strategy.
     pub fn with_hmp_beam_width(mut self, beam_width: usize) -> Self {
         self.hmp_beam_width = beam_width.max(1);
+        self
+    }
+
+    /// Capture a CPU/memory/disk timeseries for every HMP/OMP candidate run
+    /// and attach it to that iteration's stats.
+    pub fn with_profile_iterations(mut self, profile_iterations: bool) -> Self {
+        self.profile_iterations = profile_iterations;
         self
     }
 

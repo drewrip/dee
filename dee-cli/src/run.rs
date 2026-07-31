@@ -74,10 +74,14 @@ where
         engine = engine.with_plans_dir(dump_plans.clone());
     }
     if profiling_enabled {
-        engine = engine.with_profiling(ProfilingConfig {
+        let mut profiling_config = ProfilingConfig {
             collect_plans: true,
             ..ProfilingConfig::default()
-        });
+        };
+        if let Some(ms) = run_cmd.profile_interval_ms {
+            profiling_config.sample_interval = std::time::Duration::from_millis(ms);
+        }
+        engine = engine.with_profiling(profiling_config);
     }
 
     let mut runs = Vec::new();

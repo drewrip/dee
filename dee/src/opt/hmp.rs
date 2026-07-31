@@ -12,6 +12,7 @@ use crate::{
     connectors::Connector,
     dag::MaterializeMode,
     executor::{ExecStats, Executor, ProfilingConfig, SimpleEngine},
+    profile::SystemUsageSample,
     opt::{
         Dag, Explain, OptimizerError, OptimizerPass,
         common::make_temp,
@@ -70,6 +71,9 @@ where
     /// Number of hypotheses the `Greedy` strategy's beam search keeps alive
     /// at each step. Unused by the `Breadth` strategy.
     beam_width: usize,
+    /// Capture each iteration's CPU/memory/disk timeseries (already sampled
+    /// by the profiled engine used for measurement) into its `IterationStat`.
+    profile_iterations: bool,
     /// Data collected during the last `run()`, used by `Explain::explain`.
     explain_data: Option<HMPExplainData>,
     _phantom: PhantomData<E>,
@@ -123,6 +127,10 @@ struct IterationStat {
     /// baseline (iteration 1).
     #[serde(default)]
     combo: Vec<String>,
+    /// CPU/memory/disk timeseries sampled during this iteration's run.
+    /// Only populated when `profile_iterations` is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    system_samples: Vec<SystemUsageSample>,
 }
 
 /// A single hypothesis in the `Greedy` strategy's beam search: a
@@ -240,6 +248,7 @@ where
         strategy: HMPStrategy,
         use_pushdown: bool,
         beam_width: usize,
+        profile_iterations: bool,
     ) -> Self {
         Self {
             conn,
@@ -252,6 +261,7 @@ where
             strategy,
             use_pushdown,
             beam_width: beam_width.max(1),
+            profile_iterations,
             top_cpu_time: if top_cpu_time > 0.0 && top_cpu_time <= 1.0 {
                 top_cpu_time
             } else {
@@ -714,6 +724,11 @@ where
             iteration: 1,
             runtime_ms: best_ms,
             combo: Vec::new(),
+            system_samples: if self.profile_iterations {
+                exec_stats.system_samples.clone()
+            } else {
+                Vec::new()
+            },
         }];
 
         // 2. Build the operator stats, then the node ranking derived from
@@ -829,6 +844,11 @@ where
                             iteration: iterations.len() + 1,
                             runtime_ms: trial_ms,
                             combo: combo.clone(),
+                            system_samples: if self.profile_iterations {
+                                trial_stats.system_samples.clone()
+                            } else {
+                                Vec::new()
+                            },
                         });
                         round_observations.push((trial_dag, trial_stats));
                         if trial_ms < best_ms {
@@ -920,6 +940,11 @@ where
                                 iteration: iterations.len() + 1,
                                 runtime_ms: ms,
                                 combo: trial_combo.clone(),
+                                system_samples: if self.profile_iterations {
+                                    trial_stats.system_samples.clone()
+                                } else {
+                                    Vec::new()
+                                },
                             });
                             tried_combos.insert(sig, ms);
 
@@ -1263,6 +1288,7 @@ mod tests {
             HMPStrategy::Breadth,
             false,
             beam_width,
+            false,
         )
     }
 

@@ -1,5 +1,5 @@
 use crate::{
-    connectors::{Connector, ConnectorError, PushdownInfo},
+    connectors::{Connector, ConnectorError, DiskUsageSample, PushdownInfo},
     dag::MaterializeMode,
 };
 use async_trait::async_trait;
@@ -9,6 +9,7 @@ use log::{info, trace};
 use r2d2::Pool;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, process::Command, sync::Arc, time::Duration};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tempfile;
 
 /// Shape of a single node in DuckDB's `EXPLAIN (FORMAT JSON)` output, just
@@ -158,6 +159,21 @@ fn sample_process_cpu_usage(pid: u32) -> Result<Option<f64>, ConnectorError> {
     })?;
 
     Ok(stdout.trim().parse::<f64>().ok())
+}
+
+fn sample_process_disk_io(pid: u32) -> (Option<u64>, Option<u64>) {
+    let mut sys = System::new();
+    let pid = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        ProcessRefreshKind::everything(),
+    );
+    sys.process(pid)
+        .map(|process| {
+            let usage = process.disk_usage();
+            (Some(usage.total_read_bytes), Some(usage.total_written_bytes))
+        })
+        .unwrap_or((None, None))
 }
 
 #[async_trait]
@@ -419,6 +435,31 @@ impl Connector for DuckDBConnection {
     async fn sample_system_cpu_usage(&self) -> Result<Option<f64>, ConnectorError> {
         sample_process_cpu_usage(std::process::id())
     }
+
+    async fn sample_system_disk_usage(&self) -> Result<DiskUsageSample, ConnectorError> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
+
+        let mut stmt = conn
+            .prepare("SELECT database_size FROM pragma_database_size()")
+            .map_err(|e| {
+                ConnectorError::Execute(format!("Failed to prepare disk usage sample: {}", e))
+            })?;
+
+        let database_size: String = stmt
+            .query_row([], |row| row.get(0))
+            .map_err(|e| ConnectorError::Execute(format!("Failed to query disk usage: {}", e)))?;
+
+        let (read_bytes, written_bytes) = sample_process_disk_io(std::process::id());
+
+        Ok(DiskUsageSample {
+            disk_bytes: parse_duckdb_size_bytes(&database_size),
+            read_bytes,
+            written_bytes,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +477,13 @@ mod tests {
         let cpu = sample_process_cpu_usage(std::process::id()).unwrap();
         assert!(cpu.is_some());
         assert!(cpu.unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn test_sample_process_disk_io() {
+        // Values may legitimately be `None` on platforms sysinfo doesn't
+        // support per-process disk counters on; just assert this doesn't panic.
+        let _ = sample_process_disk_io(std::process::id());
     }
 
     async fn in_memory_conn() -> Arc<DuckDBConnection> {
