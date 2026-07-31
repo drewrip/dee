@@ -14,6 +14,7 @@ from .plot import (
     plot_hmp_iterations,
     plot_omp_iterations,
     plot_pushdown_comparison,
+    plot_resource_usage,
 )
 
 
@@ -187,6 +188,7 @@ def build_opt_cmd(
     hmp_strategy=None,
     hmp_no_pushdown=False,
     explain_path=None,
+    profile_iterations=False,
 ):
     """Build a `dee-cli opt` command line from the optimizer knobs shared by
     both the standard single-DAG benchmark and the pushdown A/B comparison."""
@@ -239,12 +241,22 @@ def build_opt_cmd(
         opt_cmd.append("--hmp-no-pushdown")
     if explain_path:
         opt_cmd.append(f"--explain={explain_path}")
+    if profile_iterations:
+        opt_cmd.append("--profile-iterations")
     return opt_cmd
 
 
-def run_multiple_times(dee_cli_path, connections_json, target, dag_path, iterations):
+def run_multiple_times(
+    dee_cli_path, connections_json, target, dag_path, iterations,
+    profile=False, profile_dir=None, profile_interval_ms=None,
+):
     """Run a DAG `iterations` times (plus a ~10% warmup fraction that isn't
-    timed), returning the wall-clock seconds for each timed run."""
+    timed), returning the wall-clock seconds for each timed run.
+
+    When `profile` is set, every timed iteration is also run with
+    `--profile`/`--profile-dump`, and the second return value is a list
+    (one entry per iteration) of that run's `system_samples` (CPU/memory/
+    disk timeseries); otherwise the second return value is `None`."""
     warmup_iters = int(iterations * 0.1)
     if warmup_iters > 0:
         print(f"  Running {warmup_iters} warmup iterations...")
@@ -262,22 +274,36 @@ def run_multiple_times(dee_cli_path, connections_json, target, dag_path, iterati
             )
 
     times = []
+    resource_samples = [] if profile else None
     for i in range(iterations):
         print(f"  Iteration {i + 1}/{iterations}...")
+        cmd = [
+            dee_cli_path,
+            "run",
+            "--connections",
+            connections_json,
+            "--target",
+            target,
+        ]
+        profile_path = None
+        if profile:
+            profile_path = Path(profile_dir) / f"profile_{i}.json"
+            cmd += ["--profile", "--profile-dump", str(profile_path)]
+            if profile_interval_ms is not None:
+                cmd += ["--profile-interval-ms", str(profile_interval_ms)]
+        cmd.append(str(dag_path))
+
         start = time.time()
-        run_cmd(
-            [
-                dee_cli_path,
-                "run",
-                "--connections",
-                connections_json,
-                "--target",
-                target,
-                str(dag_path),
-            ]
-        )
+        run_cmd(cmd)
         times.append(time.time() - start)
-    return times
+
+        if profile:
+            with open(profile_path, "r") as f:
+                report = json.load(f)
+            runs = report.get("runs", [])
+            resource_samples.append(runs[0]["system_samples"] if runs else [])
+
+    return times, resource_samples
 
 
 def benchmark(
@@ -304,6 +330,8 @@ def benchmark(
     hmp_strategy=None,
     hmp_no_pushdown=False,
     explain_dir=None,
+    profile=False,
+    profile_interval_ms=None,
 ):
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
@@ -361,6 +389,7 @@ def benchmark(
             hmp_strategy=hmp_strategy,
             hmp_no_pushdown=hmp_no_pushdown,
             explain_path=explain_path,
+            profile_iterations=profile,
         )
 
         opt_stats_json = run_cmd(opt_cmd)
@@ -371,8 +400,14 @@ def benchmark(
             f"Running {num_iters} iteration(s) for original and optimized versions..."
         )
 
-        original_times = run_multiple_times(dee_cli_path, connections_json, target, dag_json_path, num_iters)
-        optimized_times = run_multiple_times(dee_cli_path, connections_json, target, opt_dag_json_path, num_iters)
+        original_times, original_resource_samples = run_multiple_times(
+            dee_cli_path, connections_json, target, dag_json_path, num_iters,
+            profile=profile, profile_dir=dest_project_path, profile_interval_ms=profile_interval_ms,
+        )
+        optimized_times, optimized_resource_samples = run_multiple_times(
+            dee_cli_path, connections_json, target, opt_dag_json_path, num_iters,
+            profile=profile, profile_dir=dest_project_path, profile_interval_ms=profile_interval_ms,
+        )
 
         original_time = sum(original_times) / num_iters
         optimized_time = sum(optimized_times) / num_iters
@@ -388,6 +423,10 @@ def benchmark(
         if deep_dive:
             result["original_distribution"] = original_times
             result["optimized_distribution"] = optimized_times
+
+        if profile:
+            result["original_resource_samples"] = original_resource_samples
+            result["optimized_resource_samples"] = optimized_resource_samples
 
         results.append(result)
 
@@ -408,6 +447,8 @@ def benchmark_pushdown_comparison(
     hmp_normalize_with_cardinality=False,
     hmp_strategy=None,
     regression_tolerance=0.02,
+    profile=False,
+    profile_interval_ms=None,
 ):
     """A/B benchmark: for every project in `config_file`, run HMP alone and
     HMP+pushdown, then execute *both* resulting DAGs `n` times each (plus a
@@ -458,18 +499,24 @@ def benchmark_pushdown_comparison(
         print(f"Optimizing {project_name} with HMP only (no pushdown)...")
         hmp_only_stats = json.loads(run_cmd(build_opt_cmd(
             dee_cli_path, connections_json, target, hmp_only_dag_path, dag_json_path,
-            enable="hmp", **hmp_kwargs,
+            enable="hmp", profile_iterations=profile, **hmp_kwargs,
         )))
 
         print(f"Optimizing {project_name} with HMP + pushdown...")
         hmp_pushdown_stats = json.loads(run_cmd(build_opt_cmd(
             dee_cli_path, connections_json, target, hmp_pushdown_dag_path, dag_json_path,
-            enable="hmp,pushdown", **hmp_kwargs,
+            enable="hmp,pushdown", profile_iterations=profile, **hmp_kwargs,
         )))
 
         print(f"Running {n} iteration(s) for HMP-only and HMP+pushdown DAGs...")
-        hmp_only_times = run_multiple_times(dee_cli_path, connections_json, target, hmp_only_dag_path, n)
-        hmp_pushdown_times = run_multiple_times(dee_cli_path, connections_json, target, hmp_pushdown_dag_path, n)
+        hmp_only_times, hmp_only_resource_samples = run_multiple_times(
+            dee_cli_path, connections_json, target, hmp_only_dag_path, n,
+            profile=profile, profile_dir=dest_project_path, profile_interval_ms=profile_interval_ms,
+        )
+        hmp_pushdown_times, hmp_pushdown_resource_samples = run_multiple_times(
+            dee_cli_path, connections_json, target, hmp_pushdown_dag_path, n,
+            profile=profile, profile_dir=dest_project_path, profile_interval_ms=profile_interval_ms,
+        )
 
         hmp_only_arr = np.array(hmp_only_times)
         hmp_pushdown_arr = np.array(hmp_pushdown_times)
@@ -499,6 +546,11 @@ def benchmark_pushdown_comparison(
             "hmp_only_stats": hmp_only_stats,
             "hmp_pushdown_stats": hmp_pushdown_stats,
         }
+
+        if profile:
+            result["hmp_only_resource_samples"] = hmp_only_resource_samples
+            result["hmp_pushdown_resource_samples"] = hmp_pushdown_resource_samples
+
         results.append(result)
 
     return results
@@ -531,6 +583,9 @@ def visualize(results):
 
     plot_path = "results.png"
     plot_data(results, plot_path)
+
+    if any(r.get("original_resource_samples") for r in results):
+        plot_resource_usage(results, "resource_usage.png", "original_resource_samples", "optimized_resource_samples")
 
 
 def visualize_pushdown_comparison(results):
@@ -565,6 +620,13 @@ def visualize_pushdown_comparison(results):
         print("\nPushdown never made any project slower than HMP alone.")
 
     plot_pushdown_comparison(results, "pushdown_comparison.png")
+
+    if any(r.get("hmp_only_resource_samples") for r in results):
+        plot_resource_usage(
+            results, "resource_usage.png",
+            "hmp_only_resource_samples", "hmp_pushdown_resource_samples",
+            variant_a_label="HMP only", variant_b_label="HMP + pushdown",
+        )
 
 
 def main():
@@ -707,6 +769,17 @@ def main():
         metavar="DIR",
         help="Directory to write per-project optimizer explain HTML reports to",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Capture CPU/memory/disk timeseries for every timed iteration via dee-cli --profile",
+    )
+    parser.add_argument(
+        "--profile-interval-ms",
+        type=int,
+        default=None,
+        help="Sampling interval in ms for --profile (defaults to dee-cli's built-in 250ms)",
+    )
     args = parser.parse_args()
 
     if args.max_mem and args.db_type != "duckdb":
@@ -745,6 +818,8 @@ def main():
             hmp_normalize_with_cardinality=args.hmp_normalize_with_cardinality,
             hmp_strategy=args.hmp_strategy,
             regression_tolerance=args.regression_tolerance,
+            profile=args.profile,
+            profile_interval_ms=args.profile_interval_ms,
         )
         visualize_pushdown_comparison(results)
 
@@ -778,6 +853,8 @@ def main():
         hmp_strategy=args.hmp_strategy,
         hmp_no_pushdown=args.hmp_no_pushdown,
         explain_dir=args.explain,
+        profile=args.profile,
+        profile_interval_ms=args.profile_interval_ms,
     )
     visualize(results)
 

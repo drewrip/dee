@@ -35,6 +35,8 @@ pub struct RunCommand {
     #[arg(long)]
     profile_viz: Option<String>,
     #[arg(long)]
+    profile_interval_ms: Option<u64>,
+    #[arg(long)]
     dump_plans: Option<String>,
 
     #[arg(required = true)]
@@ -128,6 +130,10 @@ pub struct OptCommand {
     /// measurements.
     #[arg(long, action)]
     omp_no_pushdown: bool,
+    /// Capture a CPU/memory/disk timeseries for every HMP/OMP candidate run
+    /// and include it in each iteration's `--stats` output.
+    #[arg(long, action)]
+    profile_iterations: bool,
     /// Write an HTML report explaining what each enabled pass did and why.
     /// Pass a path to choose the output file, e.g. `--explain=out.html`;
     /// bare `--explain` writes to `explain.html`.

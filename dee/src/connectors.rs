@@ -84,4 +84,22 @@ pub trait Connector {
     async fn sample_system_memory_usage(&self) -> Result<Option<u64>, ConnectorError> {
         Ok(None)
     }
+
+    async fn sample_system_disk_usage(&self) -> Result<DiskUsageSample, ConnectorError> {
+        Ok(DiskUsageSample::default())
+    }
+}
+
+/// A single point of process/DB-reported disk activity. All fields are
+/// independently optional since not every connector can report every field
+/// (e.g. Postgres runs out-of-process and can only report DB-side sizes,
+/// not this process's own read/write bytes).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiskUsageSample {
+    /// On-disk size of the connector's working file/database, in bytes.
+    pub disk_bytes: Option<u64>,
+    /// Cumulative bytes read by this process since it started.
+    pub read_bytes: Option<u64>,
+    /// Cumulative bytes written by this process since it started.
+    pub written_bytes: Option<u64>,
 }

@@ -72,6 +72,9 @@ pub struct SystemUsageSample {
     pub elapsed_ms: i64,
     pub cpu_percent: Option<f64>,
     pub memory_bytes: Option<u64>,
+    pub disk_bytes: Option<u64>,
+    pub read_bytes: Option<u64>,
+    pub written_bytes: Option<u64>,
 }
 
 fn normalize_identifier(value: &str) -> String {

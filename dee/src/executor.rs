@@ -137,11 +137,15 @@ where
     let timestamp = Utc::now();
     let cpu_percent = conn.sample_system_cpu_usage().await?;
     let memory_bytes = conn.sample_system_memory_usage().await?;
+    let disk = conn.sample_system_disk_usage().await?;
     Ok(SystemUsageSample {
         timestamp,
         elapsed_ms: (timestamp - start).num_milliseconds(),
         cpu_percent,
         memory_bytes,
+        disk_bytes: disk.disk_bytes,
+        read_bytes: disk.read_bytes,
+        written_bytes: disk.written_bytes,
     })
 }
 
