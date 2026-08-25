@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use log::{debug, info, warn};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -12,12 +12,13 @@ use crate::{
     connectors::Connector,
     dag::MaterializeMode,
     executor::{ExecStats, Executor, ProfilingConfig, SimpleEngine},
-    profile::SystemUsageSample,
+    plan::OpKey,
     opt::{
         Dag, Explain, OptimizerError, OptimizerPass,
         common::make_temp,
         explain::{render_bar_row, render_card_grid, render_ranked_table},
         pushdown::PushdownPass,
+        report::{HmpDetail, IterationStat, PassDetail, PassOutcome},
     },
 };
 
@@ -98,41 +99,6 @@ struct HMPExplainData {
     beam_width: usize,
 }
 
-#[derive(Deserialize, Debug)]
-struct DuckDBPlan {
-    operator_name: Option<String>,
-    #[serde(alias = "name")]
-    name: Option<String>,
-    #[serde(default)]
-    operator_timing: Option<f64>,
-    #[serde(default)]
-    extra_info: HashMap<String, serde_json::Value>,
-    #[serde(default)]
-    children: Vec<DuckDBPlan>,
-}
-
-#[derive(Hash, Eq, PartialEq, Clone, Debug)]
-struct OpKey {
-    name: String,
-    cardinality: String,
-}
-
-/// Runtime of a single iteration attempted by the pass, in the order it was
-/// run. Iteration 1 is always the baseline (no materializations applied).
-#[derive(Serialize, Debug, Clone)]
-struct IterationStat {
-    iteration: usize,
-    runtime_ms: i64,
-    /// Materialization combo tried at this iteration; empty for the
-    /// baseline (iteration 1).
-    #[serde(default)]
-    combo: Vec<String>,
-    /// CPU/memory/disk timeseries sampled during this iteration's run.
-    /// Only populated when `profile_iterations` is enabled.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    system_samples: Vec<SystemUsageSample>,
-}
-
 /// A single hypothesis in the `Greedy` strategy's beam search: a
 /// materialization combo and the runtime it measured at.
 #[derive(Debug, Clone)]
@@ -164,71 +130,6 @@ struct NodeRankingRow {
     /// `--hmp-normalize-with-cardinality` is set) `total_cpu_time_s` divided
     /// by `cardinality`.
     ranking_score: f64,
-}
-
-impl DuckDBPlan {
-    fn get_sig(&self) -> Option<OpKey> {
-        let name = self.operator_name.clone().or_else(|| self.name.clone())?;
-        let cardinality = self
-            .extra_info
-            .get("Estimated Cardinality")
-            .and_then(|v| {
-                if let Some(s) = v.as_str() {
-                    Some(s.to_string())
-                } else if let Some(f) = v.as_f64() {
-                    Some(f.to_string())
-                } else if let Some(i) = v.as_i64() {
-                    Some(i.to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "0".to_string());
-        Some(OpKey { name, cardinality })
-    }
-
-    fn collect_operator_stats(
-        &self,
-        timing_map: &mut HashMap<OpKey, f64>,
-        occurrence_map: &mut HashMap<OpKey, usize>,
-    ) {
-        if let Some(sig) = self.get_sig() {
-            if let Some(t) = self.operator_timing {
-                *timing_map.entry(sig.clone()).or_insert(0.0) += t;
-            }
-            *occurrence_map.entry(sig).or_insert(0) += 1;
-        }
-        for child in &self.children {
-            child.collect_operator_stats(timing_map, occurrence_map);
-        }
-    }
-
-    /// Collect every `(operator signature, CPU cost)` pair in this plan tree,
-    /// one entry per occurrence (no de-duplication or averaging) -- used to
-    /// total the actual downstream cost of duplicate computation, rather
-    /// than an average cost per unique operator.
-    fn collect_operators(&self, out: &mut Vec<(OpKey, f64)>) {
-        if let (Some(sig), Some(t)) = (self.get_sig(), self.operator_timing) {
-            out.push((sig, t));
-        }
-        for child in &self.children {
-            child.collect_operators(out);
-        }
-    }
-
-    fn contains_operator(&self, target: &OpKey) -> bool {
-        if let Some(sig) = self.get_sig() {
-            if sig == *target {
-                return true;
-            }
-        }
-        for child in &self.children {
-            if child.contains_operator(target) {
-                return true;
-            }
-        }
-        false
-    }
 }
 
 impl<C, E> HMPPass<C, E>
@@ -283,11 +184,12 @@ where
         for node in dag.nodes.nodes() {
             if matches!(node.materialize, MaterializeMode::Table) {
                 materialized_node_count += 1;
-                if let Some(node_stat) = exec_stats.node_stats.get(&node.id) {
-                    if let Some(plan_str) = &node_stat.plan {
-                        if let Ok(plan) = serde_json::from_str::<DuckDBPlan>(plan_str) {
-                            plan.collect_operator_stats(&mut timing_map, &mut occurrence_map);
-                        }
+                if let Some(node_stat) = exec_stats.node_stats.get(&node.id)
+                    && let Some(plan_str) = &node_stat.plan
+                    && let Some(plans) = self.conn.parse_plan(plan_str)
+                {
+                    for plan in &plans {
+                        plan.collect_operator_stats(&mut timing_map, &mut occurrence_map);
                     }
                 }
             }
@@ -313,6 +215,7 @@ where
     /// operator appears in, and every View whose EXPLAIN plan contains the
     /// operator. Rows are sorted by operator name for stable output.
     fn build_operator_table(
+        conn: &C,
         dag: &Dag,
         exec_stats: &ExecStats,
         op_stats: &HashMap<OpKey, (f64, usize)>,
@@ -328,7 +231,7 @@ where
                 operator: format!("{}(cardinality={})", op_key.name, op_key.cardinality),
                 avg_runtime_s: *avg_runtime,
                 table_occurrences: *occurrences,
-                traced_views: Self::find_traced_views(dag, op_key, exec_stats),
+                traced_views: Self::find_traced_views(conn, dag, op_key, exec_stats),
             })
             .collect()
     }
@@ -390,7 +293,7 @@ where
             return;
         };
 
-        let rows = Self::build_operator_table(dag, exec_stats, op_stats);
+        let rows = Self::build_operator_table(self.conn.as_ref(), dag, exec_stats, op_stats);
         let table = Self::format_operator_table(&rows);
         info!("HMPPass operator rankings:\n{}", table);
 
@@ -404,7 +307,12 @@ where
     /// Find every View node whose EXPLAIN plan contains the given operator,
     /// i.e. every View the operator can be traced back to (not just the one
     /// `find_materialization_candidate` would pick to materialize).
-    fn find_traced_views(dag: &Dag, op_key: &OpKey, exec_stats: &ExecStats) -> Vec<String> {
+    fn find_traced_views(
+        conn: &C,
+        dag: &Dag,
+        op_key: &OpKey,
+        exec_stats: &ExecStats,
+    ) -> Vec<String> {
         let mut views = Vec::new();
         for node in dag.nodes.nodes() {
             if !matches!(node.materialize, MaterializeMode::View) {
@@ -416,8 +324,8 @@ where
             let Some(plan_str) = &node_stat.plan else {
                 continue;
             };
-            if let Ok(plans) = serde_json::from_str::<Vec<DuckDBPlan>>(plan_str)
-                && plans.iter().any(|p| p.contains_operator(op_key))
+            if let Some(plans) = conn.parse_plan(plan_str)
+                && plans.iter().any(|p| p.contains(op_key))
             {
                 views.push(node.id.clone());
             }
@@ -427,13 +335,12 @@ where
 
     /// Estimated cardinality of a View's own EXPLAIN plan, taken from the
     /// root operator of its (already-collected) query plan.
-    fn view_cardinality(exec_stats: &ExecStats, view_id: &str) -> Option<f64> {
+    fn view_cardinality(conn: &C, exec_stats: &ExecStats, view_id: &str) -> Option<f64> {
         let node_stat = exec_stats.node_stats.get(view_id)?;
         let plan_str = node_stat.plan.as_ref()?;
-        let plans: Vec<DuckDBPlan> = serde_json::from_str(plan_str).ok()?;
-        let root = plans.first()?;
-        let sig = root.get_sig()?;
-        sig.cardinality.parse::<f64>().ok()
+        let plans = conn.parse_plan(plan_str)?;
+        // The root operator's estimate, matching the pre-refactor behaviour.
+        plans.first()?.estimated_cardinality
     }
 
     /// Sum, for every View that is a branch point (out-degree > 1 and more
@@ -444,13 +351,14 @@ where
     /// table uses). This approximates the cost of running the View once,
     /// not the cost of the duplicate work it causes downstream.
     fn aggregate_cpu_time_avg(
+        conn: &C,
         dag: &Dag,
         exec_stats: &ExecStats,
         op_stats: &HashMap<OpKey, (f64, usize)>,
     ) -> HashMap<String, f64> {
         let mut aggregate_cpu_time: HashMap<String, f64> = HashMap::new();
         for (op_key, (avg_runtime, _)) in op_stats {
-            for view in Self::find_traced_views(dag, op_key, exec_stats) {
+            for view in Self::find_traced_views(conn, dag, op_key, exec_stats) {
                 if dag.nodes.out_degree(&view) > 1 && dag.nodes.paths_to_sinks(&view) > 1 {
                     *aggregate_cpu_time.entry(view).or_insert(0.0) += avg_runtime;
                 }
@@ -466,7 +374,11 @@ where
     /// that operator. This totals the real cost of the duplicate
     /// computation a View introduces downstream, instead of estimating the
     /// cost of running the View itself.
-    fn aggregate_downstream_cost(dag: &Dag, exec_stats: &ExecStats) -> HashMap<String, f64> {
+    fn aggregate_downstream_cost(
+        conn: &C,
+        dag: &Dag,
+        exec_stats: &ExecStats,
+    ) -> HashMap<String, f64> {
         let mut aggregate_cpu_time: HashMap<String, f64> = HashMap::new();
         for node in dag.nodes.nodes() {
             if !matches!(node.materialize, MaterializeMode::Table) {
@@ -478,14 +390,16 @@ where
             let Some(plan_str) = &node_stat.plan else {
                 continue;
             };
-            let Ok(plan) = serde_json::from_str::<DuckDBPlan>(plan_str) else {
+            let Some(plans) = conn.parse_plan(plan_str) else {
                 continue;
             };
 
             let mut operators = Vec::new();
-            plan.collect_operators(&mut operators);
+            for plan in &plans {
+                plan.collect_operators(&mut operators);
+            }
             for (op_key, cpu_cost) in operators {
-                for view in Self::find_traced_views(dag, &op_key, exec_stats) {
+                for view in Self::find_traced_views(conn, dag, &op_key, exec_stats) {
                     if dag.nodes.out_degree(&view) > 1 && dag.nodes.paths_to_sinks(&view) > 1 {
                         *aggregate_cpu_time.entry(view).or_insert(0.0) += cpu_cost;
                     }
@@ -503,6 +417,7 @@ where
     /// `normalize_with_cardinality` is set) `total_cpu_time_s` divided by the
     /// View's estimated cardinality, from its EXPLAIN plan.
     fn build_node_table(
+        conn: &C,
         exec_stats: &ExecStats,
         aggregate_cpu_time: HashMap<String, f64>,
         normalize_with_cardinality: bool,
@@ -510,7 +425,7 @@ where
         let mut rows: Vec<(String, f64, Option<f64>, f64)> = aggregate_cpu_time
             .into_iter()
             .map(|(node, total_cpu_time_s)| {
-                let cardinality = Self::view_cardinality(exec_stats, &node);
+                let cardinality = Self::view_cardinality(conn, exec_stats, &node);
                 let ranking_score = match (normalize_with_cardinality, cardinality) {
                     (true, Some(c)) if c > 0.0 => total_cpu_time_s / c,
                     _ => total_cpu_time_s,
@@ -553,12 +468,12 @@ where
 
         for (obs_dag, obs_stats) in observations {
             let aggregate_cpu_time = if self.downstream_cost {
-                Self::aggregate_downstream_cost(obs_dag, obs_stats)
+                Self::aggregate_downstream_cost(self.conn.as_ref(), obs_dag, obs_stats)
             } else {
                 let op_stats = self.operator_stats(obs_dag, obs_stats);
-                Self::aggregate_cpu_time_avg(obs_dag, obs_stats, &op_stats)
+                Self::aggregate_cpu_time_avg(self.conn.as_ref(), obs_dag, obs_stats, &op_stats)
             };
-            let ranking = Self::build_node_table(obs_stats, aggregate_cpu_time, self.normalize_with_cardinality);
+            let ranking = Self::build_node_table(self.conn.as_ref(), obs_stats, aggregate_cpu_time, self.normalize_with_cardinality);
             for row in ranking {
                 *score_sums.entry(row.node.clone()).or_insert(0.0) += row.ranking_score;
                 *score_counts.entry(row.node).or_insert(0) += 1;
@@ -693,12 +608,11 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError> {
+    async fn run(&mut self, dag: &mut Dag) -> Result<PassOutcome, OptimizerError> {
         debug!(
             "Running HMPPass (Heuristic Materialization Pass), max_runs={}, top_cpu_time={}",
             self.max_runs, self.top_cpu_time
         );
-        let mut stats = HashMap::new();
 
         // 1. Establish baseline and collect plans
         debug!("Establishing baseline by running DAG with profiling and plan collection enabled");
@@ -718,7 +632,7 @@ where
         let mut runs_used = 1usize;
         let mut best_ms = exec_stats.duration.num_milliseconds();
         debug!("Baseline run completed in {}ms", best_ms);
-        stats.insert("baseline_runtime_ms".into(), best_ms.to_string());
+        let baseline_ms = best_ms;
 
         let mut iterations: Vec<IterationStat> = vec![IterationStat {
             iteration: 1,
@@ -729,6 +643,7 @@ where
             } else {
                 Vec::new()
             },
+            ..Default::default()
         }];
 
         // 2. Build the operator stats, then the node ranking derived from
@@ -740,11 +655,11 @@ where
         self.log_operator_table(dag, &exec_stats, &op_stats);
 
         let aggregate_cpu_time = if self.downstream_cost {
-            Self::aggregate_downstream_cost(dag, &exec_stats)
+            Self::aggregate_downstream_cost(self.conn.as_ref(), dag, &exec_stats)
         } else {
-            Self::aggregate_cpu_time_avg(dag, &exec_stats, &op_stats)
+            Self::aggregate_cpu_time_avg(self.conn.as_ref(), dag, &exec_stats, &op_stats)
         };
-        let node_ranking = Self::build_node_table(&exec_stats, aggregate_cpu_time, self.normalize_with_cardinality);
+        let node_ranking = Self::build_node_table(self.conn.as_ref(), &exec_stats, aggregate_cpu_time, self.normalize_with_cardinality);
         self.log_node_table(&node_ranking);
         let baseline_scores: HashMap<String, f64> = node_ranking
             .iter()
@@ -849,6 +764,7 @@ where
                             } else {
                                 Vec::new()
                             },
+                            ..Default::default()
                         });
                         round_observations.push((trial_dag, trial_stats));
                         if trial_ms < best_ms {
@@ -945,6 +861,7 @@ where
                                 } else {
                                     Vec::new()
                                 },
+                                ..Default::default()
                             });
                             tried_combos.insert(sig, ms);
 
@@ -998,26 +915,27 @@ where
             runs_used,
             self.max_runs
         );
-        stats.insert(
-            "new_materializations".into(),
-            if best_combo.is_empty() {
-                "none".into()
-            } else {
-                best_combo.join(",")
-            },
-        );
-        stats.insert(
-            "materialization_count".into(),
-            best_combo.len().to_string(),
-        );
-        stats.insert("working_set_size".into(), candidate_nodes.len().to_string());
-        stats.insert("runs_used".into(), runs_used.to_string());
-        stats.insert("final_runtime_ms".into(), best_ms.to_string());
-        stats.insert(
-            "iterations".into(),
-            serde_json::to_string(&iterations)
-                .map_err(|e| OptimizerError::Exec(format!("failed to serialize iterations: {e}")))?,
-        );
+        let outcome = PassOutcome {
+            dag_runs_used: runs_used as u32,
+            changes_applied: best_combo.len() as u32,
+            // Every iteration past the baseline is one candidate evaluated.
+            candidates_considered: iterations.len().saturating_sub(1) as u32,
+            working_set_size: candidate_nodes.len() as u32,
+            iterations: iterations.clone(),
+            detail: PassDetail::Hmp(HmpDetail {
+                baseline_runtime_ms: baseline_ms,
+                final_runtime_ms: best_ms,
+                max_runs: self.max_runs,
+                top_cpu_time: self.top_cpu_time,
+                strategy: format!("{:?}", self.strategy),
+                beam_width: self.beam_width,
+                normalize_with_cardinality: self.normalize_with_cardinality,
+                downstream_cost: self.downstream_cost,
+                use_pushdown: self.use_pushdown,
+                new_materializations: best_combo.clone(),
+                working_set: candidate_nodes.clone(),
+            }),
+        };
 
         self.explain_data = Some(HMPExplainData {
             baseline_ms: iterations.first().map(|i| i.runtime_ms).unwrap_or(best_ms),
@@ -1026,7 +944,7 @@ where
             max_runs: self.max_runs,
             top_cpu_time: self.top_cpu_time,
             normalize_with_cardinality: self.normalize_with_cardinality,
-            operator_rows: Self::build_operator_table(dag, &exec_stats, &op_stats),
+            operator_rows: Self::build_operator_table(self.conn.as_ref(), dag, &exec_stats, &op_stats),
             node_rows: node_ranking,
             working_set: candidate_nodes,
             best_combo,
@@ -1035,7 +953,7 @@ where
             beam_width: self.beam_width,
         });
 
-        Ok(stats)
+        Ok(outcome)
     }
 }
 
@@ -1268,6 +1186,7 @@ mod tests {
             finish: now,
             duration: chrono::TimeDelta::zero(),
             plan,
+            rows_produced: None,
         }
     }
 
@@ -1416,11 +1335,12 @@ mod tests {
             HMPStrategy::Greedy,
             false,
             2,
+            false,
         );
 
-        let stats = pass.run(&mut dag).await.unwrap();
+        let outcome = pass.run(&mut dag).await.unwrap();
 
-        let runs_used: usize = stats.get("runs_used").unwrap().parse().unwrap();
+        let runs_used = outcome.dag_runs_used;
         assert!(runs_used <= 4);
         assert!(runs_used >= 1);
     }

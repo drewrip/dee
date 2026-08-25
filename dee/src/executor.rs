@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use log::{debug, warn};
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
 use std::{
@@ -321,6 +322,10 @@ where
                             finish: node_finish,
                             duration: node_finish - node_start,
                             plan,
+                            // Rows the backend reported writing. Meaningful
+                            // for TABLE/TEMP_TABLE (CTAS row count); a VIEW
+                            // writes nothing, so this is 0 there.
+                            rows_produced: Some(res as u64),
                         },
                     ))
                 });
@@ -587,21 +592,27 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecStats {
     pub start: DateTime<Utc>,
     pub finish: DateTime<Utc>,
     pub duration: TimeDelta,
     pub node_stats: HashMap<String, NodeStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_samples: Vec<SystemUsageSample>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeStats {
     pub start: DateTime<Utc>,
     pub finish: DateTime<Utc>,
     pub duration: TimeDelta,
+    /// Raw backend EXPLAIN / EXPLAIN ANALYZE JSON, when plan collection is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// Rows the backend reported writing for this node, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_produced: Option<u64>,
 }
 
 #[cfg(test)]

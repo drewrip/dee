@@ -38,6 +38,20 @@ pub struct RunCommand {
     profile_interval_ms: Option<u64>,
     #[arg(long)]
     dump_plans: Option<String>,
+    /// Execute each DAG this many times inside a single process, so
+    /// per-repetition timings exclude process startup, connection-pool
+    /// creation and the initial cleanup. Each repetition is reported
+    /// separately.
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
+    /// Untimed repetitions run before the measured ones, to warm the page
+    /// cache and the engine. Reported with `phase = "warmup"`.
+    #[arg(long, default_value_t = 0)]
+    warmups: usize,
+    /// Write the machine-readable `ProfileReport` JSON here. Implies
+    /// profiling. This is what the benchmarking harness consumes.
+    #[arg(long)]
+    report_json: Option<String>,
 
     #[arg(required = true)]
     dag_files: Vec<String>,
@@ -139,6 +153,11 @@ pub struct OptCommand {
     /// bare `--explain` writes to `explain.html`.
     #[arg(long, num_args = 0..=1, default_missing_value = "explain.html")]
     explain: Option<String>,
+    /// Write the machine-readable `OptimizeReport` JSON here. This is what
+    /// the benchmarking harness consumes; `--stats` remains the
+    /// human-oriented stdout dump.
+    #[arg(long)]
+    report_json: Option<String>,
 
     dag_file: String,
 }

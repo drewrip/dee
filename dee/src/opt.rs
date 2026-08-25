@@ -3,10 +3,12 @@ pub mod explain;
 pub mod hmp;
 pub mod omp;
 pub mod pushdown;
+pub mod report;
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use log::{debug, error, warn};
 
 use thiserror::Error;
@@ -23,6 +25,10 @@ use crate::{
 };
 
 pub use crate::opt::explain::render_explain_html;
+pub use crate::opt::report::{
+    CandidateScore, HmpDetail, IterationStat, OmpDetail, OptimizeReport, PassDetail, PassOutcome,
+    PassReport, PushdownDetail, PushdownOutcome,
+};
 
 #[derive(Error, Debug)]
 pub enum OptimizerError {
@@ -38,7 +44,7 @@ where
     C: Connector + Send + 'static,
     E: Executor<C> + Send,
 {
-    async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError>;
+    async fn run(&mut self, dag: &mut Dag) -> Result<PassOutcome, OptimizerError>;
 }
 
 /// Implemented by optimizer passes that can explain, after `run()` has
@@ -163,11 +169,11 @@ where
         &self.explain_sections
     }
 
-    pub async fn run(
-        &mut self,
-        dag: &mut Dag,
-    ) -> Result<HashMap<String, Arc<HashMap<String, String>>>, OptimizerError> {
-        let mut stats = HashMap::new();
+    pub async fn run(&mut self, dag: &mut Dag) -> Result<OptimizeReport, OptimizerError> {
+        let started_at = Utc::now();
+        let nodes_before = dag.nodes.num_nodes() as u32;
+        let mut passes: Vec<PassReport> = Vec::new();
+        let mut order: u32 = 0;
 
         if let Err(e) = self.engine.resolve_schemas(dag).await {
             error!("couldn't resolve_schemas: {e}")
@@ -188,14 +194,21 @@ where
                 self.hmp_beam_width,
                 self.profile_iterations,
             );
-            let res = pass.run(dag).await?;
+            let pass_started = Utc::now();
+            let outcome = pass.run(dag).await?;
+            let pass_finished = Utc::now();
             if self.explain_enabled {
                 self.explain_sections
                     .push((pass.explain_label(), pass.explain()));
             }
-            if self.stats_on_passes {
-                stats.insert("HMPPass".to_string(), Arc::new(res));
-            }
+            passes.push(PassReport::from_outcome(
+                "HMPPass",
+                order,
+                pass_started,
+                pass_finished,
+                outcome,
+            ));
+            order += 1;
         } else {
             debug!("skipping HMP pass");
         }
@@ -210,14 +223,21 @@ where
                 self.omp_use_pushdown,
                 self.profile_iterations,
             );
-            let res = pass.run(dag).await?;
+            let pass_started = Utc::now();
+            let outcome = pass.run(dag).await?;
+            let pass_finished = Utc::now();
             if self.explain_enabled {
                 self.explain_sections
                     .push((pass.explain_label(), pass.explain()));
             }
-            if self.stats_on_passes {
-                stats.insert("OMPPass".to_string(), Arc::new(res));
-            }
+            passes.push(PassReport::from_outcome(
+                "OMPPass",
+                order,
+                pass_started,
+                pass_finished,
+                outcome,
+            ));
+            order += 1;
         } else {
             debug!("skipping OMP pass");
         }
@@ -225,19 +245,55 @@ where
         if self.run_pushdown_pass {
             let mut pass: PushdownPass<C, E> =
                 PushdownPass::new(self.conn.clone(), self.engine.clone());
-            let res = pass.run(dag).await?;
+            let pass_started = Utc::now();
+            let outcome = pass.run(dag).await?;
+            let pass_finished = Utc::now();
             if self.explain_enabled {
                 self.explain_sections
                     .push((pass.explain_label(), pass.explain()));
             }
-            if self.stats_on_passes {
-                stats.insert("PushdownPass".to_string(), Arc::new(res));
-            }
+            passes.push(PassReport::from_outcome(
+                "PushdownPass",
+                order,
+                pass_started,
+                pass_finished,
+                outcome,
+            ));
         } else {
             debug!("skipping Pushdown pass");
         }
 
-        Ok(stats)
+        let finished_at = Utc::now();
+
+        // Baseline/final runtimes come from whichever pass measured them.
+        // HMP measures both explicitly; OMP's costs are the equivalent.
+        let mut baseline_runtime_ms = None;
+        let mut final_runtime_ms = None;
+        for pass in &passes {
+            match &pass.detail {
+                PassDetail::Hmp(d) => {
+                    baseline_runtime_ms.get_or_insert(d.baseline_runtime_ms);
+                    final_runtime_ms = Some(d.final_runtime_ms);
+                }
+                PassDetail::Omp(d) => {
+                    baseline_runtime_ms.get_or_insert(d.baseline_value.round() as i64);
+                    final_runtime_ms = Some(d.best_value.round() as i64);
+                }
+                PassDetail::Pushdown(_) => {}
+            }
+        }
+
+        Ok(OptimizeReport {
+            started_at,
+            finished_at,
+            wall_ms: (finished_at - started_at).num_milliseconds(),
+            baseline_runtime_ms,
+            final_runtime_ms,
+            dag_runs_used: passes.iter().map(|p| p.dag_runs_used).sum(),
+            nodes_before,
+            nodes_after: dag.nodes.num_nodes() as u32,
+            passes,
+        })
     }
 }
 
@@ -300,12 +356,14 @@ impl OptimizerConfig {
     pub fn with_all_disabled(mut self) -> Self {
         self.run_omp_pass = false;
         self.run_hmp_pass = false;
+        self.run_pushdown_pass = false;
         self
     }
 
     pub fn with_all_enabled(mut self) -> Self {
         self.run_omp_pass = true;
         self.run_hmp_pass = true;
+        self.run_pushdown_pass = true;
         self
     }
 

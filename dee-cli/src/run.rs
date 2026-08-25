@@ -26,8 +26,12 @@ pub async fn run(run_cmd: RunCommand) -> Result<(), Box<dyn std::error::Error>> 
             run_cmd.target, run_cmd.connections
         )
     })?;
-    let profiling_enabled =
-        run_cmd.profile || run_cmd.profile_dump.is_some() || run_cmd.profile_viz.is_some();
+    // --report-json is a machine-readable consumer of the profile, so it
+    // implies profiling just like the human-facing flags do.
+    let profiling_enabled = run_cmd.profile
+        || run_cmd.profile_dump.is_some()
+        || run_cmd.profile_viz.is_some()
+        || run_cmd.report_json.is_some();
 
     let runs = match &target_connection {
         Connection::DuckDB(config) => {
@@ -47,6 +51,10 @@ pub async fn run(run_cmd: RunCommand) -> Result<(), Box<dyn std::error::Error>> 
         };
 
         println!("{}", render_profile_summary(&report));
+
+        if let Some(path) = &run_cmd.report_json {
+            fs::write(path, serde_json::to_string_pretty(&report)?)?;
+        }
 
         if let Some(path) = &run_cmd.profile_dump {
             let payload = serde_json::to_string_pretty(&report)?;
@@ -84,17 +92,43 @@ where
         engine = engine.with_profiling(profiling_config);
     }
 
+    let repeat = run_cmd.repeat.max(1);
+    let warmups = run_cmd.warmups;
+    let total = warmups + repeat;
+
     let mut runs = Vec::new();
     for dag_file_path in &run_cmd.dag_files {
         info!("Starting DAG: {}", dag_file_path);
         let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(dag_file_path)?)?;
         let dag = Dag::try_from(dag_file)?;
-        engine.cleanup(&dag).await?;
-        let exec_stats = engine.run(&dag).await?;
-        info!("Finished DAG: {}. stats = {:?}", dag_file_path, exec_stats);
 
-        if profiling_enabled {
-            runs.push(build_dag_run_profile(dag_file_path, &dag, &exec_stats));
+        // Every repetition happens inside this one process against this one
+        // connection pool, so the timings in ExecStats measure the DAG and
+        // not the CLI's startup.
+        for i in 0..total {
+            let is_warmup = i < warmups;
+            let phase = if is_warmup { "warmup" } else { "measure" };
+
+            // Each repetition starts from a clean slate, otherwise an earlier
+            // repetition's materialized tables would still be present.
+            engine.cleanup(&dag).await?;
+            let exec_stats = engine.run(&dag).await?;
+
+            info!(
+                "Finished DAG: {} [{} {}/{}] in {}ms",
+                dag_file_path,
+                phase,
+                if is_warmup { i + 1 } else { i - warmups + 1 },
+                if is_warmup { warmups } else { repeat },
+                exec_stats.duration.num_milliseconds()
+            );
+
+            if profiling_enabled {
+                let mut profile = build_dag_run_profile(dag_file_path, &dag, &exec_stats);
+                profile.phase = phase.to_string();
+                profile.rep_index = if is_warmup { i } else { i - warmups };
+                runs.push(profile);
+            }
         }
     }
 
