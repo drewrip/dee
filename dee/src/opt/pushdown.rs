@@ -19,6 +19,7 @@ use crate::{
     opt::{
         Dag, Explain, OptimizerError, OptimizerPass,
         explain::{render_card_grid, render_ranked_table},
+        report::{PassDetail, PassOutcome, PushdownDetail, PushdownOutcome},
     },
 };
 
@@ -1146,9 +1147,8 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError> {
+    async fn run(&mut self, dag: &mut Dag) -> Result<PassOutcome, OptimizerError> {
         debug!("PushdownPass: starting");
-        let mut stats = HashMap::new();
 
         // Prerequisite — resolve the Arrow output schema of every node in the
         // DAG by running the whole DAG as views and calling get_schema on each.
@@ -1203,7 +1203,7 @@ where
             temp_table_ids.len(),
             temp_table_ids
         );
-        stats.insert("temp_tables_count".into(), temp_table_ids.len().to_string());
+        let temp_tables_count = temp_table_ids.len();
 
         // Materialize every node of the graph minor as a real scratch table
         // up front, once, so pushdown() can analyze any node's query in
@@ -1300,15 +1300,35 @@ where
         debug!("PushdownPass: cleaning up scratch DAG");
         cleanup_scratch_dag(&minor, &scratch_names, self.conn.as_ref()).await;
 
-        stats.insert("rewrites_applied".into(), rewrites.to_string());
         debug!("PushdownPass: complete — {rewrites} rewrite(s) applied");
+
+        let outcome = PassOutcome {
+            // Pushdown analyses each TempTable's plan in place; it never
+            // executes a candidate DAG of its own.
+            dag_runs_used: 0,
+            changes_applied: rewrites as u32,
+            candidates_considered: temp_tables_count as u32,
+            working_set_size: temp_tables_count as u32,
+            iterations: Vec::new(),
+            detail: PassDetail::Pushdown(PushdownDetail {
+                temp_tables_count,
+                rewrites_applied: rewrites,
+                outcomes: outcomes
+                    .iter()
+                    .map(|(node_id, outcome)| PushdownOutcome {
+                        node_id: node_id.clone(),
+                        outcome: outcome.clone(),
+                    })
+                    .collect(),
+            }),
+        };
 
         self.explain_data = Some(PushdownExplainData {
             outcomes,
             rewrites_applied: rewrites,
         });
 
-        Ok(stats)
+        Ok(outcome)
     }
 }
 

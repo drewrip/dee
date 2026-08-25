@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use itertools::{Itertools, repeat_n};
 use log::debug;
-use serde::Serialize;
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
     connectors::Connector,
@@ -13,25 +12,9 @@ use crate::{
         common::make_temp,
         explain::{render_bar_row, render_card_grid, render_ranked_table},
         pushdown::PushdownPass,
+        report::{CandidateScore, IterationStat, OmpDetail, PassDetail, PassOutcome},
     },
-    profile::SystemUsageSample,
 };
-
-/// Runtime of a single plan attempted by the pass, in the order it was run.
-/// Iteration 1 is always the baseline (the DAG's current materialization
-/// configuration). Skipped (duplicate-of-baseline) attempts don't run at all,
-/// so they're omitted from this series. Early-terminated attempts are
-/// included, but their `runtime_ms` is only a lower bound (the cancellation
-/// budget) since the trial was killed before finishing.
-#[derive(Serialize, Debug, Clone)]
-struct IterationStat {
-    iteration: usize,
-    runtime_ms: i64,
-    /// CPU/memory/disk timeseries sampled during this iteration's run.
-    /// Only populated when `profile_iterations` is enabled.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    system_samples: Vec<SystemUsageSample>,
-}
 
 /// One materialization plan attempt, used by `Explain::explain`.
 #[derive(Debug, Clone)]
@@ -116,9 +99,8 @@ where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    async fn run(&mut self, dag: &mut Dag) -> Result<HashMap<String, String>, OptimizerError> {
+    async fn run(&mut self, dag: &mut Dag) -> Result<PassOutcome, OptimizerError> {
         debug!("Running OMPPass with centrality: {:?}", self.centrality);
-        let mut stats = HashMap::new();
 
         // Measure with a dedicated engine so profiling can be enabled for
         // this pass's runs independent of whatever engine `self.engine`
@@ -214,6 +196,8 @@ where
             } else {
                 Vec::new()
             },
+            outcome: Some("baseline".to_string()),
+            ..Default::default()
         }];
 
         let mut best_cost = baseline_cost;
@@ -248,7 +232,6 @@ where
             // The baseline combination was already measured above — skip it.
             if *plan == baseline_modes {
                 debug!("OMPPass: plan {} is the baseline, skipping", i + 1);
-                stats.insert(format!("attempt_{}", i + 1), "baseline(skipped)".to_string());
                 attempts.push(OMPAttempt {
                     label: format!("Plan {}: {}", i + 1, describe_plan(plan)),
                     outcome: "skipped (same as baseline)".to_string(),
@@ -302,10 +285,6 @@ where
                     Ok(r) => (r.duration.num_milliseconds() as f32, r.system_samples),
                     Err(ExecutorError::Cancelled) => {
                         debug!("OMPPass: plan {} cancelled after {}ms budget", i + 1, budget_ms);
-                        stats.insert(
-                            format!("attempt_{}", i + 1),
-                            format!("cancelled({})", budget_ms),
-                        );
                         // The trial was killed at budget_ms, so its true
                         // runtime is unknown beyond "at least budget_ms".
                         // Record that lower bound so it still shows up in
@@ -314,6 +293,8 @@ where
                             iteration: iterations.len() + 1,
                             runtime_ms: budget_ms as i64,
                             system_samples: Vec::new(),
+                            outcome: Some("cancelled".to_string()),
+                            ..Default::default()
                         });
                         attempts.push(OMPAttempt {
                             label: format!("Plan {}: {}", i + 1, describe_plan(plan)),
@@ -336,11 +317,12 @@ where
                 (r.duration.num_milliseconds() as f32, r.system_samples)
             };
 
-            stats.insert(format!("attempt_{}", i + 1), current_cost.to_string());
             iterations.push(IterationStat {
                 iteration: iterations.len() + 1,
                 runtime_ms: current_cost as i64,
                 system_samples: current_samples,
+                outcome: Some("ok".to_string()),
+                ..Default::default()
             });
             attempts.push(OMPAttempt {
                 label: format!("Plan {}: {}", i + 1, describe_plan(plan)),
@@ -376,22 +358,38 @@ where
             change * 100.0,
         );
 
-        stats.insert("baseline_value".into(), baseline_cost.to_string());
-        stats.insert("best_value".into(), best_cost.to_string());
-        stats.insert("opt_change".into(), change.to_string());
-
         let best_plan: Vec<String> = best_dag
             .nodes
             .nodes()
             .filter(|n| matches!(n.materialize, MaterializeMode::TempTable))
             .map(|n| n.id.clone())
             .collect();
-        stats.insert("best_plan".into(), format!("{:?}", best_plan));
-        stats.insert(
-            "iterations".into(),
-            serde_json::to_string(&iterations)
-                .map_err(|e| OptimizerError::Exec(format!("failed to serialize iterations: {e}")))?,
-        );
+
+        let outcome = PassOutcome {
+            // The baseline plus every trial that actually ran.
+            dag_runs_used: iterations.len() as u32,
+            changes_applied: best_plan.len() as u32,
+            candidates_considered: iterations.len().saturating_sub(1) as u32,
+            working_set_size: top_candidates.len() as u32,
+            iterations: iterations.clone(),
+            detail: PassDetail::Omp(OmpDetail {
+                baseline_value: baseline_cost as f64,
+                best_value: best_cost as f64,
+                opt_change: change as f64,
+                best_plan: best_plan.clone(),
+                centrality: format!("{:?}", self.centrality),
+                candidates_ranked: candidates
+                    .iter()
+                    .rev()
+                    .map(|(node_id, rank)| CandidateScore {
+                        node_id: node_id.clone(),
+                        score: *rank as f64,
+                    })
+                    .collect(),
+                early_termination: self.early_termination,
+                use_pushdown: self.use_pushdown,
+            }),
+        };
 
         for attempt in attempts.iter_mut() {
             if let Some(cost) = attempt.cost_ms
@@ -412,7 +410,7 @@ where
         });
 
         *dag = best_dag;
-        Ok(stats)
+        Ok(outcome)
     }
 }
 

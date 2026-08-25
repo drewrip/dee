@@ -91,6 +91,9 @@ pub async fn opt(opt_cmd: OptCommand) -> Result<(), Box<dyn Error>> {
         let html = dee::opt::explain::render_explain_html(&explain_sections);
         fs::write(path, html)?;
     }
+    if let Some(path) = &opt_cmd.report_json {
+        fs::write(path, serde_json::to_string_pretty(&opt_stats)?)?;
+    }
     if opt_cmd.stats {
         let mut buf = Vec::new();
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");

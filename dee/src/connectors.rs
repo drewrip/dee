@@ -77,6 +77,22 @@ pub trait Connector {
         Ok(None)
     }
 
+    /// Parse this backend's plan JSON into the optimizer's neutral plan form.
+    ///
+    /// Returns `None` when the text is not a plan this backend recognizes.
+    fn parse_plan(&self, _json: &str) -> Option<Vec<crate::plan::PlanNode>> {
+        None
+    }
+
+    /// What this backend's per-operator plan timings physically measure.
+    ///
+    /// DuckDB reports CPU time, Postgres wall time, so a cost ranking built
+    /// from them is optimizing for different things on each. Results record
+    /// this so the two are never silently compared.
+    fn time_basis(&self) -> crate::plan::TimeBasis {
+        crate::plan::TimeBasis::CpuTime
+    }
+
     async fn sample_system_cpu_usage(&self) -> Result<Option<f64>, ConnectorError> {
         Ok(None)
     }

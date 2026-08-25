@@ -6,5 +6,6 @@ pub mod executor;
 pub mod file;
 pub mod graph;
 pub mod opt;
+pub mod plan;
 pub mod profile;
 pub mod report;

@@ -13,6 +13,14 @@ pub struct ProfileReport {
 pub struct DagRunProfile {
     pub dag_file: String,
     pub db: String,
+    /// `"warmup"` for untimed leading repetitions, `"measure"` otherwise.
+    /// Warmups are reported so they are visible, but must be excluded from
+    /// any aggregate.
+    #[serde(default = "default_phase")]
+    pub phase: String,
+    /// 0-based repetition index within this DAG's `--repeat` series.
+    #[serde(default)]
+    pub rep_index: usize,
     pub run_started_at: DateTime<Utc>,
     pub run_finished_at: DateTime<Utc>,
     pub duration_ms: i64,
@@ -64,6 +72,9 @@ pub struct NodeExecutionProfile {
     pub finish: DateTime<Utc>,
     pub duration_ms: i64,
     pub plan: Option<String>,
+    /// Rows the backend reported writing for this node, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_produced: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +86,10 @@ pub struct SystemUsageSample {
     pub disk_bytes: Option<u64>,
     pub read_bytes: Option<u64>,
     pub written_bytes: Option<u64>,
+}
+
+fn default_phase() -> String {
+    "measure".to_string()
 }
 
 fn normalize_identifier(value: &str) -> String {
@@ -165,6 +180,7 @@ pub fn build_dag_run_profile(dag_file: &str, dag: &Dag, exec_stats: &ExecStats) 
             finish: stats.finish,
             duration_ms: stats.duration.num_milliseconds(),
             plan: stats.plan.clone(),
+            rows_produced: stats.rows_produced,
         })
         .collect();
     node_executions.sort_by(|a, b| a.start.cmp(&b.start).then(a.node_id.cmp(&b.node_id)));
@@ -186,6 +202,8 @@ pub fn build_dag_run_profile(dag_file: &str, dag: &Dag, exec_stats: &ExecStats) 
 
     DagRunProfile {
         dag_file: dag_file.to_string(),
+        phase: default_phase(),
+        rep_index: 0,
         db: dag.db.clone(),
         run_started_at: exec_stats.start,
         run_finished_at: exec_stats.finish,

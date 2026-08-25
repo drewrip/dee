@@ -176,6 +176,40 @@ fn sample_process_disk_io(pid: u32) -> (Option<u64>, Option<u64>) {
         .unwrap_or((None, None))
 }
 
+/// Rows written by a `CREATE TABLE AS` / `CREATE TEMP TABLE AS`, read from a
+/// DuckDB `enable_profiling='json'` plan.
+///
+/// The `*_CREATE_TABLE_AS` operator reports `operator_cardinality = 1` (the
+/// single count row the statement returns), so the real figure is the
+/// cardinality of its input operator.
+fn rows_written_from_plan(json_str: &str) -> Option<usize> {
+    fn op_name(node: &serde_json::Value) -> Option<&str> {
+        node.get("operator_name")
+            .or_else(|| node.get("name"))
+            .and_then(|v| v.as_str())
+    }
+
+    fn find(node: &serde_json::Value) -> Option<usize> {
+        if let Some(name) = op_name(node)
+            && name.ends_with("CREATE_TABLE_AS")
+        {
+            let child = node.get("children")?.as_array()?.first()?;
+            return child
+                .get("operator_cardinality")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+        }
+        for child in node.get("children")?.as_array()? {
+            if let Some(found) = find(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    find(&serde_json::from_str::<serde_json::Value>(json_str).ok()?)
+}
+
 #[async_trait]
 impl Connector for DuckDBConnection {
     type Config = DuckDBConfig;
@@ -327,7 +361,15 @@ impl Connector for DuckDBConnection {
                     ConnectorError::Execute(format!("Failed to read profiling output: {}", e))
                 })?;
 
-                Ok((res, Some(json_str)))
+                // DuckDB's `execute` reports 0 changed rows for a CTAS, and
+                // the CREATE_TABLE_AS operator's own cardinality is 1 (the
+                // count row it returns). The number of rows actually written
+                // is the cardinality of that operator's input, so read it off
+                // the profiling plan we already have rather than paying for a
+                // separate COUNT(*).
+                let rows_written = rows_written_from_plan(&json_str).unwrap_or(res);
+
+                Ok((rows_written, Some(json_str)))
             }
         }
     }
@@ -411,6 +453,14 @@ impl Connector for DuckDBConnection {
         }
 
         Ok(Some(result))
+    }
+
+    fn parse_plan(&self, json: &str) -> Option<Vec<crate::plan::PlanNode>> {
+        crate::plan::parse_duckdb_plan(json)
+    }
+
+    fn time_basis(&self) -> crate::plan::TimeBasis {
+        crate::plan::TimeBasis::CpuTime
     }
 
     async fn sample_system_memory_usage(&self) -> Result<Option<u64>, ConnectorError> {
