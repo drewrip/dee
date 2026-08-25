@@ -32,14 +32,20 @@ def render(spec: ChartSpec, out_dir: Path, formats: set[str]) -> dict[str, str]:
         return {}
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(10, 5.2), dpi=140)
+    is_bar = spec.kind not in ("line", "scatter")
+    # A fixed 10in width crowds tick labels into an unreadable pile once a bar
+    # chart has more than a handful of categories (e.g. a project x variant
+    # cross product), so widen the figure to the label count instead.
+    n_labels = len(dict.fromkeys(spec.series[0].x)) if is_bar and spec.series else 0
+    width_in = max(10.0, min(22.0, 0.9 * n_labels + 2.0)) if is_bar else 10.0
+    fig, ax = plt.subplots(figsize=(width_in, 5.2), dpi=140)
     fig.patch.set_facecolor(LIGHT["surface"])
     ax.set_facecolor(LIGHT["surface"])
 
-    if spec.kind in ("line", "scatter"):
+    if not is_bar:
         _draw_line(ax, spec)
     else:
-        _draw_bars(ax, spec)
+        _draw_bars(ax, spec, rotate=n_labels > 6)
 
     if spec.hline is not None:
         ax.axhline(spec.hline, color=LIGHT["text_muted"], linewidth=1.0,
@@ -104,7 +110,7 @@ def _draw_line(ax, spec: ChartSpec) -> None:
         ax.set_yscale("log")
 
 
-def _draw_bars(ax, spec: ChartSpec) -> None:
+def _draw_bars(ax, spec: ChartSpec, rotate: bool = False) -> None:
     labels = list(dict.fromkeys(spec.series[0].x)) if spec.series else []
     n = max(len(spec.series), 1)
     # Cap the bar width so the band keeps visible air rather than being filled.
@@ -113,13 +119,21 @@ def _draw_bars(ax, spec: ChartSpec) -> None:
 
     for i, s in enumerate(spec.series):
         offset = (i - (n - 1) / 2) * (width + 0.02)
-        xs = [p + offset for p in positions]
-        ys = [y if y is not None else 0 for y in s.y]
+        # None means "not measured", not zero -- a 0-height bar in a ratio
+        # chart (speedup, relative resource use, payback runs) would read as a
+        # real, favorable measurement instead of absent data.
+        xs, ys = zip(*((p + offset, y) for p, y in zip(positions, s.y) if y is not None)) \
+            if any(y is not None for y in s.y) else ((), ())
         ax.bar(xs, ys, width=width, label=s.name, color=series_color(s.name, i),
                zorder=3, linewidth=0)
 
     ax.set_xticks(list(positions))
-    ax.set_xticklabels(labels, fontsize=8)
+    # A dozen multi-line category labels set flat overlap each other; angling
+    # them past that count is the only way to keep every one readable.
+    if rotate:
+        ax.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
+    else:
+        ax.set_xticklabels(labels, fontsize=8)
     # Without this, matplotlib shrinks the x range onto the bars themselves, so
     # a chart with one category renders as a single slab filling the panel.
     ax.set_xlim(-0.5, len(labels) - 0.5)

@@ -43,19 +43,19 @@ dee_opt:
 
 backends:
   duckdb:
-    threads: 16
-    num_connections: 16
+    threads: 8
+    num_connections: 8
   postgres:
     provider: container
     image: postgres:18
     port: 55433
-    cpus: 16
+    cpus: 8
     memory: 12g
-    num_connections: 16
+    num_connections: 8
     settings:
       shared_buffers: 3GB
       work_mem: 256MB
-      max_parallel_workers: 16
+      max_parallel_workers: 8
 
 execution:
   repetitions: 5

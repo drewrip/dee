@@ -8,6 +8,8 @@ dependencies = [
     "pyarrow>=17",
     "duckdb>=1.1",
     "numpy",
+    # Cross-platform process CPU/RSS/IO sampling (Linux and macOS).
+    "psutil>=5.9",
     # Workload preparation (dag-bench projects are dbt projects).
     "PyYAML",
     "dbt-core",

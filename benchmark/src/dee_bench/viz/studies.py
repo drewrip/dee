@@ -24,6 +24,19 @@ def _rows(con, sql: str) -> list[tuple]:
         return []
 
 
+def _drop_empty_labels(labels: list[str], by_variant: dict[str, list]) -> tuple[list[str], dict[str, list]]:
+    """Drop label positions where every series is None.
+
+    A partial run measures the unoptimized baseline for a cell well before its
+    optimized variants finish, which would otherwise show that cell as a bare
+    x-axis label with no bars at all -- a category advertising data that isn't
+    there yet.
+    """
+    keep = [i for i in range(len(labels)) if any(v[i] is not None for v in by_variant.values())]
+    return ([labels[i] for i in keep],
+            {name: [v[i] for i in keep] for name, v in by_variant.items()})
+
+
 # Measured runtime per cell, the basis of most studies. Medians rather than
 # means: a single slow repetition from an unrelated system hiccup should not
 # move the headline number.
@@ -51,7 +64,8 @@ def study_scaling(con) -> Study:
         return s
 
     sfs = sorted({r[2] for r in rows})
-    if len(sfs) < 2:
+    single_sf = len(sfs) < 2
+    if single_sf:
         s.empty_reason = (
             f"Only one scale factor ({sfs[0]:g}) was benchmarked. "
             "Sweep `matrix.sf` over several values to see scaling behaviour."
@@ -59,8 +73,25 @@ def study_scaling(con) -> Study:
 
     for backend in sorted({r[1] for r in rows}):
         for project in sorted({r[0] for r in rows if r[1] == backend}):
-            series = []
             names = ordered(list({r[3] for r in rows if r[0] == project and r[1] == backend}))
+            if single_sf:
+                # A single scale factor has no trend to draw as a line -- it
+                # would just be disconnected dots on an arbitrary axis. Compare
+                # variants directly instead, which is what the data actually is.
+                by_name = {r[3]: r[5] for r in rows if r[0] == project and r[1] == backend}
+                s.charts.append(ChartSpec(
+                    id=f"scaling-{backend}-{project}",
+                    kind="grouped_bar",
+                    title=f"{project} on {backend}",
+                    subtitle=f"Median measured runtime at scale factor {sfs[0]:g}",
+                    x_label="", y_label="Runtime (s)",
+                    series=[Series(name=n, x=[f"sf{sfs[0]:g}"], y=[by_name.get(n)])
+                            for n in names],
+                    note="Only one scale factor was benchmarked, so this shows runtime by "
+                         "variant rather than a trend across scale.",
+                ))
+                continue
+            series = []
             for name in names:
                 pts = sorted(
                     (r for r in rows if r[0] == project and r[1] == backend and r[3] == name),
@@ -112,6 +143,10 @@ def study_optimization(con) -> Study:
         for v in variants:
             match = [r[5] for r in rows if (r[0], r[1], r[2]) == key and r[3] == v]
             by_variant[v].append(base / match[0] if match and match[0] else None)
+    labels, by_variant = _drop_empty_labels(labels, by_variant)
+    if not labels:
+        s.empty_reason = "No optimized variant has a measured baseline to compare against yet."
+        return s
 
     s.charts.append(ChartSpec(
         id="optimization-speedup", kind="grouped_bar",
@@ -358,6 +393,7 @@ def study_resource_response(con) -> Study:
             for v in variants:
                 match = [r[idx] for r in rows if (r[0], r[1], r[2]) == key and r[3] == v]
                 by_variant[v].append(match[0] / base if match and match[0] else None)
+        labels, by_variant = _drop_empty_labels(labels, by_variant)
         if not labels:
             continue
         s.charts.append(ChartSpec(
