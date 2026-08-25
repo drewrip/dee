@@ -1,0 +1,64 @@
+# How effective is the pushdown pass?
+#
+# The ladder is built so pushdown's two distinct effects can be separated,
+# because a plain "hmp vs hmp+pushdown" comparison conflates them:
+#
+#   unopt              baseline
+#   pushdown_only      pushdown with nothing to work on -- an unoptimized dbt
+#                      DAG is views terminating in tables, and pushdown only
+#                      rewrites TempTable nodes. Expected to be a no-op; it is
+#                      here to prove that, not as a serious contender.
+#   hmp                materialization only, pushdown disabled everywhere
+#   hmp_then_pushdown  the same materializations, then pushdown as a final
+#                      rewrite  ->  isolates the REWRITE's effect
+#   hmp_pushdown       pushdown also runs inside HMP's candidate evaluation, so
+#                      it can change which materializations HMP picks
+#                      ->  isolates the effect on the SEARCH
+#
+# Postgres is included because DuckDB at sf 0.1 runs these DAGs in well under a
+# second, where small effects sit inside measurement noise; the same DAGs take
+# ~20s on postgres, so the signal is unambiguous there.
+name: pushdown-ablation
+dag_bench: ${DAG_BENCH}
+dee_cli: ../../target/release/dee-cli
+output_dir: ../results/pushdown-ablation
+verbosity: detailed
+
+matrix:
+  project: [p01_iot, p03_ecommerce, p07_saas, p09_gaming]
+  backend: [duckdb, postgres]
+  sf: [0.1]
+  variant: [unopt, pushdown_only, hmp, hmp_then_pushdown, hmp_pushdown]
+
+variants:
+  unopt:             {passes: []}
+  pushdown_only:     {passes: [pushdown]}
+  hmp:               {passes: [hmp], hmp_use_pushdown: false}
+  hmp_then_pushdown: {passes: [hmp, pushdown], hmp_use_pushdown: false}
+  hmp_pushdown:      {passes: [hmp, pushdown]}
+
+dee_opt:
+  hmp_max_runs: 4
+  hmp_strategy: breadth
+
+backends:
+  duckdb:
+    threads: 16
+    num_connections: 16
+  postgres:
+    provider: container
+    image: postgres:18
+    port: 55433
+    cpus: 16
+    memory: 12g
+    num_connections: 16
+    settings:
+      shared_buffers: 3GB
+      work_mem: 256MB
+      max_parallel_workers: 16
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600
