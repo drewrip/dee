@@ -2,12 +2,25 @@
 
 An experimental SQL transformation orchestrator
 
+## Benchmarking
 
-## Dependencies
+The benchmark harness lives in [`benchmark/`](benchmark/) and runs `dee`
+against [dag-bench](https://github.com/drewrip/dag-bench). See
+[`benchmark/README.md`](benchmark/README.md) for full details; the two most
+common runs:
 
-We have a dependency on both the `datafusion` and `duckdb` crates. However, we currently
-require a recent git commit of `datafusion` that fixes a crucial bug for this project.
-Related to this we also then require a slightly modified version of the `duckdb` crate.
-This just updates the `duckdb-rs` version of `arrow` to 59 which is required for compatibility
-with the most recent `datafusion`. These will be replaced with dependencies on versions
-of the proper upstream crates once they are compatible again.
+```bash
+cd benchmark
+uv venv && uv pip install -e .
+export DAG_BENCH=/path/to/dag-bench
+cargo build --release --manifest-path ../Cargo.toml
+
+# Smoke test: one project, one scale factor, runs in a couple of minutes.
+.venv/bin/dee-bench run -c configs/smoke.yaml
+
+# Full evaluation: every project, both backends, a scale-factor and HMP
+# tuning sweep. This is long-running, so submit it as a background worker
+# rather than running it in the foreground.
+.venv/bin/dee-bench submit -c configs/full.yaml
+.venv/bin/dee-bench status results/full-eval
+```
