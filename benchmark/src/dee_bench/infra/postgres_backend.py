@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..sampler import CgroupReader, find_cgroup_path
+from ..sampler import CgroupReader
 from ..workload import (
     WorkloadError,
     ensure_scratch_repo_root,
@@ -239,13 +239,13 @@ class PostgresBackend(Backend):
     def _cgroup(self) -> CgroupReader | None:
         if not self.container_id:
             return None
-        path = find_cgroup_path(self.container_id)
-        if path is None:
+        reader = CgroupReader(container_runtime(), self.container_id)
+        if reader.sample() is None:
             self.log(
                 "  postgres: cgroup counters unavailable; container CPU/memory will not be sampled"
             )
             return None
-        return CgroupReader(path)
+        return reader
 
     # -- data --------------------------------------------------------------
 

@@ -106,11 +106,16 @@ def _figure(spec: ChartSpec) -> dict[str, Any]:
                 "customdata": [dark] * max(len(s.x), 1),
             })
         else:
+            # None means "not measured" -- omit the point rather than let
+            # plotly render it as a zero-height bar, which would read as a
+            # real, favorable measurement in a speedup/relative-resource chart.
+            pts = [(x, y) for x, y in zip(s.x, s.y) if y is not None]
+            xs, ys = zip(*pts) if pts else ((), ())
             traces.append({
-                "type": "bar", "name": s.name, "x": s.x, "y": s.y,
+                "type": "bar", "name": s.name, "x": list(xs), "y": list(ys),
                 "marker": {"color": light, "line": {"width": 0}},
                 "hovertemplate": hover,
-                "customdata": [dark] * max(len(s.x), 1),
+                "customdata": [dark] * max(len(xs), 1),
             })
 
     layout: dict[str, Any] = {

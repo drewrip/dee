@@ -11,24 +11,23 @@ output_dir: ../results/full-eval
 verbosity: detailed
 
 matrix:
-  project: [p01_iot, p02_adtech, p03_ecommerce, p04_fraud, p05_hr, p06_logistics, p07_saas, p08_healthcare, p09_gaming, p10_energy]
+  project: [p01_iot, p03_ecommerce, p05_hr, p07_saas, p09_gaming]
   backend: [duckdb, postgres]
-  sf: [0.1, 0.25, 0.5]
-  variant: [unopt, hmp, hmp_pushdown, omp]
+  sf: [1]
+  variant: [unopt, hmp, hmp_pushdown]
 
 variants:
   unopt:        {passes: []}
   hmp:          {passes: [hmp], hmp_use_pushdown: false}
   hmp_pushdown: {passes: [hmp, pushdown]}
-  omp:          {passes: [omp]}
 
 # Lists here multiply into the matrix, but only for variants whose passes
 # actually read the option -- `hmp_strategy` does not duplicate `unopt` or
 # `omp` cells.
 dee_opt:
-  hmp_max_runs: [1, 4]
-  hmp_strategy: [breadth, greedy]
-  hmp_downstream_cost: [false, true]
+  hmp_max_runs: [3]
+  hmp_strategy: [breadth]
+  hmp_downstream_cost: [false]
   hmp_beam_width: 2
   hmp_top_cpu_time: 0.5
   omp_node_centrality: outdegree

@@ -6,8 +6,8 @@ measured, for two reasons:
 * dee's own Postgres connector reports no CPU or disk at all, and its memory
   sample reads ``pg_backend_memory_contexts`` — the monitoring connection's own
   backend, not the workers doing the work. Study 7 is unmeasurable from inside.
-* CPU is read here as **counter deltas** (``/proc/<pid>/stat`` utime+stime,
-  cgroup ``cpu.stat`` usage_usec) rather than sampled percentages. A sampled
+* CPU is read here as **counter deltas** (process cumulative CPU time, cgroup
+  ``cpu.stat`` usage_usec) rather than sampled percentages. A sampled
   percentage integrated over time misses everything between samples; a counter
   cannot. dee's internal estimate trapezoidally integrates ``ps -o %cpu``,
   which is why the two can disagree.
@@ -15,25 +15,27 @@ measured, for two reasons:
 Two sources are sampled, and recorded distinctly:
 
 ``harness_process``
-    The dee-cli process tree, from ``/proc``. Covers DuckDB entirely, since it
-    is in-process.
+    The dee-cli process tree, via ``psutil``. Covers DuckDB entirely, since it
+    is in-process. ``psutil`` (rather than ``/proc`` directly) is what makes
+    this work on macOS dev machines as well as Linux.
 ``harness_container``
-    The postgres container's cgroup. Covers the server-side work DuckDB does
-    not have.
+    The postgres container's cgroup, read through ``exec`` rather than the
+    host's ``/sys/fs/cgroup``: on Docker Desktop (macOS) containers run inside
+    a Linux VM the host filesystem never exposes, so there is no cgroup path
+    to find on the host at all. Reading it from inside the container works
+    the same way regardless of host OS or cgroup driver.
 """
 
 from __future__ import annotations
 
-import os
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+import psutil
 
 
 @dataclass
@@ -67,92 +69,43 @@ class PhaseMetrics:
 
 
 # --------------------------------------------------------------------------
-# /proc readers
+# process-tree reader (psutil, so it works on both Linux and macOS)
 # --------------------------------------------------------------------------
-
-
-def _proc_children(pid: int) -> list[int]:
-    """Every descendant of `pid`, via /proc/<pid>/task/*/children."""
-    out: list[int] = []
-    stack = [pid]
-    seen = set()
-    while stack:
-        cur = stack.pop()
-        if cur in seen:
-            continue
-        seen.add(cur)
-        out.append(cur)
-        task_dir = Path(f"/proc/{cur}/task")
-        try:
-            for task in task_dir.iterdir():
-                try:
-                    kids = (task / "children").read_text().split()
-                except (OSError, ValueError):
-                    continue
-                stack.extend(int(k) for k in kids)
-        except OSError:
-            continue
-    return out
-
-
-def _read_proc_stat_cpu(pid: int) -> float | None:
-    """CPU seconds this process has used (utime + stime)."""
-    try:
-        data = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return None
-    # comm may contain spaces and parentheses, so split after the last ')'.
-    try:
-        rest = data[data.rindex(")") + 2 :].split()
-        utime, stime = int(rest[11]), int(rest[12])
-    except (ValueError, IndexError):
-        return None
-    return (utime + stime) / CLK_TCK
-
-
-def _read_proc_rss(pid: int) -> int | None:
-    try:
-        statm = Path(f"/proc/{pid}/statm").read_text().split()
-        return int(statm[1]) * PAGE_SIZE
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def _read_proc_io(pid: int) -> tuple[int | None, int | None]:
-    try:
-        text = Path(f"/proc/{pid}/io").read_text()
-    except OSError:
-        # Unreadable without matching credentials; not fatal.
-        return None, None
-    read = written = None
-    for line in text.splitlines():
-        if line.startswith("read_bytes:"):
-            read = int(line.split()[1])
-        elif line.startswith("write_bytes:"):
-            written = int(line.split()[1])
-    return read, written
 
 
 def sample_process_tree(pid: int) -> Sample | None:
     """One sample summed over `pid` and every descendant."""
-    pids = _proc_children(pid)
-    if not pids:
+    try:
+        root = psutil.Process(pid)
+        procs = [root, *root.children(recursive=True)]
+    except psutil.NoSuchProcess:
         return None
+
     cpu = rss = read = written = 0.0
-    any_cpu = False
-    for p in pids:
-        c = _read_proc_stat_cpu(p)
-        if c is not None:
-            cpu += c
-            any_cpu = True
-        r = _read_proc_rss(p)
-        if r:
-            rss += r
-        rb, wb = _read_proc_io(p)
-        if rb:
-            read += rb
-        if wb:
-            written += wb
+    any_cpu = any_io = False
+    for p in procs:
+        try:
+            times = p.cpu_times()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        cpu += times.user + times.system
+        any_cpu = True
+        try:
+            rss += p.memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        # io_counters() doesn't exist on macOS at all (not just unimplemented),
+        # so the attribute itself is probed rather than assumed present.
+        io_counters = getattr(p, "io_counters", None)
+        if io_counters is None:
+            continue
+        try:
+            io = io_counters()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        read += io.read_bytes
+        written += io.write_bytes
+        any_io = True
     if not any_cpu:
         return None
     now = datetime.now(timezone.utc)
@@ -162,61 +115,40 @@ def sample_process_tree(pid: int) -> Sample | None:
         timestamp=now,
         cpu_seconds_cum=cpu,
         rss_bytes=int(rss),
-        read_bytes=int(read),
-        written_bytes=int(written),
+        read_bytes=int(read) if any_io else None,
+        written_bytes=int(written) if any_io else None,
     )
 
 
 # --------------------------------------------------------------------------
-# cgroup v2 readers (for a containerized postgres)
+# cgroup v2 reader (for a containerized postgres), via `exec`
 # --------------------------------------------------------------------------
-
-
-def find_cgroup_path(container_id: str) -> Path | None:
-    """Locate a container's cgroup v2 directory on the host.
-
-    The layout depends on the runtime and whether it is rootful or rootless:
-    docker uses ``docker-<id>.scope`` under system.slice, while rootless podman
-    nests ``libpod-<id>.scope`` under the invoking user's slice. Both are tried
-    before falling back to a scan, because without this the postgres
-    container's CPU and memory go unsampled and study 7 loses its server-side
-    half.
-    """
-    uid = os.getuid()
-    user_slice = (
-        f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
-    )
-    roots = [
-        # docker, rootful
-        Path(f"/sys/fs/cgroup/system.slice/docker-{container_id}.scope"),
-        Path(f"/sys/fs/cgroup/docker/{container_id}"),
-        # podman, rootful
-        Path(f"/sys/fs/cgroup/machine.slice/libpod-{container_id}.scope"),
-        # podman, rootless
-        Path(f"{user_slice}/user.slice/libpod-{container_id}.scope"),
-        Path(f"{user_slice}/libpod-{container_id}.scope"),
-    ]
-    for r in roots:
-        if (r / "cpu.stat").exists():
-            return r
-    # Fall back to a scan; layouts vary by cgroup driver and systemd version.
-    for base in (Path("/sys/fs/cgroup"),):
-        if not base.exists():
-            continue
-        try:
-            for candidate in base.glob(f"**/*{container_id[:12]}*"):
-                if (candidate / "cpu.stat").exists():
-                    return candidate
-        except OSError:
-            continue
-    return None
 
 
 class CgroupReader:
-    """Reads cpu/memory/io counters for one container's cgroup."""
+    """Reads cpu/memory/io counters for one container's own cgroup v2 root.
 
-    def __init__(self, cgroup: Path):
-        self.cgroup = cgroup
+    Read through ``<runtime> exec ... cat ...`` rather than the host's
+    ``/sys/fs/cgroup``: with cgroup namespaces (the default since Docker
+    20.10), a container's own root cgroup is mounted at ``/sys/fs/cgroup``
+    inside it, so this needs no knowledge of the host's cgroup driver or
+    layout, and works the same on a bare-metal Linux host or a macOS/Docker
+    Desktop VM.
+    """
+
+    def __init__(self, runtime: str, container_id: str):
+        self.runtime = runtime
+        self.container_id = container_id
+
+    def _cat(self, path: str) -> str | None:
+        try:
+            proc = subprocess.run(
+                [self.runtime, "exec", self.container_id, "cat", path],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return proc.stdout if proc.returncode == 0 else None
 
     def sample(self) -> Sample | None:
         cpu = self._cpu_seconds()
@@ -234,35 +166,41 @@ class CgroupReader:
         )
 
     def _cpu_seconds(self) -> float | None:
-        try:
-            for line in (self.cgroup / "cpu.stat").read_text().splitlines():
-                if line.startswith("usage_usec"):
-                    return int(line.split()[1]) / 1e6
-        except (OSError, ValueError):
+        text = self._cat("/sys/fs/cgroup/cpu.stat")
+        if text is None:
             return None
+        for line in text.splitlines():
+            if line.startswith("usage_usec"):
+                try:
+                    return int(line.split()[1]) / 1e6
+                except (ValueError, IndexError):
+                    return None
         return None
 
     def _memory_bytes(self) -> int | None:
+        text = self._cat("/sys/fs/cgroup/memory.current")
+        if text is None:
+            return None
         try:
-            return int((self.cgroup / "memory.current").read_text().strip())
-        except (OSError, ValueError):
+            return int(text.strip())
+        except ValueError:
             return None
 
     def _io_bytes(self) -> tuple[int | None, int | None]:
+        text = self._cat("/sys/fs/cgroup/io.stat")
+        if text is None:
+            return None, None
         read = written = 0
         found = False
-        try:
-            for line in (self.cgroup / "io.stat").read_text().splitlines():
-                for field_ in line.split()[1:]:
-                    key, _, value = field_.partition("=")
-                    if key == "rbytes":
-                        read += int(value)
-                        found = True
-                    elif key == "wbytes":
-                        written += int(value)
-                        found = True
-        except (OSError, ValueError):
-            return None, None
+        for line in text.splitlines():
+            for field_ in line.split()[1:]:
+                key, _, value = field_.partition("=")
+                if key == "rbytes":
+                    read += int(value)
+                    found = True
+                elif key == "wbytes":
+                    written += int(value)
+                    found = True
         return (read, written) if found else (None, None)
 
 
