@@ -1,0 +1,58 @@
+# The full evaluation: every study, both backends, a scale-factor sweep and an
+# HMP tuning sweep. Long-running -- submit it rather than running it in the
+# foreground:
+#
+#   dee-bench submit -c configs/full.yaml
+#   dee-bench status <run_dir>
+name: full-eval
+dag_bench: ${DAG_BENCH}
+dee_cli: ../../target/release/dee-cli
+output_dir: ../results/full-eval
+verbosity: detailed
+
+matrix:
+  project: [p01_iot, p02_adtech, p03_ecommerce, p04_fraud, p07_saas, p09_gaming]
+  backend: [duckdb, postgres]
+  sf: [0.1, 0.25, 0.5]
+  variant: [unopt, hmp, hmp_pushdown, omp, full]
+
+variants:
+  unopt:        {passes: []}
+  hmp:          {passes: [hmp], hmp_use_pushdown: false}
+  hmp_pushdown: {passes: [hmp, pushdown]}
+  omp:          {passes: [omp]}
+  full:         {passes: [hmp, omp, pushdown]}
+
+# Lists here multiply into the matrix, but only for variants whose passes
+# actually read the option -- `hmp_strategy` does not duplicate `unopt` or
+# `omp` cells.
+dee_opt:
+  hmp_max_runs: [1, 4]
+  hmp_strategy: [breadth, greedy]
+  hmp_downstream_cost: [false, true]
+  hmp_beam_width: 2
+  hmp_top_cpu_time: 0.5
+  omp_node_centrality: outdegree
+
+backends:
+  duckdb:
+    threads: 16
+    max_memory: 16GB
+    num_connections: 16
+  postgres:
+    provider: docker
+    image: postgres:18
+    cpus: 16
+    memory: 16g
+    num_connections: 16
+    settings:
+      shared_buffers: 4GB
+      work_mem: 256MB
+      max_parallel_workers: 16
+      max_parallel_workers_per_gather: 4
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 7200

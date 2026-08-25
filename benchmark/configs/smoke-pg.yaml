@@ -1,0 +1,43 @@
+# Postgres smoke test: same shape as smoke.yaml, against a managed container.
+#
+# Port 5432 is deliberately avoided -- a developer machine usually already has
+# a local postgres there, and the benchmark must never touch it.
+name: smoke-pg
+dag_bench: ${DAG_BENCH}
+dee_cli: ../../target/release/dee-cli
+output_dir: ../results/smoke-pg
+verbosity: detailed
+
+matrix:
+  project: [p01_iot]
+  backend: [postgres]
+  sf: [0.1]
+  variant: [unopt, hmp, hmp_pushdown]
+
+variants:
+  unopt:        {passes: []}
+  hmp:          {passes: [hmp], hmp_use_pushdown: false}
+  hmp_pushdown: {passes: [hmp, pushdown]}
+
+dee_opt:
+  hmp_max_runs: 3
+  hmp_strategy: breadth
+
+backends:
+  postgres:
+    provider: container
+    image: postgres:18
+    port: 55433
+    cpus: 8
+    memory: 8g
+    num_connections: 16
+    settings:
+      shared_buffers: 2GB
+      work_mem: 256MB
+      max_parallel_workers: 8
+
+execution:
+  repetitions: 3
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

@@ -1,0 +1,46 @@
+# Both backends over the same project and scale factor, so DuckDB and Postgres
+# results land in one dataset and the dashboard can compare them directly.
+#
+# Postgres runs on 55433 rather than 5432: a developer machine usually already
+# has a local server on the default port, and the benchmark must never touch it.
+name: cross-backend
+dag_bench: ${DAG_BENCH}
+dee_cli: ../../target/release/dee-cli
+output_dir: ../results/cross-backend
+verbosity: detailed
+
+matrix:
+  project: [p01_iot]
+  backend: [duckdb, postgres]
+  sf: [0.1]
+  variant: [unopt, hmp, hmp_pushdown]
+
+variants:
+  unopt:        {passes: []}
+  hmp:          {passes: [hmp], hmp_use_pushdown: false}
+  hmp_pushdown: {passes: [hmp, pushdown]}
+
+dee_opt:
+  hmp_max_runs: 3
+  hmp_strategy: breadth
+
+backends:
+  duckdb:
+    threads: 8
+    num_connections: 16
+  postgres:
+    provider: container
+    image: postgres:18
+    port: 55433
+    cpus: 8
+    memory: 8g
+    num_connections: 16
+    settings:
+      shared_buffers: 2GB
+      work_mem: 256MB
+      max_parallel_workers: 8
+
+execution:
+  repetitions: 3
+  warmups: 1
+  sample_interval_ms: 100

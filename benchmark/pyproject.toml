@@ -1,25 +1,37 @@
 [project]
-name = "dee-benchmark"
+name = "dee-bench"
 version = "0.1.0"
-description = "Benchmarking suite for dee"
-requires-python = "==3.13"
+description = "Benchmarking harness for dee against dag-bench"
+requires-python = ">=3.11"
 dependencies = [
-    "pandas",
-    "matplotlib",
+    # Results storage and analysis.
+    "pyarrow>=17",
+    "duckdb>=1.1",
     "numpy",
+    # Workload preparation (dag-bench projects are dbt projects).
     "PyYAML",
     "dbt-core",
     "dbt-duckdb",
     "dbt-postgres",
+    # Visualization: plotly for the interactive dashboard, matplotlib for the
+    # static png/pdf each chart links to.
+    "plotly>=5.20",
+    "matplotlib",
+    "jinja2",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.scripts]
-dee-benchmark = "dee_benchmark.run:main"
-dee-plot = "dee_benchmark.plot:main"
+dee-bench = "dee_bench.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dee_benchmark"]
+packages = ["src/dee_bench"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
