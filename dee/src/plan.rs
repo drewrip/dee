@@ -132,24 +132,35 @@ struct DuckDBPlan {
 }
 
 impl DuckDBPlan {
-    fn into_plan_node(self) -> Option<PlanNode> {
-        let operator = self.operator_name.clone().or_else(|| self.name.clone())?;
+    /// Convert to plan nodes, splicing unnamed wrappers out of the tree.
+    ///
+    /// DuckDB's profiling output is rooted at a query-level object that has no
+    /// `operator_name` of its own -- the real plan hangs off its `children`.
+    /// An unnamed node therefore contributes its children in its own place
+    /// rather than nothing, otherwise the entire plan would be discarded and
+    /// the optimizer would see no operators at all.
+    fn into_plan_nodes(self) -> Vec<PlanNode> {
+        let name = self.operator_name.clone().or_else(|| self.name.clone());
+        let children: Vec<PlanNode> = self
+            .children
+            .into_iter()
+            .flat_map(DuckDBPlan::into_plan_nodes)
+            .collect();
+        let Some(operator) = name else {
+            return children;
+        };
         let estimated = self
             .extra_info
             .get("Estimated Cardinality")
             .and_then(json_to_f64);
-        Some(PlanNode {
+        vec![PlanNode {
             operator,
             // DuckDB's operator_timing is already this operator's own time.
             exclusive_time_s: self.operator_timing,
             cardinality: self.operator_cardinality,
             estimated_cardinality: estimated,
-            children: self
-                .children
-                .into_iter()
-                .filter_map(DuckDBPlan::into_plan_node)
-                .collect(),
-        })
+            children,
+        }]
     }
 }
 
@@ -165,15 +176,15 @@ fn json_to_f64(v: &serde_json::Value) -> Option<f64> {
 /// while `EXPLAIN (FORMAT JSON)` is an array of roots.
 pub fn parse_duckdb_plan(json: &str) -> Option<Vec<PlanNode>> {
     if let Ok(roots) = serde_json::from_str::<Vec<DuckDBPlan>>(json) {
-        return Some(roots.into_iter().filter_map(DuckDBPlan::into_plan_node).collect());
+        return Some(
+            roots
+                .into_iter()
+                .flat_map(DuckDBPlan::into_plan_nodes)
+                .collect(),
+        );
     }
     let root = serde_json::from_str::<DuckDBPlan>(json).ok()?;
-    // The profiling root is a query-level wrapper with no operator name of its
-    // own; its children are the real plan.
-    match root.into_plan_node() {
-        Some(node) => Some(vec![node]),
-        None => None,
-    }
+    Some(root.into_plan_nodes())
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +316,42 @@ mod tests {
             assert_eq!(plans[0].exclusive_time_s, Some(0.5));
             assert_eq!(plans[0].estimated_cardinality, Some(12.0));
         }
+    }
+
+    #[test]
+    fn duckdb_profiling_root_is_spliced_out_not_discarded() {
+        // Shape of real `enable_profiling='json'` output: the root is a
+        // query-level object with no operator_name, and the plan hangs off its
+        // children. Discarding it would leave the optimizer with no operators,
+        // an empty candidate ranking, and nothing to do.
+        let json = r#"{
+            "query_name": "CREATE TABLE x AS ...", "cpu_time": 2.8, "rows_returned": 1,
+            "children": [
+              {"operator_name":"BATCH_CREATE_TABLE_AS","operator_timing":0.001,
+               "operator_cardinality":1,"extra_info":{"Estimated Cardinality":1},
+               "children":[
+                 {"operator_name":"HASH_GROUP_BY","operator_timing":1.5,
+                  "operator_cardinality":541,"extra_info":{"Estimated Cardinality":600},
+                  "children":[]}]}]}"#;
+        let plans = parse_duckdb_plan(json).unwrap();
+        assert_eq!(plans.len(), 1, "the unnamed root should be replaced by its children");
+        assert_eq!(plans[0].operator, "BATCH_CREATE_TABLE_AS");
+
+        // The operators below it must still be reachable for cost tracing.
+        let mut ops = Vec::new();
+        plans[0].collect_operators(&mut ops);
+        let names: Vec<&str> = ops.iter().map(|(k, _)| k.name.as_str()).collect();
+        assert!(names.contains(&"HASH_GROUP_BY"), "got {names:?}");
+    }
+
+    #[test]
+    fn duckdb_unnamed_intermediate_node_keeps_its_subtree() {
+        let json = r#"{"children":[{"children":[
+            {"operator_name":"SEQ_SCAN","operator_timing":0.4,
+             "extra_info":{"Estimated Cardinality":10},"children":[]}]}]}"#;
+        let plans = parse_duckdb_plan(json).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].operator, "SEQ_SCAN");
     }
 
     #[test]
