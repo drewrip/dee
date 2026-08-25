@@ -10,7 +10,7 @@ matrix:
   project: [p01_iot, p02_adtech, p03_ecommerce]
   backend: [duckdb]
   sf: [0.1]
-  variant: [unopt, hmp, hmp_pushdown, full]
+  variant: [unopt, hmp, hmp_pushdown]
 
 variants:
   unopt:        {passes: []}
@@ -18,7 +18,6 @@ variants:
   # materialization alone.
   hmp:          {passes: [hmp], hmp_use_pushdown: false}
   hmp_pushdown: {passes: [hmp, pushdown]}
-  full:         {passes: [hmp, omp, pushdown]}
 
 dee_opt:
   hmp_max_runs: 4
