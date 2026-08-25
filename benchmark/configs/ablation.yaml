@@ -1,0 +1,33 @@
+# Study 4: the ablation ladder. Each rung adds one more optimization, so the
+# marginal effect of each is visible rather than only the combined effect.
+name: ablation
+dag_bench: ${DAG_BENCH}
+dee_cli: ../../target/release/dee-cli
+output_dir: ../results/ablation
+verbosity: detailed
+
+matrix:
+  project: [p01_iot, p02_adtech, p03_ecommerce]
+  backend: [duckdb]
+  sf: [0.1]
+  variant: [unopt, hmp, hmp_pushdown, full]
+
+variants:
+  unopt:        {passes: []}
+  # HMP with its internal pushdown disabled, so this rung measures
+  # materialization alone.
+  hmp:          {passes: [hmp], hmp_use_pushdown: false}
+  hmp_pushdown: {passes: [hmp, pushdown]}
+  full:         {passes: [hmp, omp, pushdown]}
+
+dee_opt:
+  hmp_max_runs: 4
+  hmp_strategy: breadth
+
+backends:
+  duckdb: {threads: 16, num_connections: 16}
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100

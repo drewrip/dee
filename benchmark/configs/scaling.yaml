@@ -1,0 +1,31 @@
+# Study 1: how runtime responds to scale factor, and whether the optimizer's
+# benefit grows or shrinks with data volume.
+#
+# Note p06_logistics is deliberately absent: its `inventory` table is
+# warehouses x skus x 3, so it scales quadratically and dwarfs the others.
+name: scaling
+dag_bench: ${DAG_BENCH}
+dee_cli: ../../target/release/dee-cli
+output_dir: ../results/scaling
+verbosity: standard
+
+matrix:
+  project: [p01_iot, p03_ecommerce, p09_gaming]
+  backend: [duckdb]
+  sf: [0.1, 0.25, 0.5, 1.0]
+  variant: [unopt, hmp_pushdown]
+
+variants:
+  unopt:        {passes: []}
+  hmp_pushdown: {passes: [hmp, pushdown]}
+
+dee_opt:
+  hmp_max_runs: 4
+  hmp_strategy: breadth
+
+backends:
+  duckdb: {threads: 16, num_connections: 16}
+
+execution:
+  repetitions: 5
+  warmups: 1
