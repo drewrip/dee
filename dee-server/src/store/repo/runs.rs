@@ -31,6 +31,16 @@ pub mod status {
     }
 }
 
+/// Where a group sits in the run queue.
+///
+/// A group with no queue state was dispatched the moment it was created --
+/// `dee trigger` and the scheduler both do that. `Pending` and `Dispatched`
+/// only ever appear on groups that arrived through `POST /v1/dags/{name}/queue`.
+pub mod queue_state {
+    pub const PENDING: &str = "pending";
+    pub const DISPATCHED: &str = "dispatched";
+}
+
 /// What a caller asks for when triggering.
 #[derive(Debug, Clone)]
 pub struct RunRequest {
@@ -44,6 +54,13 @@ pub struct RunRequest {
     pub cleanup_before: bool,
     pub collect_plans: bool,
     pub sample_interval_ms: Option<i32>,
+    /// Park the group in the queue instead of driving it now. The dispatcher
+    /// starts it when the DAG is free and everything ahead of it has finished.
+    pub queued: bool,
+    /// False when `dag_version` was resolved from the DAG's current version
+    /// rather than named by the caller, which is what lets a queued entry
+    /// re-resolve to a newer version before it runs.
+    pub pin_version: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +81,9 @@ pub struct RunGroupRow {
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// `None` for a group that never went through the queue.
+    pub queue_state: Option<String>,
+    pub pin_version: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,6 +161,9 @@ pub struct CreatedGroup {
 ///
 /// Warmups come first and are tagged `phase = 'warmup'`; they are recorded so
 /// they are visible, but must be excluded from any aggregate.
+///
+/// `request.queued` decides who starts the group: the caller, right now, or
+/// the queue dispatcher when the DAG frees up.
 pub async fn create_group(
     store: &Store,
     request: RunRequest,
@@ -169,8 +192,9 @@ pub async fn create_group(
                     "INSERT INTO run_groups
                         (run_group_id, dag_id, dag_version, target, trigger, scheduled_for,
                          warmups, repetitions, cleanup_before, collect_plans,
-                         sample_interval_ms, status, created_at, instance_id)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         sample_interval_ms, status, created_at, instance_id,
+                         queue_state, pin_version)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     duckdb::params![
                         group_id,
                         request.dag_id,
@@ -185,7 +209,9 @@ pub async fn create_group(
                         request.sample_interval_ms,
                         status::QUEUED,
                         now,
-                        instance_id
+                        instance_id,
+                        request.queued.then(|| queue_state::PENDING),
+                        request.pin_version
                     ],
                 )?;
                 for (run_id, phase, rep_index) in &runs {
@@ -233,6 +259,9 @@ pub async fn create_group(
 ///
 /// Optimizations count: they run the DAG against the same warehouse, so an
 /// optimize and a scheduled run would fight over the same relation names.
+/// Entries still waiting in the queue count too, which is what stops a manual
+/// trigger or a schedule from cutting in front of a queue that is mid-drain.
+/// The dispatcher itself asks [`dispatch_blocker`] instead.
 pub async fn active_job(store: &Store, dag_id: String) -> Result<Option<String>, StoreError> {
     store
         .read(move |conn| {
@@ -246,6 +275,220 @@ pub async fn active_job(store: &Store, dag_id: String) -> Result<Option<String>,
             )?;
             let mut rows = stmt.query_map(duckdb::params![dag_id], |r| r.get::<_, String>(0))?;
             rows.next().transpose().map_err(StoreError::from)
+        })
+        .await
+}
+
+/// What actually blocks the queue from starting `dag_id` right now.
+///
+/// Deliberately narrower than [`active_job`]: entries still sitting in the
+/// queue are excluded, because otherwise the first pending entry would report
+/// itself -- and every entry behind it -- as a reason not to start. Only work
+/// that has been handed to a driver, or an optimization, counts.
+pub async fn dispatch_blocker(
+    store: &Store,
+    dag_id: String,
+) -> Result<Option<String>, StoreError> {
+    store
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT run_group_id FROM run_groups
+                 WHERE dag_id = ?1 AND status IN ('queued', 'running')
+                   AND (queue_state IS NULL OR queue_state = 'dispatched')
+                 UNION ALL
+                 SELECT optimization_id FROM optimizations
+                 WHERE dag_id = ?1 AND status IN ('queued', 'running')
+                 LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(duckdb::params![dag_id], |r| r.get::<_, String>(0))?;
+            rows.next().transpose().map_err(StoreError::from)
+        })
+        .await
+}
+
+/// The front of the queue, oldest first.
+///
+/// Entries for different DAGs are interleaved here; the dispatcher decides
+/// which of them can actually start. Ordering by id after `created_at` is what
+/// makes N entries submitted in one burst dequeue in submission order.
+pub async fn next_pending(store: &Store, limit: usize) -> Result<Vec<RunGroupRow>, StoreError> {
+    store
+        .read(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "{GROUP_SELECT}
+                 WHERE g.queue_state = 'pending' AND g.status = 'queued'
+                 ORDER BY g.created_at, g.run_group_id
+                 LIMIT ?"
+            ))?;
+            Ok(stmt
+                .query_map(duckdb::params![limit as i64], group_from)?
+                .collect::<duckdb::Result<Vec<_>>>()?)
+        })
+        .await
+}
+
+/// Take an entry out of the queue. Returns false if something already did.
+///
+/// This is the queue's compare-and-set: the transition out of `pending`
+/// happens in the same statement that checks for it, so a dispatch racing a
+/// `DELETE /v1/queue/{id}` cannot both win.
+pub async fn mark_dispatched(store: &Store, group_id: String) -> Result<bool, StoreError> {
+    store
+        .write(move |conn| {
+            let n = conn.execute(
+                "UPDATE run_groups SET queue_state = ?
+                 WHERE run_group_id = ? AND queue_state = 'pending' AND status = 'queued'",
+                duckdb::params![queue_state::DISPATCHED, group_id],
+            )?;
+            Ok(n == 1)
+        })
+        .await
+}
+
+/// Put a dispatched entry back at its original place in the queue.
+///
+/// Only used when the in-memory claim is lost between the compare-and-set and
+/// the spawn. Position is preserved because ordering is by `created_at`, which
+/// this does not touch.
+pub async fn requeue(store: &Store, group_id: String) -> Result<(), StoreError> {
+    store
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE run_groups SET queue_state = ?
+                 WHERE run_group_id = ? AND queue_state = 'dispatched' AND status = 'queued'",
+                duckdb::params![queue_state::PENDING, group_id],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+/// Repoint a queued group at a different version of its DAG.
+///
+/// The group's runs carry `dag_version` too -- the benchmark reads it from
+/// there -- so both move together or the two disagree about what ran.
+pub async fn set_group_version(
+    store: &Store,
+    group_id: String,
+    version: i32,
+) -> Result<(), StoreError> {
+    store
+        .write(move |conn| {
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            let result = (|| -> Result<(), StoreError> {
+                conn.execute(
+                    "UPDATE run_groups SET dag_version = ? WHERE run_group_id = ?",
+                    duckdb::params![version, group_id],
+                )?;
+                conn.execute(
+                    "UPDATE runs SET dag_version = ? WHERE run_group_id = ?",
+                    duckdb::params![version, group_id],
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
+        })
+        .await
+}
+
+/// The queue, front first. Includes entries the dispatcher has already started.
+pub async fn list_queue(
+    store: &Store,
+    dag_name: Option<String>,
+    active_only: bool,
+    limit: usize,
+) -> Result<Vec<RunGroupRow>, StoreError> {
+    store
+        .read(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "{GROUP_SELECT}
+                 WHERE g.queue_state IS NOT NULL
+                   AND (?1 IS NULL OR d.name = ?1)
+                   AND (NOT ?2 OR g.status IN ('queued', 'running'))
+                 ORDER BY g.created_at, g.run_group_id
+                 LIMIT ?3"
+            ))?;
+            Ok(stmt
+                .query_map(
+                    duckdb::params![dag_name, active_only, limit as i64],
+                    group_from,
+                )?
+                .collect::<duckdb::Result<Vec<_>>>()?)
+        })
+        .await
+}
+
+/// Drop one entry that has not started. Returns false if it already has.
+pub async fn drop_pending(store: &Store, group_id: String) -> Result<bool, StoreError> {
+    Ok(cancel_pending(store, CancelPending::One(group_id)).await? > 0)
+}
+
+/// Drop every entry that has not started, optionally for one DAG.
+pub async fn clear_pending(
+    store: &Store,
+    dag_id: Option<String>,
+) -> Result<usize, StoreError> {
+    cancel_pending(store, CancelPending::All(dag_id)).await
+}
+
+enum CancelPending {
+    One(String),
+    All(Option<String>),
+}
+
+/// Cancelled, not deleted: a benchmark that queued fifty runs and abandoned
+/// thirty should still be able to say so afterwards.
+async fn cancel_pending(store: &Store, what: CancelPending) -> Result<usize, StoreError> {
+    let now = Utc::now();
+    let (group_id, dag_id) = match what {
+        CancelPending::One(id) => (Some(id), None),
+        CancelPending::All(dag_id) => (None, dag_id),
+    };
+    store
+        .write(move |conn| {
+            const REASON: &str = "removed from the run queue before it started";
+            // The predicate is written once and applied to both tables through
+            // the group id, so a partially cancelled entry is not possible.
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+            let result = (|| -> Result<usize, StoreError> {
+                conn.execute(
+                    "UPDATE runs SET status = ?1, finished_at = ?2, error = ?3
+                     WHERE status IN ('queued', 'running')
+                       AND run_group_id IN (
+                           SELECT run_group_id FROM run_groups
+                           WHERE queue_state = 'pending' AND status = 'queued'
+                             AND (?4 IS NULL OR run_group_id = ?4)
+                             AND (?5 IS NULL OR dag_id = ?5))",
+                    duckdb::params![status::CANCELLED, now, REASON, group_id, dag_id],
+                )?;
+                let n = conn.execute(
+                    "UPDATE run_groups SET status = ?1, finished_at = ?2, error = ?3
+                     WHERE queue_state = 'pending' AND status = 'queued'
+                       AND (?4 IS NULL OR run_group_id = ?4)
+                       AND (?5 IS NULL OR dag_id = ?5)",
+                    duckdb::params![status::CANCELLED, now, REASON, group_id, dag_id],
+                )?;
+                Ok(n)
+            })();
+            match result {
+                Ok(n) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
         })
         .await
 }
@@ -352,37 +595,40 @@ pub async fn list_runs(store: &Store, filter: RunFilter) -> Result<Vec<RunRow>, 
         .await
 }
 
+const GROUP_SELECT: &str = "SELECT g.run_group_id, g.dag_id, d.name, g.dag_version, g.target,
+        g.trigger, g.scheduled_for, g.warmups, g.repetitions, g.cleanup_before,
+        g.collect_plans, g.sample_interval_ms, g.status, g.created_at, g.finished_at, g.error,
+        g.queue_state, g.pin_version
+    FROM run_groups g JOIN dags d USING (dag_id)";
+
+fn group_from(row: &duckdb::Row<'_>) -> duckdb::Result<RunGroupRow> {
+    Ok(RunGroupRow {
+        run_group_id: row.get(0)?,
+        dag_id: row.get(1)?,
+        dag_name: row.get(2)?,
+        dag_version: row.get(3)?,
+        target: row.get(4)?,
+        trigger: row.get(5)?,
+        scheduled_for: row.get(6)?,
+        warmups: row.get(7)?,
+        repetitions: row.get(8)?,
+        cleanup_before: row.get(9)?,
+        collect_plans: row.get(10)?,
+        sample_interval_ms: row.get(11)?,
+        status: row.get(12)?,
+        created_at: row.get(13)?,
+        finished_at: row.get(14)?,
+        error: row.get(15)?,
+        queue_state: row.get(16)?,
+        pin_version: row.get(17)?,
+    })
+}
+
 pub async fn get_group(store: &Store, group_id: String) -> Result<Option<RunGroupRow>, StoreError> {
     store
         .read(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT g.run_group_id, g.dag_id, d.name, g.dag_version, g.target, g.trigger,
-                        g.scheduled_for, g.warmups, g.repetitions, g.cleanup_before,
-                        g.collect_plans, g.sample_interval_ms, g.status, g.created_at,
-                        g.finished_at, g.error
-                 FROM run_groups g JOIN dags d USING (dag_id)
-                 WHERE g.run_group_id = ?",
-            )?;
-            let mut rows = stmt.query_map(duckdb::params![group_id], |r| {
-                Ok(RunGroupRow {
-                    run_group_id: r.get(0)?,
-                    dag_id: r.get(1)?,
-                    dag_name: r.get(2)?,
-                    dag_version: r.get(3)?,
-                    target: r.get(4)?,
-                    trigger: r.get(5)?,
-                    scheduled_for: r.get(6)?,
-                    warmups: r.get(7)?,
-                    repetitions: r.get(8)?,
-                    cleanup_before: r.get(9)?,
-                    collect_plans: r.get(10)?,
-                    sample_interval_ms: r.get(11)?,
-                    status: r.get(12)?,
-                    created_at: r.get(13)?,
-                    finished_at: r.get(14)?,
-                    error: r.get(15)?,
-                })
-            })?;
+            let mut stmt = conn.prepare(&format!("{GROUP_SELECT} WHERE g.run_group_id = ?"))?;
+            let mut rows = stmt.query_map(duckdb::params![group_id], group_from)?;
             rows.next().transpose().map_err(StoreError::from)
         })
         .await
@@ -780,7 +1026,222 @@ mod tests {
             cleanup_before: true,
             collect_plans: false,
             sample_interval_ms: None,
+            queued: false,
+            pin_version: true,
         }
+    }
+
+    fn queued_request(dag_id: &str, pin_version: bool) -> RunRequest {
+        RunRequest {
+            queued: true,
+            pin_version,
+            ..request(dag_id, 0, 1)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_queue_dequeues_in_submission_order() {
+        let (store, dag_id) = seeded().await;
+        let mut submitted = Vec::new();
+        for _ in 0..5 {
+            submitted.push(
+                create_group(&store, queued_request(&dag_id, true), "i".into())
+                    .await
+                    .unwrap()
+                    .run_group_id,
+            );
+        }
+
+        // Ids are UUIDv7, so entries created inside one millisecond still come
+        // back in the order they were written.
+        let order: Vec<String> = next_pending(&store, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|g| g.run_group_id)
+            .collect();
+        assert_eq!(order, submitted);
+    }
+
+    #[tokio::test]
+    async fn test_a_waiting_entry_blocks_a_trigger_but_not_the_dispatcher() {
+        let (store, dag_id) = seeded().await;
+        let entry = create_group(&store, queued_request(&dag_id, true), "i".into())
+            .await
+            .unwrap()
+            .run_group_id;
+
+        // A manual trigger must not cut the line...
+        assert_eq!(
+            active_job(&store, dag_id.clone()).await.unwrap().as_deref(),
+            Some(entry.as_str())
+        );
+        // ...but the queue must not treat its own front entry as a blocker,
+        // or nothing would ever start.
+        assert!(dispatch_blocker(&store, dag_id.clone()).await.unwrap().is_none());
+
+        assert!(mark_dispatched(&store, entry.clone()).await.unwrap());
+        assert_eq!(
+            dispatch_blocker(&store, dag_id).await.unwrap().as_deref(),
+            Some(entry.as_str()),
+            "once started it blocks like any other job"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_taking_an_entry_out_of_the_queue_happens_exactly_once() {
+        let (store, dag_id) = seeded().await;
+        let entry = create_group(&store, queued_request(&dag_id, true), "i".into())
+            .await
+            .unwrap()
+            .run_group_id;
+
+        assert!(mark_dispatched(&store, entry.clone()).await.unwrap());
+        assert!(
+            !mark_dispatched(&store, entry.clone()).await.unwrap(),
+            "a second dispatch of the same entry must lose"
+        );
+
+        // A lost claim puts it back where it was, still ahead of nothing.
+        requeue(&store, entry.clone()).await.unwrap();
+        assert!(mark_dispatched(&store, entry).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_dropping_a_waiting_entry_cancels_it_and_its_runs() {
+        let (store, dag_id) = seeded().await;
+        let entry = create_group(
+            &store,
+            RunRequest {
+                queued: true,
+                ..request(&dag_id, 1, 3)
+            },
+            "i".into(),
+        )
+        .await
+        .unwrap()
+        .run_group_id;
+
+        assert!(drop_pending(&store, entry.clone()).await.unwrap());
+        let group = get_group(&store, entry.clone()).await.unwrap().unwrap();
+        assert_eq!(group.status, status::CANCELLED);
+        // Cancelled, not deleted: a benchmark that abandoned thirty of fifty
+        // queued runs should still be able to say so afterwards.
+        let series = runs_in_group(&store, entry.clone()).await.unwrap();
+        assert_eq!(series.len(), 4);
+        assert!(series.iter().all(|r| r.status == status::CANCELLED));
+
+        assert!(
+            !drop_pending(&store, entry).await.unwrap(),
+            "dropping it twice is not a second cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_started_entry_cannot_be_dropped_from_the_queue() {
+        let (store, dag_id) = seeded().await;
+        let entry = create_group(&store, queued_request(&dag_id, true), "i".into())
+            .await
+            .unwrap()
+            .run_group_id;
+        mark_dispatched(&store, entry.clone()).await.unwrap();
+
+        // It has a warehouse to unwind now, so it is cancelled as a run, not
+        // dropped as a queue entry.
+        assert!(!drop_pending(&store, entry.clone()).await.unwrap());
+        let group = get_group(&store, entry).await.unwrap().unwrap();
+        assert_eq!(group.status, status::QUEUED);
+    }
+
+    #[tokio::test]
+    async fn test_clearing_one_dags_queue_leaves_the_others_alone() {
+        let (store, dag_id) = seeded().await;
+        let other = "d2";
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO dags (dag_id, name, current_version, created_at, updated_at)
+                     VALUES ('d2', 'churn', 1, now(), now())",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            create_group(&store, queued_request(&dag_id, true), "i".into())
+                .await
+                .unwrap();
+        }
+        create_group(&store, queued_request(other, true), "i".into())
+            .await
+            .unwrap();
+
+        assert_eq!(clear_pending(&store, Some(dag_id)).await.unwrap(), 3);
+        let left = next_pending(&store, 10).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].dag_id, other);
+
+        assert_eq!(clear_pending(&store, None).await.unwrap(), 1);
+        assert!(next_pending(&store, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_listing_the_queue_hides_finished_entries_unless_asked() {
+        let (store, dag_id) = seeded().await;
+        let done = create_group(&store, queued_request(&dag_id, true), "i".into())
+            .await
+            .unwrap()
+            .run_group_id;
+        let waiting = create_group(&store, queued_request(&dag_id, true), "i".into())
+            .await
+            .unwrap()
+            .run_group_id;
+        finalize_group(&store, done.clone(), None).await.unwrap();
+
+        // An ordinary trigger is not a queue entry and never appears here.
+        create_group(&store, request(&dag_id, 0, 1), "i".into())
+            .await
+            .unwrap();
+
+        let active = list_queue(&store, None, true, 10).await.unwrap();
+        assert_eq!(
+            active.iter().map(|g| g.run_group_id.clone()).collect::<Vec<_>>(),
+            vec![waiting.clone()]
+        );
+
+        let all = list_queue(&store, None, false, 10).await.unwrap();
+        assert_eq!(
+            all.iter().map(|g| g.run_group_id.clone()).collect::<Vec<_>>(),
+            vec![done, waiting]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repointing_an_entry_moves_the_group_and_its_runs_together() {
+        let (store, dag_id) = seeded().await;
+        let entry = create_group(
+            &store,
+            RunRequest {
+                queued: true,
+                pin_version: false,
+                ..request(&dag_id, 1, 2)
+            },
+            "i".into(),
+        )
+        .await
+        .unwrap()
+        .run_group_id;
+
+        set_group_version(&store, entry.clone(), 7).await.unwrap();
+
+        let group = get_group(&store, entry.clone()).await.unwrap().unwrap();
+        assert_eq!(group.dag_version, 7);
+        assert!(!group.pin_version);
+        // The two must not be able to disagree about what ran.
+        let series = runs_in_group(&store, entry).await.unwrap();
+        assert!(series.iter().all(|r| r.dag_version == 7));
     }
 
     fn exec_stats(node_ms: i64, rows: Option<u64>) -> ExecStats {

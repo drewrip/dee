@@ -119,6 +119,7 @@ CELLS = Table(
         Column("backend_config", pa.string(), "JSON of the backend tuning in effect (threads, memory, connection count)."),
         Column("repetitions", pa.int32(), "Measured repetitions requested per DAG variant."),
         Column("warmups", pa.int32(), "Untimed warmup repetitions run before the measured ones."),
+        Column("repeat_mode", pa.string(), "How the repetitions were executed: 'group' (one server-side run group sharing one warm engine) or 'queue' (one queued run group each, run strictly in sequence with a fresh engine per repetition). Timings are only comparable across cells that agree on this."),
         Column("dee_git_sha", pa.string(), "git SHA of the dee checkout under test."),
         Column("dag_bench_git_sha", pa.string(), "git SHA of the dag-bench checkout supplying the workload."),
         Column("harness_version", pa.string(), "dee-bench version that produced this row."),
@@ -146,6 +147,7 @@ RUNS = Table(
     columns=[
         Column("cell_id", pa.string(), "Cell this run belongs to."),
         Column("run_id", pa.string(), "Unique id for this single execution."),
+        Column("run_group_id", pa.string(), "dee run group this execution belonged to. One group holds every repetition under repeat_mode 'group', and exactly one under 'queue' -- which is how the two modes are told apart in the data."),
         Column("dag_variant", pa.string(), "'unopt' for the baseline DAG, 'optimized' for the post-optimizer DAG."),
         Column("phase", pa.string(), "'warmup' or 'measure'. Exclude warmups from every aggregate."),
         Column("rep_index", pa.int32(), "0-based repetition index within its phase."),

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 from dee_bench.config import Variant
-from dee_bench.matrix import Cell, compute_cell_id, prune_dee_opt, schedule
+from dee_bench.matrix import Cell, compute_cell_id, expand, prune_dee_opt, schedule
 
 
 def cell(variant="hmp", passes=("hmp",), dee_opt=None, **kw):
@@ -83,3 +84,37 @@ class TestSchedule:
         opt = cell(variant="hmp", passes=("hmp",))
         base = cell(variant="unopt", passes=())
         assert schedule([opt, base])[0].variant.name == "unopt"
+
+
+
+def _config(**matrix):
+    """The slice of a BenchConfig that `expand` actually reads."""
+    return SimpleNamespace(
+        name="r",
+        matrix={"project": ["p01_iot"], "backend": ["duckdb"], "sf": [0.1],
+                "variant": ["unopt"], **matrix},
+        dee_opt={},
+        variants={"unopt": Variant(name="unopt", passes=())},
+        backends={"duckdb": {}},
+        execution=SimpleNamespace(repetitions=3, warmups=1, repeat_mode="group"),
+    )
+
+
+class TestRepeatMode:
+    def test_the_execution_setting_applies_to_every_cell(self):
+        cfg = _config()
+        cfg.execution.repeat_mode = "queue"
+        assert [c.repeat_mode for c in expand(cfg)] == ["queue"]
+
+    def test_the_matrix_can_sweep_it(self):
+        # Comparing the two measurement modes is the reason it is sweepable:
+        # one run directory, one baseline, two ways of measuring it.
+        cells = expand(_config(repeat_mode=["group", "queue"]))
+        assert sorted(c.repeat_mode for c in cells) == ["group", "queue"]
+        # Distinct cells, not one counted twice: they measure differently.
+        assert len({c.cell_id for c in cells}) == 2
+
+    def test_it_is_not_carried_into_extra(self):
+        # `extra` holds matrix keys the runner does not understand. This one it
+        # does, and duplicating it there would put it in the identity twice.
+        assert expand(_config(repeat_mode=["queue"]))[0].extra == {}

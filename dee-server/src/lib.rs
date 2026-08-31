@@ -17,6 +17,7 @@ use std::sync::Arc;
 use crate::config::ServerConfig;
 use crate::error::ServerError;
 use crate::state::{AppState, VERSION};
+use crate::exec::queue::Dispatcher;
 use crate::sched::clock::SystemClock;
 use crate::sched::scheduler::Scheduler;
 use crate::store::Store;
@@ -85,7 +86,14 @@ where
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let scheduler_task = tokio::spawn(
-        Arc::clone(&scheduler).run_loop(config_tick_interval, shutdown_rx),
+        Arc::clone(&scheduler).run_loop(config_tick_interval, shutdown_rx.clone()),
+    );
+
+    // The run queue. Started after the orphan sweep for the same reason the
+    // scheduler is: a stale `running` row would make it hold every entry back.
+    let dispatcher = Arc::new(Dispatcher::new(state.clone()));
+    let dispatcher_task = tokio::spawn(
+        Arc::clone(&dispatcher).run_loop(config_tick_interval, shutdown_rx),
     );
 
     // Printed on stdout, not through the logger: a supervising process (the
@@ -115,9 +123,12 @@ where
         .await
         .map_err(|e| ServerError::Internal(e.to_string()));
 
-    // Stop scheduling first, so nothing new starts while we are draining.
+    // Stop scheduling and dispatching first, so nothing new starts while we
+    // are draining. Entries still queued stay queued; the next boot's orphan
+    // sweep is what makes them terminal, the same as any other unfinished work.
     let _ = shutdown_tx.send(true);
     let _ = scheduler_task.await;
+    let _ = dispatcher_task.await;
     janitor.abort();
 
     // Ask in-flight runs to stop and give them a moment. Cancellation is only

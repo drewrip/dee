@@ -239,7 +239,7 @@ pub async fn cancel(client: &Client, id: String) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-fn print_runs(runs: &[Value]) {
+pub fn print_runs(runs: &[Value]) {
     println!(
         "{:<38} {:<12} {:<8} {:>4} {:>10}  {}",
         "RUN ID", "STATUS", "PHASE", "REP", "DURATION", "DAG"

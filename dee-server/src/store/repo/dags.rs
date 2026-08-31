@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use dee::dag::Dag;
 use dee::file::DagFile;
+use dee::opt::OptimizerConfig;
 use serde::Serialize;
 
 use crate::hash::dag_hash;
@@ -38,6 +39,9 @@ pub struct DagRow {
     pub default_target: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Which passes this DAG is meant to be optimized with, and their
+    /// parameters. `None` means `dee optimize` falls back to dee's defaults.
+    pub optimizer_config: Option<OptimizerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,7 +83,7 @@ pub struct Submitted {
 }
 
 const DAG_SELECT: &str = "SELECT dag_id, name, description, current_version, default_target,
-                                 created_at, updated_at FROM dags";
+                                 created_at, updated_at, optimizer_config FROM dags";
 
 fn dag_from(row: &duckdb::Row<'_>) -> duckdb::Result<DagRow> {
     Ok(DagRow {
@@ -90,7 +94,48 @@ fn dag_from(row: &duckdb::Row<'_>) -> duckdb::Result<DagRow> {
         default_target: row.get(4)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
+        // Surfaced as an error rather than dropped: a config that no longer
+        // parses means `dee optimize` would silently run under different
+        // settings than the ones the DAG was submitted with, which is exactly
+        // the failure this column exists to prevent. Only reachable if the
+        // column was written by a different build of dee.
+        optimizer_config: row
+            .get::<_, Option<String>>(7)?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|e| {
+                duckdb::Error::FromSqlConversionFailure(7, duckdb::types::Type::Text, Box::new(e))
+            })?,
     })
+}
+
+/// Replace a DAG's optimizer configuration, or clear it with `None`.
+///
+/// Separate from `submit` so the settings can be changed without resubmitting
+/// a definition -- the same reason connections and schedules are editable at
+/// runtime.
+pub async fn set_optimizer_config(
+    store: &Store,
+    dag_id: String,
+    config: Option<&OptimizerConfig>,
+) -> Result<(), StoreError> {
+    let json = config
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|source| StoreError::Decode {
+            what: "optimizer config",
+            source,
+        })?;
+    let now = Utc::now();
+    store
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE dags SET optimizer_config = ?, updated_at = ? WHERE dag_id = ?",
+                duckdb::params![json, now, dag_id],
+            )?;
+            Ok(())
+        })
+        .await
 }
 
 pub async fn get(store: &Store, name: String) -> Result<Option<DagRow>, StoreError> {
@@ -98,6 +143,18 @@ pub async fn get(store: &Store, name: String) -> Result<Option<DagRow>, StoreErr
         .read(move |conn| {
             let mut stmt = conn.prepare(&format!("{DAG_SELECT} WHERE name = ?"))?;
             let mut rows = stmt.query_map(duckdb::params![name], dag_from)?;
+            rows.next().transpose().map_err(StoreError::from)
+        })
+        .await
+}
+
+/// The queue dispatcher holds a `dag_id`, not a name, and needs the DAG's
+/// current version to re-resolve an entry that did not pin one.
+pub async fn get_by_id(store: &Store, dag_id: String) -> Result<Option<DagRow>, StoreError> {
+    store
+        .read(move |conn| {
+            let mut stmt = conn.prepare(&format!("{DAG_SELECT} WHERE dag_id = ?"))?;
+            let mut rows = stmt.query_map(duckdb::params![dag_id], dag_from)?;
             rows.next().transpose().map_err(StoreError::from)
         })
         .await
@@ -118,16 +175,60 @@ pub async fn list(store: &Store) -> Result<Vec<DagRow>, StoreError> {
 /// has, that version is returned and nothing is written. The benchmark harness
 /// and any CI resubmit constantly, and without this each would grow the
 /// history by one identical version per invocation.
-pub async fn submit(
-    store: &Store,
-    name: String,
-    definition: DagFile,
-    target: Option<String>,
-    description: Option<String>,
-    origin: Origin,
-    derived_from_version: Option<i32>,
-    optimization_id: Option<String>,
-) -> Result<Submitted, StoreError> {
+/// One submission. Every `Option` here means "leave whatever is already
+/// recorded alone", which is what lets CI resubmit a definition without
+/// clearing the target or the optimizer settings an operator set by hand.
+#[derive(Clone)]
+pub struct SubmitRequest {
+    pub name: String,
+    pub definition: DagFile,
+    pub target: Option<String>,
+    pub description: Option<String>,
+    pub origin: Origin,
+    /// Set together with `optimization_id` on a version the optimizer produced.
+    pub derived_from_version: Option<i32>,
+    pub optimization_id: Option<String>,
+    /// Replaces the DAG's stored optimizer configuration when present.
+    pub optimizer_config: Option<OptimizerConfig>,
+}
+
+impl SubmitRequest {
+    /// A plain submission: a name and a definition, nothing else changed.
+    pub fn new(name: String, definition: DagFile, origin: Origin) -> Self {
+        SubmitRequest {
+            name,
+            definition,
+            target: None,
+            description: None,
+            origin,
+            derived_from_version: None,
+            optimization_id: None,
+            optimizer_config: None,
+        }
+    }
+}
+
+pub async fn submit(store: &Store, request: SubmitRequest) -> Result<Submitted, StoreError> {
+    let SubmitRequest {
+        name,
+        definition,
+        target,
+        description,
+        origin,
+        derived_from_version,
+        optimization_id,
+        optimizer_config,
+    } = request;
+
+    let optimizer_config = optimizer_config
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|source| StoreError::Decode {
+            what: "optimizer config",
+            source,
+        })?;
+
     let content_hash = dag_hash(&definition).map_err(|source| StoreError::Decode {
         what: "dag definition",
         source,
@@ -190,11 +291,29 @@ pub async fn submit(
                             rows.next().transpose()?
                         };
                         if let Some(version) = matched {
-                            if let Some(target) = &target {
+                            // The definition is unchanged, but the settings
+                            // submitted alongside it may not be -- a benchmark
+                            // sweeping OMP parameters resubmits one definition
+                            // per cell and changes only the config.
+                            if target.is_some()
+                                || description.is_some()
+                                || optimizer_config.is_some()
+                            {
                                 conn.execute(
-                                    "UPDATE dags SET default_target = ?, updated_at = ?
+                                    "UPDATE dags
+                                     SET default_target = coalesce(?, default_target),
+                                         description = coalesce(?, description),
+                                         optimizer_config =
+                                             coalesce(?, optimizer_config),
+                                         updated_at = ?
                                      WHERE dag_id = ?",
-                                    duckdb::params![target, now, dag_id],
+                                    duckdb::params![
+                                        target,
+                                        description,
+                                        optimizer_config,
+                                        now,
+                                        dag_id
+                                    ],
                                 )?;
                             }
                             conn.execute_batch("COMMIT;")?;
@@ -213,10 +332,18 @@ pub async fn submit(
                 if existing.is_none() {
                     conn.execute(
                         "INSERT INTO dags (dag_id, name, description, current_version,
-                                           default_target, created_at, updated_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                           default_target, created_at, updated_at,
+                                           optimizer_config)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         duckdb::params![
-                            dag_id, name, description, next_version, target, now, now
+                            dag_id,
+                            name,
+                            description,
+                            next_version,
+                            target,
+                            now,
+                            now,
+                            optimizer_config
                         ],
                     )?;
                 } else {
@@ -225,9 +352,17 @@ pub async fn submit(
                          SET current_version = ?,
                              default_target = coalesce(?, default_target),
                              description = coalesce(?, description),
+                             optimizer_config = coalesce(?, optimizer_config),
                              updated_at = ?
                          WHERE dag_id = ?",
-                        duckdb::params![next_version, target, description, now, dag_id],
+                        duckdb::params![
+                            next_version,
+                            target,
+                            description,
+                            optimizer_config,
+                            now,
+                            dag_id
+                        ],
                     )?;
                 }
 
@@ -513,13 +648,9 @@ mod tests {
         let store = Store::open_temporary().unwrap();
         let submitted = submit(
             &store,
-            "d".into(),
-            dag,
-            None,
-            None,
-            Origin::Submitted,
-            None,
-            None,
+            SubmitRequest {
+                ..SubmitRequest::new("d".into(), dag, Origin::Submitted)
+            },
         )
         .await
         .unwrap();
@@ -540,7 +671,8 @@ mod tests {
         // a version.
         let (store, first) = store_with(diamond()).await;
         let again = submit(
-            &store, "d".into(), diamond(), None, None, Origin::Submitted, None, None,
+            &store,
+            SubmitRequest::new("d".into(), diamond(), Origin::Submitted),
         )
         .await
         .unwrap();
@@ -557,7 +689,8 @@ mod tests {
         changed.nodes[0].query_text = "select 99".into();
 
         let second = submit(
-            &store, "d".into(), changed, None, None, Origin::Submitted, None, None,
+            &store,
+            SubmitRequest::new("d".into(), changed, Origin::Submitted),
         )
         .await
         .unwrap();
@@ -566,6 +699,129 @@ mod tests {
         assert_eq!(second.version, 2);
         assert_ne!(second.content_hash, first.content_hash);
         assert_eq!(get(&store, "d".into()).await.unwrap().unwrap().current_version, 2);
+    }
+
+    #[tokio::test]
+    async fn test_optimizer_settings_round_trip_with_the_dag() {
+        let store = Store::open_temporary().unwrap();
+        let config = OptimizerConfig {
+            run_omp_pass: true,
+            run_hmp_pass: false,
+            omp_top: Some(5),
+            omp_early_termination: false,
+            ..OptimizerConfig::default()
+        };
+        submit(
+            &store,
+            SubmitRequest {
+                optimizer_config: Some(config.clone()),
+                ..SubmitRequest::new("d".into(), diamond(), Origin::Submitted)
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = get(&store, "d".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .optimizer_config
+            .expect("the config submitted with the dag");
+        assert!(stored.run_omp_pass);
+        assert!(!stored.run_hmp_pass);
+        assert_eq!(stored.omp_top, Some(5));
+        // Stored resolved: a field nobody named still has an explicit value.
+        assert!(!stored.omp_early_termination);
+        assert_eq!(stored.hmp_max_runs, OptimizerConfig::default().hmp_max_runs);
+    }
+
+    #[tokio::test]
+    async fn test_resubmitting_without_settings_leaves_them_alone() {
+        // CI resubmits definitions; it must not silently wipe the settings an
+        // operator -- or a benchmark cell -- put on the DAG.
+        let store = Store::open_temporary().unwrap();
+        submit(
+            &store,
+            SubmitRequest {
+                optimizer_config: Some(OptimizerConfig {
+                    omp_top: Some(3),
+                    ..OptimizerConfig::default()
+                }),
+                target: Some("wh".into()),
+                ..SubmitRequest::new("d".into(), diamond(), Origin::Submitted)
+            },
+        )
+        .await
+        .unwrap();
+
+        // Once for unchanged content, once for a new version: both paths
+        // update the dags row and both must leave the config in place.
+        let mut changed = diamond();
+        changed.nodes[0].query_text = "select 99".into();
+        for definition in [diamond(), changed] {
+            submit(
+                &store,
+                SubmitRequest::new("d".into(), definition, Origin::Submitted),
+            )
+            .await
+            .unwrap();
+            let row = get(&store, "d".into()).await.unwrap().unwrap();
+            assert_eq!(row.optimizer_config.unwrap().omp_top, Some(3));
+            assert_eq!(row.default_target.as_deref(), Some("wh"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resubmitting_one_definition_under_new_settings_updates_them() {
+        // A sweep over OMP parameters submits the same definition per cell and
+        // changes only the config, so the no-op content path has to carry it.
+        let (store, _) = store_with(diamond()).await;
+        for top in [1usize, 2, 3] {
+            let again = submit(
+                &store,
+                SubmitRequest {
+                    optimizer_config: Some(OptimizerConfig {
+                        omp_top: Some(top),
+                        ..OptimizerConfig::default()
+                    }),
+                    ..SubmitRequest::new("d".into(), diamond(), Origin::Submitted)
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!again.created, "the definition never changed");
+            let row = get(&store, "d".into()).await.unwrap().unwrap();
+            assert_eq!(row.optimizer_config.unwrap().omp_top, Some(top));
+        }
+        assert_eq!(versions(&store, get(&store, "d".into()).await.unwrap().unwrap().dag_id)
+            .await
+            .unwrap()
+            .len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_settings_can_be_replaced_and_cleared_without_resubmitting() {
+        let (store, submitted) = store_with(diamond()).await;
+        assert!(
+            get(&store, "d".into()).await.unwrap().unwrap().optimizer_config.is_none(),
+            "a dag submitted without settings has none"
+        );
+
+        set_optimizer_config(
+            &store,
+            submitted.dag_id.clone(),
+            Some(&OptimizerConfig {
+                hmp_max_runs: 4,
+                ..OptimizerConfig::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let row = get(&store, "d".into()).await.unwrap().unwrap();
+        assert_eq!(row.optimizer_config.unwrap().hmp_max_runs, 4);
+
+        set_optimizer_config(&store, submitted.dag_id, None).await.unwrap();
+        assert!(get(&store, "d".into()).await.unwrap().unwrap().optimizer_config.is_none());
     }
 
     #[tokio::test]
@@ -578,13 +834,11 @@ mod tests {
 
         let second = submit(
             &store,
-            "d".into(),
-            optimized,
-            None,
-            None,
-            Origin::Optimized,
-            Some(first.version),
-            Some("opt-1".into()),
+            SubmitRequest {
+                derived_from_version: Some(first.version),
+                optimization_id: Some("opt-1".into()),
+                ..SubmitRequest::new("d".into(), optimized, Origin::Optimized)
+            },
         )
         .await
         .unwrap();

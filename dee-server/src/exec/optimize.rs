@@ -56,6 +56,9 @@ pub async fn drive(state: AppState, job: OptimizeJob) {
 
     let _ = dag_id;
     state.runs.finish(&optimization_id).await;
+    // An optimization holds the same per-DAG claim as a run, so finishing one
+    // can unblock a queue -- and the entries behind it pick up the rewrite.
+    state.wake_queue();
 }
 
 async fn drive_inner(state: AppState, job: OptimizeJob) -> Result<(), ServerError> {
@@ -92,13 +95,15 @@ async fn drive_inner(state: AppState, job: OptimizeJob) -> Result<(), ServerErro
     let result_version = if job.save_as_version {
         let submitted = dags::submit(
             &state.store,
-            job.dag_name.clone(),
-            optimized,
-            None,
-            None,
-            dags::Origin::Optimized,
-            Some(job.source_version),
-            Some(job.optimization_id.clone()),
+            dags::SubmitRequest {
+                derived_from_version: Some(job.source_version),
+                optimization_id: Some(job.optimization_id.clone()),
+                ..dags::SubmitRequest::new(
+                    job.dag_name.clone(),
+                    optimized,
+                    dags::Origin::Optimized,
+                )
+            },
         )
         .await?;
         Some(submitted.version)

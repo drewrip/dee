@@ -85,11 +85,20 @@ execution:
   repetitions: 5
   warmups: 1
   sample_interval_ms: 100
+  repeat_mode: group           # or `queue` — see "How measurements are taken"
 ```
 
 Every `dee_opt` key mirrors a field of `OptimizerConfig` in
 `dee/src/opt.rs`; `src/dee_bench/config.py` holds the mapping, including which
 passes read each option.
+
+A cell's variant and `dee_opt` are submitted **with its DAG**, as the DAG's
+optimizer settings, so `dee dag optimizer c<cell_id>` answers what any DAG in
+the sweep's registry is for. The optimize request itself then carries no
+settings at all — an optimization with none of its own runs under the DAG's.
+dee echoes back the configuration it resolved to, and a cell fails loudly if
+that disagrees with what it asked for, so the indirection is checked rather
+than assumed.
 
 ### Why the matrix does not explode
 
@@ -150,11 +159,48 @@ dee-bench viz results/my-eval --only payback --format png,pdf
 
 ## How measurements are taken
 
-**Timing.** A trigger carries the cell's `warmups` and `repetitions`, and the
-whole series executes inside one dee server against one already-warm connection
-pool. So `runs.engine_wall_ms` measures the DAG rather than process startup,
-pool construction and cleanup. `phase_wall_ms` records the client-observed outer
-bound for comparison.
+**Timing.** A cell's `warmups` and `repetitions` execute inside one dee server
+against one already-warm connection pool, so `runs.engine_wall_ms` measures the
+DAG rather than process startup, pool construction and cleanup. `phase_wall_ms`
+records the client-observed outer bound for comparison.
+
+`execution.repeat_mode` decides how the repetitions get there:
+
+`group` *(default)*
+:   One trigger carrying the whole series. dee runs it back to back inside a
+    single driver against one engine — the tightest measurement of the DAG
+    itself, and what every result to date was produced with.
+
+`queue` *(needs dee's run queue)*
+:   One entry per repetition on the server's run queue, drained strictly in
+    sequence. Each repetition gets a fresh engine and its own run group in
+    dee's history, which is closer to what a repetition looks like in
+    production, where nothing shares an engine with the run before it. Use it
+    to ask whether the shared engine is flattering the numbers.
+
+Both modes produce the same rows: `repetitions` measured runs with `rep_index`
+counting `0..n-1` within a phase, and `warmups` run once at the front.
+`runs.run_group_id` is what tells them apart — one group for the whole cell
+under `group`, one per repetition under `queue` — and `cells.repeat_mode`
+records which was asked for. **Timings are only comparable across cells that
+agree on it**, so it is part of `cell_id`. That also makes it sweepable like
+any other matrix axis, which is how the two modes get compared inside one run
+directory rather than by diffing two:
+
+```yaml
+matrix:
+  variant: [unopt, hmp]
+  repeat_mode: [group, queue]    # four cells, one baseline, two ways to measure
+```
+
+```sql
+select c.variant, c.repeat_mode,
+       count(distinct r.run_group_id) as groups,
+       median(r.engine_wall_ms) as median_ms
+from runs r join cells c using (cell_id)
+where r.phase = 'measure'
+group by 1, 2;
+```
 
 **CPU and memory.** Sampled externally by the harness from `/proc` (the dee
 server's process tree) and cgroup counters (the Postgres container), as counter
@@ -181,20 +227,29 @@ must not be silently averaged together.
 
 The harness starts one `dee serve` per sweep, on an ephemeral port so
 concurrent sweeps cannot collide, and stops it on exit. Each prepared project
-registers its own connection and submits its DAG; because every cell builds its
-own warehouse, connections are re-registered per preparation, which is what
-evicts the pool still holding the previous cell's database file.
+registers its own connection and submits its DAG — with its optimizer settings
+attached — and because every cell builds its own warehouse, connections are
+re-registered per preparation, which is what evicts the pool still holding the
+previous cell's database file.
 
 The server's metadata database is written to `<run_dir>/metadata.duckdb` and is
 an artifact of the sweep in its own right — it holds every run, node timing and
 optimizer decision as queryable tables, alongside the parquet:
 
 ```sql
-SELECT d.name, r.dag_version, count(*) AS runs, round(median(r.duration_ms))
+SELECT d.name, d.optimizer_config, r.dag_version,
+       count(*) AS runs, round(median(r.duration_ms))
 FROM runs r JOIN dags d USING (dag_id)
 WHERE r.status = 'succeeded' AND r.phase = 'measure'
-GROUP BY 1, 2;
+GROUP BY 1, 2, 3;
 ```
+
+A sweep needs a dee new enough to have the run queue and per-DAG optimizer
+settings. Neither is detectable from a version — dee keeps one schema rather
+than a migration chain — so the queue is probed by calling its endpoint
+(`dee-bench doctor` reports it, and a sweep attached to a server it did not
+start checks before its first cell), and the settings are checked per cell by
+comparing the configuration dee says it resolved to against the cell's own.
 
 To point a sweep at a server you manage yourself, set `server.url`; the harness
 will use it and will not stop it.

@@ -2,14 +2,39 @@ pub mod connections;
 pub mod dags;
 pub mod meta;
 pub mod optimize;
+pub mod queue;
 pub mod runs;
 pub mod schedules;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
+use dee::opt::OptimizerConfig;
 use tower_http::trace::TraceLayer;
 
+use crate::error::ServerError;
 use crate::state::AppState;
+
+/// `hmp_show_operators` and `hmp_show_nodes` name files the optimizer writes.
+///
+/// In a daemon those become arbitrary filesystem writes chosen by whoever can
+/// reach the API. The empty string keeps the diagnostic (it logs the table),
+/// so the useful half of the option survives. Shared, because a config can now
+/// arrive with a DAG as well as with an optimization request.
+pub(crate) fn reject_server_side_paths(config: &OptimizerConfig) -> Result<(), ServerError> {
+    for (name, value) in [
+        ("hmp_show_operators", &config.hmp_show_operators),
+        ("hmp_show_nodes", &config.hmp_show_nodes),
+    ] {
+        if let Some(path) = value {
+            if !path.is_empty() {
+                return Err(ServerError::BadRequest(format!(
+                    "{name} cannot name a file on the server; pass \"\" to log the table instead"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -30,7 +55,16 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/dags/{name}/versions", get(dags::versions))
         .route("/v1/dags/{name}/versions/{version}", get(dags::version))
         .route("/v1/dags/{name}/graph", get(dags::graph))
+        .route(
+            "/v1/dags/{name}/optimizer",
+            get(dags::get_optimizer)
+                .put(dags::set_optimizer)
+                .delete(dags::clear_optimizer),
+        )
         .route("/v1/dags/{name}/runs", post(runs::trigger))
+        .route("/v1/dags/{name}/queue", post(queue::enqueue))
+        .route("/v1/queue", get(queue::list).delete(queue::clear))
+        .route("/v1/queue/{group_id}", delete(queue::drop_entry))
         .route("/v1/runs", get(runs::list))
         .route("/v1/runs/{run_id}", get(runs::get))
         .route("/v1/runs/{run_id}/nodes", get(runs::nodes))

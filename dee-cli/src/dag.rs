@@ -8,6 +8,7 @@ use dee::file::DagFile;
 use serde_json::{Value, json};
 
 use crate::client::Client;
+use crate::optconfig::{OptimizerArgs, print_config};
 
 #[derive(Args)]
 pub struct DagCommand {
@@ -33,6 +34,8 @@ pub enum DagSubcommand {
     Rm { name: String },
     /// Render a DAG's graph.
     Graph(GraphArgs),
+    /// Show or set the optimizer configuration a DAG is optimized under.
+    Optimizer(OptimizerSettingsArgs),
 }
 
 #[derive(Args)]
@@ -47,6 +50,20 @@ pub struct SubmitArgs {
     pub target: Option<String>,
     #[arg(long)]
     pub description: Option<String>,
+    /// Which optimizer passes this DAG should be optimized with, and their
+    /// parameters. Stored with the DAG, so `dee optimize` needs no flags.
+    #[command(flatten)]
+    pub optimizer: OptimizerArgs,
+}
+
+#[derive(Args)]
+pub struct OptimizerSettingsArgs {
+    pub name: String,
+    /// Remove the DAG's configuration; `dee optimize` falls back to defaults.
+    #[arg(long, conflicts_with_all = ["enable", "disable", "optimizer_config"])]
+    pub clear: bool,
+    #[command(flatten)]
+    pub optimizer: OptimizerArgs,
 }
 
 #[derive(Args)]
@@ -74,6 +91,7 @@ pub struct GraphArgs {
 pub async fn run(client: &Client, cmd: DagCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd.command {
         DagSubcommand::Submit(args) => submit(client, args).await,
+        DagSubcommand::Optimizer(args) => optimizer(client, args).await,
         DagSubcommand::List => {
             let rows: Vec<Value> = client.get("/v1/dags").await?;
             if rows.is_empty() {
@@ -169,11 +187,13 @@ async fn submit(client: &Client, args: SubmitArgs) -> Result<(), Box<dyn std::er
             .to_string(),
     };
 
+    let optimizer_config = args.optimizer.to_json()?;
     let body = json!({
         "name": name,
         "definition": definition,
         "target": args.target,
         "description": args.description,
+        "optimizer_config": optimizer_config,
     });
     let result: Value = client.post("/v1/dags", &body).await?;
 
@@ -185,9 +205,46 @@ async fn submit(client: &Client, args: SubmitArgs) -> Result<(), Box<dyn std::er
         // regenerates an identical definition.
         println!("'{name}' is unchanged; still at version {version}");
     }
+    if optimizer_config.is_some() {
+        // Read it back rather than echoing what was sent: the server resolves
+        // the partial config against dee's defaults, and the resolved whole is
+        // what this DAG will actually be optimized under.
+        let settings: Value = client.get(&format!("/v1/dags/{name}/optimizer")).await?;
+        println!("optimizer configuration:");
+        print_config(&settings["config"]);
+    }
     for warning in result["warnings"].as_array().into_iter().flatten() {
         eprintln!("warning: {}", warning.as_str().unwrap_or(""));
     }
+    Ok(())
+}
+
+async fn optimizer(
+    client: &Client,
+    args: OptimizerSettingsArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("/v1/dags/{}/optimizer", args.name);
+
+    if args.clear {
+        client.delete(&path).await?;
+        println!("cleared '{}' optimizer configuration", args.name);
+        return Ok(());
+    }
+
+    // Setting is a replace, not a merge: what is stored is exactly what these
+    // flags describe, with dee's defaults filling the rest. Anything else and
+    // the stored settings would depend on the order they were written in.
+    let settings: Value = match args.optimizer.to_json()? {
+        Some(config) => client.put(&path, &config).await?,
+        None => client.get(&path).await?,
+    };
+
+    if settings["configured"].as_bool().unwrap_or(false) {
+        println!("{} is optimized with:", args.name);
+    } else {
+        println!("{} has no configuration; dee's defaults apply:", args.name);
+    }
+    print_config(&settings["config"]);
     Ok(())
 }
 

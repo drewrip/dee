@@ -30,7 +30,7 @@ from .infra import make_backend
 from .infra.base import Backend, BackendContext
 from .matrix import Cell, cells_to_rows, expand, summarize
 from .runner import CellRunner
-from .server import DeeServer
+from .server import ApiError, DeeServer, ServerError
 from .store import ResultStore
 from .workload import prepare
 
@@ -150,7 +150,36 @@ class Sweep:
         )
         with server as client:
             self.log(f"    dee server at {client.url} (metadata: {self.run_dir}/metadata.duckdb)")
+            self._require_server_support(pending, client)
             self._execute_cells(pending, client, server.pid)
+
+    @staticmethod
+    def _require_server_support(pending: list[Cell], client) -> None:
+        """Fail now, not on the first cell, if the server has no run queue.
+
+        Probed by calling the endpoint, not by reading a version: dee keeps one
+        schema rather than a migration chain, so nothing it reports about
+        itself distinguishes a build with the queue from one without.
+
+        Per-DAG optimizer settings are not checked here for the same reason --
+        a server that ignores them on submit answers `GET /v1/dags/{name}` the
+        same way. That one is caught per cell instead, by comparing the
+        configuration dee says it resolved to against the cell's own.
+
+        Only reachable when attached to a server the sweep did not build, but
+        that is exactly the case where the binary can be older than the harness
+        -- and a sweep that dies eight cells in has already wasted the
+        expensive part.
+        """
+        if not any(cell.repeat_mode == "queue" for cell in pending):
+            return
+        try:
+            client.queue()
+        except (ApiError, ServerError) as e:
+            raise ServerError(
+                "execution.repeat_mode is 'queue' but this dee server has no run "
+                f"queue ({e}); use a newer dee, or set repeat_mode: group"
+            ) from None
 
     def _execute_cells(self, pending: list[Cell], client, server_pid) -> None:
         prepared_key: tuple[str, str, float] | None = None

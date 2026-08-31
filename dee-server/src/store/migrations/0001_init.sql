@@ -30,14 +30,26 @@ CREATE TABLE IF NOT EXISTS connections (
   updated_at  TIMESTAMPTZ NOT NULL
 );
 
+-- `optimizer_config` is the serialized `dee::opt::OptimizerConfig` this DAG is
+-- meant to be optimized under: which passes to run and their parameters. It
+-- sits here next to `default_target`, for the same reason that does -- it says
+-- how the DAG is meant to be worked with, not what it computes. On
+-- `dag_versions` it would be folded into the content hash, and submitting one
+-- definition under two OMP settings would look like two different DAGs.
+--
+-- Stored resolved, every field written out rather than only the ones the
+-- submitter named, so a benchmark cell records the exact settings it ran under
+-- even if dee's defaults move. Null means no opinion: `dee optimize` falls
+-- back to `OptimizerConfig::default()`.
 CREATE TABLE IF NOT EXISTS dags (
-  dag_id          VARCHAR PRIMARY KEY,
-  name            VARCHAR NOT NULL UNIQUE,
-  description     VARCHAR,
-  current_version INTEGER NOT NULL,
-  default_target  VARCHAR,
-  created_at      TIMESTAMPTZ NOT NULL,
-  updated_at      TIMESTAMPTZ NOT NULL
+  dag_id           VARCHAR PRIMARY KEY,
+  name             VARCHAR NOT NULL UNIQUE,
+  description      VARCHAR,
+  current_version  INTEGER NOT NULL,
+  default_target   VARCHAR,
+  optimizer_config VARCHAR,
+  created_at       TIMESTAMPTZ NOT NULL,
+  updated_at       TIMESTAMPTZ NOT NULL
 );
 
 -- Content-addressed and immutable. `content_hash` is sha256 over a canonical
@@ -134,6 +146,24 @@ CREATE INDEX IF NOT EXISTS ix_skips_dag ON schedule_skips (dag_id, scheduled_for
 -- semantics become a property of the group, executed by one driver task
 -- against one cached pool -- so a benchmark repetition and a scheduled
 -- execution are the same kind of object, and both accumulate history.
+--
+-- A group is also how a queue entry is represented, because an entry *is* an
+-- ordinary run group that was accepted and deliberately not dispatched.
+-- `queue_state` is the only thing separating the two: null means the group was
+-- driven the moment it was created, 'pending' means it is waiting its turn,
+-- 'dispatched' means the queue has handed it to a driver. The value is kept
+-- rather than cleared on dispatch, so `GET /v1/queue` can still show an entry
+-- while it runs and history says which runs arrived through the queue.
+--
+-- FIFO order is (created_at, run_group_id). Ids are UUIDv7, so the tiebreaker
+-- is itself chronological: N entries enqueued inside one millisecond still
+-- dequeue in submission order.
+--
+-- `pin_version` records whether `dag_version` was named by the caller or
+-- merely resolved from the DAG's current version when the entry was created.
+-- An entry that did not pin one re-resolves when its turn comes, so a queue
+-- sitting behind an optimization runs the rewrite -- which is the point of
+-- queueing N runs to watch a DAG adapt.
 CREATE TABLE IF NOT EXISTS run_groups (
   run_group_id       VARCHAR PRIMARY KEY,
   dag_id             VARCHAR NOT NULL,
@@ -146,13 +176,16 @@ CREATE TABLE IF NOT EXISTS run_groups (
   cleanup_before     BOOLEAN NOT NULL DEFAULT true,
   collect_plans      BOOLEAN NOT NULL DEFAULT false,
   sample_interval_ms INTEGER,
+  queue_state        VARCHAR,
+  pin_version        BOOLEAN NOT NULL DEFAULT true,
   status             VARCHAR NOT NULL,
   created_at         TIMESTAMPTZ NOT NULL,
   finished_at        TIMESTAMPTZ,
   instance_id        VARCHAR NOT NULL,
   error              VARCHAR
 );
-CREATE INDEX IF NOT EXISTS ix_groups_dag ON run_groups (dag_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_groups_dag   ON run_groups (dag_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_groups_queue ON run_groups (queue_state, created_at);
 
 -- One row per DAG execution. Columns mirror ExecStats and DagRunProfile's
 -- headline fields, so the benchmark's `runs` parquet table is a projection of

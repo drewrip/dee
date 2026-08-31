@@ -3,6 +3,10 @@
 //! The flags are the ones `dee-cli opt` had, so muscle memory and the
 //! benchmark's option table carry over. What changed is where they go: they
 //! now build an `OptimizerConfig` that is sent as JSON, rather than an argv.
+//!
+//! A flag that is not passed is not sent, and the server fills it in from the
+//! DAG's own configuration -- so the settings a DAG was submitted with are
+//! what it is optimized under, and these flags are overrides for one run.
 
 use std::fs;
 use std::path::PathBuf;
@@ -11,18 +15,7 @@ use clap::Args;
 use serde_json::{Value, json};
 
 use crate::client::Client;
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum CliOMPCentrality {
-    Outdegree,
-    Paths,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum CliHMPStrategy {
-    Breadth,
-    Greedy,
-}
+use crate::optconfig::{OptimizerArgs, print_config};
 
 #[derive(Args)]
 pub struct OptimizeCommand {
@@ -34,44 +27,8 @@ pub struct OptimizeCommand {
     #[arg(short, long)]
     pub target: Option<String>,
 
-    /// Passes to run, starting from everything off.
-    #[arg(long, value_delimiter = ',', conflicts_with = "disable")]
-    pub enable: Option<Vec<String>>,
-    /// Passes to skip, starting from everything on.
-    #[arg(long, value_delimiter = ',', conflicts_with = "enable")]
-    pub disable: Option<Vec<String>>,
-
-    #[arg(long)]
-    pub omp_top: Option<usize>,
-    #[arg(long, default_value = "outdegree")]
-    pub omp_node_centrality: CliOMPCentrality,
-    #[arg(long, action)]
-    pub omp_exhaust: bool,
-    #[arg(long, action)]
-    pub omp_no_pushdown: bool,
-
-    #[arg(long, action)]
-    pub hmp_downstream_cost: bool,
-    #[arg(long, default_value_t = 1)]
-    pub hmp_max_runs: usize,
-    #[arg(long, default_value_t = 0.5)]
-    pub hmp_top_cpu_time: f64,
-    #[arg(long, action)]
-    pub hmp_normalize_with_cardinality: bool,
-    #[arg(long, default_value = "breadth")]
-    pub hmp_strategy: CliHMPStrategy,
-    #[arg(long, default_value_t = 2)]
-    pub hmp_beam_width: usize,
-    #[arg(long, action)]
-    pub hmp_no_pushdown: bool,
-    /// Log HMP's operator ranking table after the baseline run.
-    #[arg(long, action)]
-    pub hmp_show_operators: bool,
-    /// Log HMP's node ranking table after the baseline run.
-    #[arg(long, action)]
-    pub hmp_show_nodes: bool,
-    #[arg(long, action)]
-    pub profile_iterations: bool,
+    #[command(flatten)]
+    pub optimizer: OptimizerArgs,
 
     /// Store the rewritten DAG as a new version.
     #[arg(long, action)]
@@ -97,56 +54,10 @@ pub async fn optimize(
     cmd: OptimizeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let save = cmd.save || cmd.output.is_some();
-    let mut config = json!({
-        "omp_top": cmd.omp_top,
-        "omp_centrality": match cmd.omp_node_centrality {
-            CliOMPCentrality::Outdegree => "outdegree",
-            CliOMPCentrality::Paths => "paths",
-        },
-        // These two flags name the behaviour they turn off, so the config
-        // value is their negation.
-        "omp_early_termination": !cmd.omp_exhaust,
-        "omp_use_pushdown": !cmd.omp_no_pushdown,
-        "hmp_use_pushdown": !cmd.hmp_no_pushdown,
-        "hmp_downstream_cost": cmd.hmp_downstream_cost,
-        "hmp_max_runs": cmd.hmp_max_runs,
-        "hmp_top_cpu_time": cmd.hmp_top_cpu_time,
-        "hmp_normalize_with_cardinality": cmd.hmp_normalize_with_cardinality,
-        "hmp_strategy": match cmd.hmp_strategy {
-            CliHMPStrategy::Breadth => "breadth",
-            CliHMPStrategy::Greedy => "greedy",
-        },
-        "hmp_beam_width": cmd.hmp_beam_width,
-        "profile_iterations": cmd.profile_iterations,
-        // The server refuses a path here, so only the log-the-table form is
-        // reachable remotely.
-        "hmp_show_operators": if cmd.hmp_show_operators { Some("") } else { None },
-        "hmp_show_nodes": if cmd.hmp_show_nodes { Some("") } else { None },
-    });
-
-    // `--enable` starts from nothing on, so the resulting pass set is exactly
-    // what was asked for and does not shift when dee's defaults change.
-    let (hmp, omp, pushdown) = match (&cmd.enable, &cmd.disable) {
-        (Some(enabled), _) => (
-            enabled.iter().any(|p| p == "hmp"),
-            enabled.iter().any(|p| p == "omp"),
-            enabled.iter().any(|p| p == "pushdown"),
-        ),
-        (None, Some(disabled)) => (
-            !disabled.iter().any(|p| p == "hmp"),
-            !disabled.iter().any(|p| p == "omp"),
-            !disabled.iter().any(|p| p == "pushdown"),
-        ),
-        (None, None) => (true, true, true),
-    };
-    config["run_hmp_pass"] = json!(hmp);
-    config["run_omp_pass"] = json!(omp);
-    config["run_pushdown_pass"] = json!(pushdown);
-
     let body = json!({
         "version": cmd.version,
         "target": cmd.target,
-        "config": config,
+        "config": cmd.optimizer.to_json()?,
         "save_as_version": save,
         "explain": cmd.explain.is_some(),
     });
@@ -162,6 +73,11 @@ pub async fn optimize(
 
     let accepted: Value = client.post(&path, &body).await?;
     let id = accepted["optimization_id"].as_str().unwrap_or("").to_string();
+
+    // With the DAG carrying settings of its own, the flags on this command are
+    // no longer the whole story, so say what actually ran.
+    println!("optimizing {} with:", cmd.name);
+    print_config(&accepted["config"]);
 
     if cmd.detach {
         println!("started optimization {id}");

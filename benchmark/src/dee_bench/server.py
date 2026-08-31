@@ -112,12 +112,19 @@ class DeeClient:
         # still holding the previous cell's database file open.
         return self.post("/v1/connections?upsert=true", {"name": name, "config": config})
 
-    def submit_dag(self, name: str, definition: dict[str, Any],
-                   target: str) -> dict[str, Any]:
-        return self.post(
-            "/v1/dags",
-            {"name": name, "definition": definition, "target": target},
-        )
+    def submit_dag(self, name: str, definition: dict[str, Any], target: str,
+                   optimizer_config: dict[str, Any] | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "name": name, "definition": definition, "target": target,
+        }
+        if optimizer_config is not None:
+            # Stored on the DAG, so `POST .../optimize` needs no settings of
+            # its own and the registry records what this DAG is for.
+            body["optimizer_config"] = optimizer_config
+        return self.post("/v1/dags", body)
+
+    def dag_optimizer(self, name: str) -> dict[str, Any]:
+        return self.get(f"/v1/dags/{name}/optimizer")
 
     def dag_version(self, name: str, version: int | None = None) -> dict[str, Any]:
         if version is None:
@@ -128,6 +135,34 @@ class DeeClient:
         return self.post(
             f"/v1/dags/{name}/runs?wait=true&timeout_s={timeout}", body, timeout + 60
         )
+
+    def enqueue(self, name: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        """Queue `body["count"]` runs and wait for all of them.
+
+        The server runs them strictly one after another -- a DAG only ever has
+        one job in flight -- so this returns once the last entry is terminal.
+        `timeout_s` is per entry, which is what a caller sizing it from a
+        single run expects.
+        """
+        return self.post(
+            f"/v1/dags/{name}/queue?wait=true&timeout_s={timeout}", body, timeout + 60
+        )
+
+    def queue(self, dag: str | None = None) -> list[dict[str, Any]]:
+        return self.get("/v1/queue", dag=dag)
+
+    def clear_queue(self, dag: str | None = None) -> None:
+        """Drop every entry that has not started yet.
+
+        The harness calls this when a cell gives up. Entries left behind would
+        keep running against the warehouse while the *next* cell is being
+        measured, which does not fail anything -- it just quietly makes the
+        next cell's timings wrong.
+        """
+        path = "/v1/queue"
+        if dag:
+            path = f"{path}?{urllib.parse.urlencode({'dag': dag})}"
+        self._request("DELETE", path)
 
     def run_group(self, group_id: str) -> dict[str, Any]:
         return self.get(f"/v1/run-groups/{group_id}")

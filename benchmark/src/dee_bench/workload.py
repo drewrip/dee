@@ -410,12 +410,17 @@ def connection_name(prepared: PreparedProject) -> str:
     return f"{prepared.project}_{prepared.backend}_sf{sf}"
 
 
-def register(client, prepared: PreparedProject, dag_name: str) -> tuple[str, dict]:
+def register(client, prepared: PreparedProject, dag_name: str,
+             optimizer_config: dict | None = None) -> tuple[str, dict]:
     """Register this project's connection and DAG with the server.
 
     Returns the connection name and the submit result. The connection is always
     upserted: replacing the config changes its hash, which is what evicts a
     pool still pointing at the previous cell's warehouse.
+
+    `optimizer_config` is stored on the DAG, so the cell's optimizer settings
+    are a property of the thing being benchmarked rather than an argument
+    repeated on every request that touches it.
     """
     import json
 
@@ -424,5 +429,5 @@ def register(client, prepared: PreparedProject, dag_name: str) -> tuple[str, dic
     client.register_connection(target, config)
 
     definition = json.loads(prepared.dag_json.read_text())
-    submitted = client.submit_dag(dag_name, definition, target)
+    submitted = client.submit_dag(dag_name, definition, target, optimizer_config)
     return target, submitted

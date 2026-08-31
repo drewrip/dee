@@ -3,15 +3,34 @@
 A cell runs in two phases:
 
 **optimize** (skipped for baseline variants)
-    ``POST /v1/dags/{name}/optimize`` with the cell's pass list and options,
-    sampled throughout. Produces a new DAG version and an ``OptimizeReport`` --
-    the cost side of the payback analysis.
+    ``POST /v1/dags/{name}/optimize``, sampled throughout. Produces a new DAG
+    version and an ``OptimizeReport`` -- the cost side of the payback analysis.
+
+    The request carries no optimizer settings. A cell's pass list and options
+    are submitted *with the DAG*, so the registry says what each DAG is for and
+    the settings cannot drift from the thing they describe. dee echoes back the
+    configuration it resolved to, and the runner checks it against the cell's
+    own before trusting the result.
 
 **measure**
-    A trigger with the cell's ``warmups`` and ``repetitions``. The whole series
-    runs inside one server against one already-warm connection pool, so
-    ``engine_wall_ms`` measures the DAG rather than process startup and pool
-    construction.
+    The cell's ``warmups`` and ``repetitions``, executed one of two ways
+    depending on ``execution.repeat_mode``:
+
+    ``group``
+        One trigger carrying the whole series, which dee runs back to back
+        inside a single driver against one already-warm engine. The tightest
+        measurement of the DAG itself, and the default.
+
+    ``queue``
+        One queued run group per repetition, drained by the server strictly in
+        sequence. Each repetition gets a fresh engine and its own group in
+        dee's history, which is what a repetition looks like in production.
+        Slightly slower and slightly noisier; the point is to be able to ask
+        whether the shared engine is flattering the numbers.
+
+    Either way the pool stays warm across repetitions -- it is cached by the
+    server, not by the run -- so ``engine_wall_ms`` measures the DAG rather
+    than process startup and pool construction.
 
 Both phases go over HTTP to a server the sweep started. The reports come back
 as the same ``OptimizeReport`` and ``ProfileReport`` shapes dee has always
@@ -50,8 +69,8 @@ class CellResult:
     rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
-def build_optimize_request(cell: Cell) -> dict[str, Any]:
-    """Render this cell's optimizer settings as an optimize request body.
+def build_optimizer_config(cell: Cell) -> dict[str, Any]:
+    """Render this cell's optimizer settings as an `OptimizerConfig`.
 
     Passes are always stated explicitly rather than relying on dee's defaults,
     so a variant's pass set is exactly its list and does not shift when those
@@ -67,9 +86,18 @@ def build_optimize_request(cell: Cell) -> dict[str, Any]:
             continue
         spec = DEE_OPT_BY_NAME[key]
         config[spec.config_field] = spec.config_value(value)
+    return config
 
+
+def build_optimize_request() -> dict[str, Any]:
+    """The optimize body. Deliberately carries no settings.
+
+    The cell's settings were submitted with the DAG, and an optimization with
+    no config of its own runs under them. Re-sending them here would work too,
+    and would mean the stored settings were never actually exercised -- a
+    benchmark of a feature should use the feature.
+    """
     return {
-        "config": config,
         "save_as_version": True,
         "explain": True,
     }
@@ -80,6 +108,24 @@ def build_run_request(cell: Cell, sample_interval_ms: int,
     return {
         "warmups": cell.warmups,
         "repetitions": cell.repetitions,
+        "cleanup_before": True,
+        "collect_plans": collect_plans,
+        "sample_interval_ms": sample_interval_ms,
+    }
+
+
+def build_queue_request(cell: Cell, sample_interval_ms: int, collect_plans: bool,
+                        *, count: int, warmups: int) -> dict[str, Any]:
+    """One `POST /v1/dags/{name}/queue` body: `count` entries of one run each.
+
+    ``repetitions`` is always 1 here. Under this mode the queue *is* the
+    repetition, so putting repetitions inside an entry as well would nest one
+    meaning of the word inside the other and make ``rep_index`` ambiguous.
+    """
+    return {
+        "count": count,
+        "warmups": warmups,
+        "repetitions": 1,
         "cleanup_before": True,
         "collect_plans": collect_plans,
         "sample_interval_ms": sample_interval_ms,
@@ -120,7 +166,13 @@ class CellRunner:
             # sharing a name across them would interleave their histories and
             # make the optimizer's derived-from chain meaningless.
             dag_name = f"c{cell.cell_id}"
-            target, submitted = register(self.client, prepared, dag_name)
+            optimizer_config = build_optimizer_config(cell)
+            (artifacts / "optimizer_config.json").write_text(
+                json.dumps(optimizer_config, indent=2)
+            )
+            target, submitted = register(
+                self.client, prepared, dag_name, optimizer_config
+            )
             version = submitted["version"]
             self._record_graph(cell, dag_name, version, "unopt", result)
 
@@ -140,7 +192,7 @@ class CellRunner:
 
     def _optimize(self, cell: Cell, dag_name: str, artifacts: Path,
                   result: CellResult) -> int:
-        body = build_optimize_request(cell)
+        body = build_optimize_request()
         (artifacts / "optimize_request.json").write_text(json.dumps(body, indent=2))
 
         started = datetime.now(timezone.utc)
@@ -149,6 +201,7 @@ class CellRunner:
         metrics, wall_ms = sampler.result
         finished = datetime.now(timezone.utc)
 
+        _verify_settings(cell, accepted.get("config") or {})
         optimization_id = accepted["optimization_id"]
         detail = self.client.optimization(optimization_id)
         if detail["status"] != "succeeded":
@@ -225,56 +278,40 @@ class CellRunner:
 
     def _measure(self, cell: Cell, dag_name: str, version: int, ctx: BackendContext,
                  artifacts: Path, dag_variant: str, result: CellResult) -> None:
-        body = build_run_request(
-            cell,
-            self.cfg.execution.sample_interval_ms,
-            collect_plans=self.store.records("plans"),
-        )
-        body["version"] = version
-        (artifacts / "run_request.json").write_text(json.dumps(body, indent=2))
-
         with self._sample_phase() as sampler:
-            triggered = self.client.trigger(dag_name, body, self.cfg.execution.timeout_s)
+            group_ids = self._execute(cell, dag_name, version, artifacts)
         metrics, wall_ms = sampler.result
 
-        group_id = triggered["run_group_id"]
-        group = self.client.run_group(group_id)
-        if group["status"] != "succeeded":
-            raise WorkloadError(
-                f"run group {group['status']}: {group.get('error') or 'no detail recorded'}"
-            )
-
-        report = self.client.group_report(group_id)
-        (artifacts / "run_report.json").write_text(json.dumps(report, indent=2))
-
-        runs = report.get("runs", [])
-        if not runs:
+        executions = self._collect(group_ids, artifacts)
+        if not executions:
             raise WorkloadError("the run produced no measurements")
 
         # One sampler covers the whole phase, which contains every repetition.
         # Splitting its totals per repetition would be a fiction, so they are
         # apportioned by each repetition's share of engine time and the basis
         # is recorded in the schema.
-        total_engine_ms = sum(r.get("duration_ms", 0) for r in runs) or 1
+        total_engine_ms = sum(r.get("duration_ms", 0) for _, r, _ in executions) or 1
 
-        # Pair the report's repetitions with their persisted run rows, so the
-        # server's own run ids are what the parquet records.
-        server_runs = group.get("runs", [])
-        by_key = {(r["phase"], r["rep_index"]): r for r in server_runs}
+        # `rep_index` is per phase and per cell, not per run group. Under
+        # `queue` each group holds one run and would otherwise report index 0
+        # five times over, so the counter runs across groups instead.
+        next_index = {"warmup": 0, "measure": 0}
 
-        for r in runs:
+        for group_id, r, server_run in executions:
             share = r.get("duration_ms", 0) / total_engine_ms
-            key = (r.get("phase", "measure"), r.get("rep_index", 0))
-            server_run = by_key.get(key)
+            phase = r.get("phase", "measure")
+            rep_index = next_index.get(phase, 0)
+            next_index[phase] = rep_index + 1
             run_id = server_run["run_id"] if server_run else str(uuid.uuid4())
             node_execs = r.get("node_executions", [])
 
             result.rows.setdefault("runs", []).append({
                 "cell_id": cell.cell_id,
                 "run_id": run_id,
+                "run_group_id": group_id,
                 "dag_variant": dag_variant,
-                "phase": r.get("phase", "measure"),
-                "rep_index": r.get("rep_index", 0),
+                "phase": phase,
+                "rep_index": rep_index,
                 "started_at": _ts(r.get("run_started_at")),
                 "finished_at": _ts(r.get("run_finished_at")),
                 "engine_wall_ms": r.get("duration_ms"),
@@ -292,7 +329,7 @@ class CellRunner:
                 "status": "ok",
                 "error": None,
             })
-            if r.get("phase", "measure") == "measure":
+            if phase == "measure":
                 result.measured_runs += 1
 
             mats = {n["id"]: n.get("materialization") for n in r.get("graph", {}).get("nodes", [])}
@@ -322,7 +359,7 @@ class CellRunner:
                 result.rows.setdefault("system_samples", []).append({
                     "cell_id": cell.cell_id,
                     "run_id": run_id,
-                    "phase": r.get("phase", "measure"),
+                    "phase": phase,
                     "source": "engine_internal",
                     "elapsed_ms": sample.get("elapsed_ms"),
                     "timestamp": _ts(sample.get("timestamp")),
@@ -337,6 +374,101 @@ class CellRunner:
         result.rows.setdefault("system_samples", []).extend(
             samples_to_rows(metrics, cell_id=cell.cell_id, run_id=measure_run_id, phase="measure")
         )
+
+    def _execute(self, cell: Cell, dag_name: str, version: int,
+                 artifacts: Path) -> list[str]:
+        """Run the cell's repetitions. Returns their run group ids, in order."""
+        if cell.repeat_mode == "queue":
+            return self._execute_queued(cell, dag_name, version, artifacts)
+
+        body = build_run_request(
+            cell,
+            self.cfg.execution.sample_interval_ms,
+            collect_plans=self.store.records("plans"),
+        )
+        body["version"] = version
+        (artifacts / "run_request.json").write_text(json.dumps(body, indent=2))
+
+        triggered = self.client.trigger(dag_name, body, self.cfg.execution.timeout_s)
+        return [triggered["run_group_id"]]
+
+    def _execute_queued(self, cell: Cell, dag_name: str, version: int,
+                        artifacts: Path) -> list[str]:
+        """Put each repetition on the server's queue, one run group apiece.
+
+        The version is pinned. A queue entry that names no version follows the
+        DAG to whatever is current when its turn comes, which is the right
+        default for watching a DAG adapt and exactly wrong here: a cell has
+        already decided which version it measures.
+
+        Two calls rather than one, because the warmups belong to the front of
+        the queue only and every entry in one request shares a body. They cost
+        nothing extra -- the entries run strictly in sequence either way.
+        """
+        timeout = self.cfg.execution.timeout_s
+        collect_plans = self.store.records("plans")
+        bodies: list[dict[str, Any]] = []
+
+        if cell.warmups:
+            bodies.append(build_queue_request(
+                cell, self.cfg.execution.sample_interval_ms, collect_plans,
+                count=1, warmups=cell.warmups,
+            ))
+        remaining = cell.repetitions - len(bodies)
+        if remaining > 0:
+            bodies.append(build_queue_request(
+                cell, self.cfg.execution.sample_interval_ms, collect_plans,
+                count=remaining, warmups=0,
+            ))
+
+        for body in bodies:
+            body["version"] = version
+        (artifacts / "queue_request.json").write_text(json.dumps(bodies, indent=2))
+
+        group_ids: list[str] = []
+        try:
+            for body in bodies:
+                accepted = self.client.enqueue(dag_name, body, timeout)
+                group_ids.extend(e["run_group_id"] for e in accepted["entries"])
+        except Exception:
+            # Whatever went wrong, entries may still be waiting their turn.
+            # Left alone they would run against the warehouse while the *next*
+            # cell is being measured -- not a failure, just quietly wrong
+            # numbers for a cell that looked fine.
+            try:
+                self.client.clear_queue(dag_name)
+            except (ApiError, ServerError):
+                pass
+            raise
+
+        return group_ids
+
+    def _collect(self, group_ids: list[str],
+                 artifacts: Path) -> list[tuple[str, dict[str, Any], dict[str, Any] | None]]:
+        """Every execution across `group_ids`, as (group id, report, run row).
+
+        The report carries the measurements and the run row carries the
+        server's own run id, so the parquet records ids that join back to
+        dee's history rather than ones the harness invented.
+        """
+        executions = []
+        for index, group_id in enumerate(group_ids):
+            group = self.client.run_group(group_id)
+            if group["status"] != "succeeded":
+                raise WorkloadError(
+                    f"run group {group['status']}: "
+                    f"{group.get('error') or 'no detail recorded'}"
+                )
+
+            report = self.client.group_report(group_id)
+            name = "run_report.json" if len(group_ids) == 1 else f"run_report_{index:02d}.json"
+            (artifacts / name).write_text(json.dumps(report, indent=2))
+
+            by_key = {(r["phase"], r["rep_index"]): r for r in group.get("runs", [])}
+            for r in report.get("runs", []):
+                key = (r.get("phase", "measure"), r.get("rep_index", 0))
+                executions.append((group_id, r, by_key.get(key)))
+        return executions
 
     # -- helpers -----------------------------------------------------------
 
@@ -387,6 +519,36 @@ class _PhaseHandle:
     """Carries a phase's sampler results out of the context manager."""
 
     result: tuple = (None, 0)
+
+
+def _verify_settings(cell: Cell, resolved: dict[str, Any]) -> None:
+    """Check the optimization ran under the settings submitted with the DAG.
+
+    The settings now reach the optimizer indirectly, so nothing about the
+    request itself proves which ones were used. dee echoes the configuration it
+    resolved to, and comparing it against the cell's own is what turns that
+    indirection back into something checkable.
+
+    The failure this exists for is silent: a dee that predates DAG-level
+    settings ignores them on submit, then optimizes under its own defaults --
+    a cell that looks like it benchmarked OMP but ran HMP as well.
+    """
+    expected = build_optimizer_config(cell)
+    disagreed = {
+        key: (value, resolved.get(key))
+        for key, value in expected.items()
+        if resolved.get(key) != value
+    }
+    if not disagreed:
+        return
+    detail = ", ".join(
+        f"{key}: asked for {asked!r}, ran with {ran!r}"
+        for key, (asked, ran) in sorted(disagreed.items())
+    )
+    raise WorkloadError(
+        f"the optimizer did not run under this cell's settings ({detail}); "
+        f"the dee server may predate per-DAG optimizer settings"
+    )
 
 
 def _aggregate_engine_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:

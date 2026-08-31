@@ -4,6 +4,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use dee::dag::Dag;
 use dee::file::DagFile;
+use dee::opt::OptimizerConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
@@ -18,6 +19,12 @@ pub struct SubmitDag {
     pub target: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Which optimizer passes this DAG should be optimized with, and their
+    /// parameters. Partial: any field left out takes dee's default, and the
+    /// resolved whole is what gets stored. Omit the object entirely to leave
+    /// whatever the DAG already has alone.
+    #[serde(default)]
+    pub optimizer_config: Option<OptimizerConfig>,
 }
 
 #[derive(Serialize)]
@@ -50,17 +57,24 @@ pub async fn submit(
         }
     }
 
+    if let Some(config) = &body.optimizer_config {
+        crate::api::reject_server_side_paths(config)?;
+    }
+
     let warnings = inspect(&body.definition)?;
 
     let submitted = dags::submit(
         &state.store,
-        body.name.clone(),
-        body.definition,
-        body.target,
-        body.description,
-        dags::Origin::Submitted,
-        None,
-        None,
+        dags::SubmitRequest {
+            target: body.target,
+            description: body.description,
+            optimizer_config: body.optimizer_config,
+            ..dags::SubmitRequest::new(
+                body.name.clone(),
+                body.definition,
+                dags::Origin::Submitted,
+            )
+        },
     )
     .await?;
 
@@ -125,6 +139,60 @@ pub async fn version(
         definition,
         nodes,
     }))
+}
+
+#[derive(Serialize)]
+pub struct OptimizerSettings {
+    pub dag: String,
+    /// False when the DAG stores nothing and `config` is dee's own defaults.
+    /// The two are worth telling apart: a benchmark cell that meant to pin OMP
+    /// parameters and silently ran under defaults is a result you would trust
+    /// and should not.
+    pub configured: bool,
+    pub config: OptimizerConfig,
+}
+
+pub async fn get_optimizer(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<OptimizerSettings>, ServerError> {
+    let dag = lookup(&state, &name).await?;
+    Ok(Json(OptimizerSettings {
+        dag: name,
+        configured: dag.optimizer_config.is_some(),
+        config: dag.optimizer_config.unwrap_or_default(),
+    }))
+}
+
+/// Replace a DAG's optimizer configuration.
+///
+/// Replace, not merge: the body is the complete intent, and any field left out
+/// takes dee's default. Merging would make the stored settings depend on the
+/// order they were written in, which is the one thing a reproducible benchmark
+/// cannot have.
+pub async fn set_optimizer(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<OptimizerConfig>>,
+) -> Result<Json<OptimizerSettings>, ServerError> {
+    let dag = lookup(&state, &name).await?;
+    let config = body.map(|Json(c)| c).unwrap_or_default();
+    crate::api::reject_server_side_paths(&config)?;
+    dags::set_optimizer_config(&state.store, dag.dag_id, Some(&config)).await?;
+    Ok(Json(OptimizerSettings {
+        dag: name,
+        configured: true,
+        config,
+    }))
+}
+
+pub async fn clear_optimizer(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ServerError> {
+    let dag = lookup(&state, &name).await?;
+    dags::set_optimizer_config(&state.store, dag.dag_id, None).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete(

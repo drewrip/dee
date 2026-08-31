@@ -48,6 +48,9 @@ pub async fn drive_group(state: AppState, group_id: String) {
         log::error!("could not finalize run group {group_id}: {e}");
     }
     state.runs.finish(&group_id).await;
+    // The DAG is free now, so whatever was waiting behind it can start without
+    // waiting for the dispatcher's next tick.
+    state.wake_queue();
 }
 
 async fn drive_group_inner(state: AppState, group_id: String) -> Result<(), ServerError> {

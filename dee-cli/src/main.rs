@@ -8,7 +8,9 @@ use std::fs;
 pub mod client;
 pub mod connection;
 pub mod dag;
+pub mod optconfig;
 pub mod optimize;
+pub mod queue;
 pub mod runs;
 pub mod schedule;
 pub mod serve;
@@ -35,6 +37,9 @@ pub enum CliCommand {
     Dag(dag::DagCommand),
     /// Run a DAG now.
     Trigger(runs::TriggerCommand),
+    /// Queue N runs of a DAG to execute one after another.
+    #[command(subcommand_value_name = "SUBCOMMAND")]
+    Queue(queue::QueueCommand),
     /// Inspect run history.
     #[command(subcommand_value_name = "SUBCOMMAND")]
     Runs(runs::RunsCommand),
@@ -119,6 +124,7 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn Error>> {
         }
         CliCommand::Dag(cmd) => dag::run(&client::Client::new(&server), cmd).await?,
         CliCommand::Trigger(cmd) => runs::trigger(&client::Client::new(&server), cmd).await?,
+        CliCommand::Queue(cmd) => queue::run(&client::Client::new(&server), cmd).await?,
         CliCommand::Runs(cmd) => runs::run(&client::Client::new(&server), cmd).await?,
         CliCommand::Cancel { id } => runs::cancel(&client::Client::new(&server), id).await?,
         CliCommand::Optimize(cmd) => {

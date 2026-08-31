@@ -57,6 +57,25 @@ dee dag versions pipeline
 dee dag graph pipeline -o pipeline.svg
 ```
 
+A DAG also carries the optimizer settings it is meant to be worked on under —
+which passes to run and their parameters — so a benchmark cell is submitted in
+one shot rather than repeated on every command that touches it:
+
+```bash
+dee dag submit pipeline.json --name pipeline --target wh \
+    --enable omp --omp-top 3 --omp-node-centrality paths --omp-exhaust
+
+dee dag optimizer pipeline                       # show
+dee dag optimizer pipeline --enable hmp,omp      # replace
+dee dag optimizer pipeline --clear               # back to dee's defaults
+```
+
+`--optimizer-config settings.json` reads the whole thing from a file, and
+individual flags override it — which is how a sweep generates one cell per
+parameter combination. The settings live on the DAG, not on a version, so
+resubmitting a definition under new settings does not mint a version, and
+resubmitting without any settings leaves the stored ones alone.
+
 **Runs** record what happened. A trigger produces a *run group*: one run
 normally, or a whole series when you ask for repetitions.
 
@@ -70,6 +89,41 @@ dee runs report <run-id> --html -o profile.html
 Repetitions execute back to back inside one server against one already-warm
 connection pool, so their timings measure the DAG rather than process startup
 and pool construction.
+
+**The queue** runs a DAG N times in succession. Each entry is its own run
+group, started only once the one before it has finished.
+
+```bash
+dee queue add pipeline -n 20                 # twenty runs, back to back
+dee queue add pipeline -n 20 --repeat 3 --warmups 1 --wait
+dee queue list --dag pipeline
+dee queue drop <run-group-id>
+dee queue clear --dag pipeline
+```
+
+This is not the same thing as `--repeat`. A run group pins one version and
+executes under one driver, so nothing that happens between its repetitions can
+change what it runs. Queue entries are separate groups, so an entry that did
+not name a `--version` resolves to whatever version is current *when its turn
+comes*. Submit a new version halfway through a queue of twenty and the
+remaining runs execute it, so one `dee runs list` shows the DAG before and
+after the change under otherwise identical conditions:
+
+```bash
+dee queue add pipeline -n 20
+dee dag submit rewritten.json --name pipeline   # lands mid-drain, as v2
+dee runs list --dag pipeline --limit 40         # v1 before it, v2 after
+```
+
+Pass `--version` to pin an entry instead.
+
+Enqueueing never conflicts — it is `dee trigger` that refuses while a DAG is
+busy, and the queue is where that run goes instead. Nothing cuts the line
+either: a manual trigger, a scheduled window and `dee optimize` are all refused
+while a queue is draining, since all three execute the DAG against the same
+warehouse. Entries still waiting when the server stops are marked `orphaned` on
+the next start rather than replayed, the same no-catchup rule the scheduler
+follows.
 
 **Schedules** are a cron expression and an IANA timezone.
 
@@ -91,12 +145,21 @@ in flight is recorded as an `overlap` skip naming what blocked it. Optimizations
 count as jobs, because they execute the DAG too.
 
 **Optimization** rewrites a DAG and, with `--save`, stores the result as a new
-version attributed to the one it came from.
+version attributed to the one it came from. With no flags it runs under the
+DAG's own settings; a flag overrides that one setting for that one run and
+leaves the rest alone.
 
 ```bash
-dee optimize pipeline --enable hmp,pushdown --save --explain explain.html
+dee optimize pipeline --save --explain explain.html   # the DAG's settings
+dee optimize pipeline --omp-top 8                     # ...with one changed
 dee dag versions pipeline
 ```
+
+Every optimization begins by printing the configuration it resolved to, since
+with two places settings can come from, "what did this actually run" should not
+be something you have to reconstruct. A DAG with no settings of its own falls
+back to dee's defaults — HMP and OMP on, pushdown off — so `--enable`/`--disable`
+is still how you pin the pass set explicitly.
 
 ```
 optimized pipeline v1 in 1669ms using 2 dag run(s)

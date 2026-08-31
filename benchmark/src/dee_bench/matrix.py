@@ -24,7 +24,7 @@ from typing import Any
 from .config import DEE_OPT_BY_NAME, BenchConfig, Variant
 
 # Keys the runner needs but which are not part of the swept matrix.
-_RESERVED = {"project", "backend", "sf", "variant"}
+_RESERVED = {"project", "backend", "sf", "variant", "repeat_mode"}
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,11 @@ class Cell:
     backend_config: dict[str, Any]
     repetitions: int
     warmups: int
+    # "group" or "queue": whether the repetitions run as one server-side run
+    # group or as that many queued ones. Part of the identity because it
+    # changes what is being measured, so two cells differing only in this are
+    # two experiments, not a duplicate.
+    repeat_mode: str = "group"
     # Any extra matrix keys, carried through for provenance.
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -69,6 +74,7 @@ class Cell:
             "backend_config": self.backend_config,
             "repetitions": self.repetitions,
             "warmups": self.warmups,
+            "repeat_mode": self.repeat_mode,
             "extra": self.extra,
         }
 
@@ -128,6 +134,9 @@ def expand(cfg: BenchConfig) -> list[Cell]:
             backend_config=dict(cfg.backends.get(backend) or {}),
             repetitions=cfg.execution.repetitions,
             warmups=cfg.execution.warmups,
+            # Swept like any other axis when the matrix names it; otherwise
+            # the whole run uses one mode.
+            repeat_mode=str(values.get("repeat_mode", cfg.execution.repeat_mode)),
             extra={k: values[k] for k in matrix_keys if k not in _RESERVED},
         )
         cell_id = compute_cell_id(cell.identity())
@@ -179,6 +188,7 @@ def cells_to_rows(cells: list[Cell], provenance: dict[str, Any]) -> list[dict[st
             "backend_config": _canonical(c.backend_config),
             "repetitions": c.repetitions,
             "warmups": c.warmups,
+            "repeat_mode": c.repeat_mode,
             "dee_git_sha": provenance.get("dee_git_sha"),
             "dag_bench_git_sha": provenance.get("dag_bench_git_sha"),
             "harness_version": provenance.get("harness_version"),

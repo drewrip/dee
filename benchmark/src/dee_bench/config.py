@@ -97,6 +97,10 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
 
 DEE_OPT_BY_NAME: dict[str, DeeOptSpec] = {s.name: s for s in DEE_OPT_SPECS}
 
+# How a cell's measured repetitions reach the server. See ExecutionConfig.
+REPEAT_MODES = ("group", "queue")
+
+
 VALID_PASSES = ("hmp", "omp", "pushdown")
 VALID_BACKENDS = ("duckdb", "postgres")
 
@@ -142,6 +146,22 @@ class ExecutionConfig:
     warmups: int = 1
     sample_interval_ms: int = 100
     timeout_s: int = 3600
+    # How the measured repetitions are executed on the server.
+    #
+    # ``group`` sends one trigger carrying every repetition, which dee runs
+    # back to back inside a single driver against one already-warm engine.
+    # That is the tightest measurement of the DAG itself, and the default.
+    #
+    # ``queue`` puts each repetition on the server's run queue as its own run
+    # group. dee still runs them strictly one at a time, but each gets a fresh
+    # engine and its own group in dee's history -- which is what a repetition
+    # looks like in production, where nothing shares an engine with the run
+    # before it. Use it to ask whether the shared engine is flattering the
+    # numbers.
+    #
+    # ``matrix.repeat_mode`` overrides this per cell, and sweeping it there is
+    # how the two modes get compared within one run.
+    repeat_mode: str = "group"
 
 
 @dataclass
@@ -324,6 +344,15 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
         raise ConfigError(f"matrix.sf must be positive numbers; got {bad_sf}")
     matrix["sf"] = [float(s) for s in matrix["sf"]]
 
+    # `repeat_mode` may be swept like anything else in the matrix, which is
+    # how the two measurement modes get compared inside one run rather than by
+    # diffing two run directories.
+    for mode in matrix.get("repeat_mode", ()):
+        if mode not in REPEAT_MODES:
+            raise ConfigError(
+                f"matrix.repeat_mode must be one of {', '.join(REPEAT_MODES)}, got {mode!r}"
+            )
+
     for project in matrix["project"]:
         if not (dag_bench / "projects" / str(project) / "dbt_project.yml").exists():
             raise ConfigError(
@@ -359,7 +388,9 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
     exec_raw = raw.get("execution") or {}
     if not isinstance(exec_raw, dict):
         raise ConfigError("`execution` must be a mapping")
-    unknown = set(exec_raw) - {"repetitions", "warmups", "sample_interval_ms", "timeout_s"}
+    unknown = set(exec_raw) - {
+        "repetitions", "warmups", "sample_interval_ms", "timeout_s", "repeat_mode",
+    }
     if unknown:
         raise ConfigError(f"execution: unknown key(s): {', '.join(sorted(unknown))}")
     execution = ExecutionConfig(**exec_raw)
@@ -367,6 +398,11 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
         raise ConfigError("execution.repetitions must be at least 1")
     if execution.warmups < 0:
         raise ConfigError("execution.warmups must not be negative")
+    if execution.repeat_mode not in REPEAT_MODES:
+        raise ConfigError(
+            f"execution.repeat_mode must be one of {', '.join(REPEAT_MODES)}, "
+            f"got {execution.repeat_mode!r}"
+        )
 
     # --- server -----------------------------------------------------------
     server_raw = raw.get("server") or {}

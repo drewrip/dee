@@ -21,10 +21,13 @@ pub struct OptimizeBody {
     pub version: Option<i32>,
     #[serde(default)]
     pub target: Option<String>,
-    /// Partial configs are accepted; absent fields take the same defaults the
-    /// CLI would have used.
+    /// Overrides for this optimization only, layered over the DAG's stored
+    /// configuration. Only the keys present here are overridden, which is what
+    /// lets `dee optimize pipeline --omp-top 5` change one parameter without
+    /// silently reverting the rest to defaults. Absent entirely means "use the
+    /// DAG's configuration as submitted".
     #[serde(default)]
-    pub config: OptimizerConfig,
+    pub config: Option<serde_json::Value>,
     /// Store the rewrite as a new version of this DAG.
     #[serde(default)]
     pub save_as_version: bool,
@@ -39,6 +42,11 @@ pub struct OptimizeAccepted {
     pub source_version: i32,
     pub target: String,
     pub status: String,
+    /// The configuration this optimization actually ran under, after the
+    /// DAG's settings and the request's overrides were resolved. Echoed back
+    /// because with two sources for it, "which settings did this use" must not
+    /// be something a caller has to reconstruct.
+    pub config: OptimizerConfig,
 }
 
 pub async fn start(
@@ -68,11 +76,21 @@ pub async fn start(
             ServerError::BadRequest(format!("'{name}' has no target; pass one with the request"))
         })?;
 
-    let mut config = body.config;
-    reject_server_side_paths(&config)?;
+    let mut config = resolve_config(dag.optimizer_config.clone(), body.config)?;
+    crate::api::reject_server_side_paths(&config)?;
     // The explain sections are only collected when the optimizer is told to,
     // and asking for the HTML afterwards is too late.
     config.explain = body.explain;
+
+    // As in `trigger`: the in-memory claim below cannot see entries still
+    // waiting in the queue, and an optimization runs the DAG, so it must not
+    // start on top of a queue that is mid-drain.
+    if let Some(blocking) = runs::active_job(&state.store, dag.dag_id.clone()).await? {
+        return Err(ServerError::Conflict(format!(
+            "'{name}' already has an active job ({blocking}); an optimization runs the DAG, \
+             so it cannot share the warehouse with a run or a queued one"
+        )));
+    }
 
     let optimization_id = optimizations::create(
         &state.store,
@@ -104,7 +122,7 @@ pub async fn start(
         dag_name: name.clone(),
         source_version,
         target: target.clone(),
-        config,
+        config: config.clone(),
         save_as_version: body.save_as_version,
         explain: body.explain,
     };
@@ -124,8 +142,41 @@ pub async fn start(
             source_version,
             target,
             status,
+            config,
         }),
     ))
+}
+
+/// Layer a request's overrides onto the DAG's stored configuration.
+///
+/// A shallow merge is the whole of it, because `OptimizerConfig` is flat: every
+/// field is a scalar the caller either named or did not. Deserializing the
+/// merged object rather than patching a struct is what keeps `deny_unknown_fields`
+/// doing its job -- a misspelled `omp_topp` is rejected here instead of being
+/// dropped and quietly running under the wrong settings.
+fn resolve_config(
+    stored: Option<OptimizerConfig>,
+    overrides: Option<serde_json::Value>,
+) -> Result<OptimizerConfig, ServerError> {
+    let base = stored.unwrap_or_default();
+    let Some(overrides) = overrides else {
+        return Ok(base);
+    };
+    let overrides = overrides.as_object().cloned().ok_or_else(|| {
+        ServerError::BadRequest("config must be a json object of optimizer settings".into())
+    })?;
+
+    let mut merged = serde_json::to_value(&base)
+        .map_err(|e| ServerError::Internal(format!("serializing the optimizer config: {e}")))?;
+    let object = merged
+        .as_object_mut()
+        .expect("OptimizerConfig serializes as an object");
+    for (key, value) in overrides {
+        object.insert(key, value);
+    }
+
+    serde_json::from_value(merged)
+        .map_err(|e| ServerError::BadRequest(format!("invalid optimizer config: {e}")))
 }
 
 async fn wait_for(
@@ -258,23 +309,79 @@ async fn fetch(
         .ok_or_else(|| ServerError::NotFound("optimization", id.to_string()))
 }
 
-/// `hmp_show_operators` and `hmp_show_nodes` name files the optimizer writes.
-///
-/// In a daemon those become arbitrary filesystem writes chosen by whoever can
-/// reach the API. The empty string keeps the diagnostic (it logs the table),
-/// so the useful half of the option survives.
-fn reject_server_side_paths(config: &OptimizerConfig) -> Result<(), ServerError> {
-    for (name, value) in [
-        ("hmp_show_operators", &config.hmp_show_operators),
-        ("hmp_show_nodes", &config.hmp_show_nodes),
-    ] {
-        if let Some(path) = value {
-            if !path.is_empty() {
-                return Err(ServerError::BadRequest(format!(
-                    "{name} cannot name a file on the server; pass \"\" to log the table instead"
-                )));
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn stored() -> OptimizerConfig {
+        OptimizerConfig {
+            run_omp_pass: true,
+            run_hmp_pass: false,
+            run_pushdown_pass: true,
+            omp_top: Some(5),
+            hmp_max_runs: 4,
+            ..OptimizerConfig::default()
         }
     }
-    Ok(())
+
+    #[test]
+    fn test_no_overrides_runs_the_dags_own_settings() {
+        // The point of storing a config with the DAG: `dee optimize pipeline`
+        // sends nothing and still benchmarks the pass it was submitted for.
+        let resolved = resolve_config(Some(stored()), None).unwrap();
+        assert!(resolved.run_omp_pass);
+        assert!(!resolved.run_hmp_pass);
+        assert_eq!(resolved.omp_top, Some(5));
+        assert_eq!(resolved.hmp_max_runs, 4);
+    }
+
+    #[test]
+    fn test_an_override_changes_one_field_and_leaves_the_rest() {
+        let resolved =
+            resolve_config(Some(stored()), Some(json!({"omp_top": 9}))).unwrap();
+        assert_eq!(resolved.omp_top, Some(9));
+        // Everything the request did not name still comes from the DAG. A
+        // merge that reverted these to defaults would silently re-enable HMP
+        // and turn an OMP benchmark into something else.
+        assert!(!resolved.run_hmp_pass);
+        assert_eq!(resolved.hmp_max_runs, 4);
+    }
+
+    #[test]
+    fn test_a_dag_with_no_settings_falls_back_to_dees_defaults() {
+        let resolved = resolve_config(None, Some(json!({"omp_top": 2}))).unwrap();
+        assert_eq!(resolved.omp_top, Some(2));
+        assert_eq!(
+            resolved.hmp_max_runs,
+            OptimizerConfig::default().hmp_max_runs
+        );
+    }
+
+    #[test]
+    fn test_a_null_override_is_a_value_not_an_absence() {
+        // `--omp-top` has no "unset" spelling of its own, so a request that
+        // sends null must clear the stored value rather than inherit it.
+        let resolved =
+            resolve_config(Some(stored()), Some(json!({"omp_top": null}))).unwrap();
+        assert_eq!(resolved.omp_top, None);
+    }
+
+    #[test]
+    fn test_a_misspelled_setting_is_rejected_rather_than_ignored() {
+        // Silently dropping it would run the benchmark under settings nobody
+        // chose, and the result would look valid.
+        let error = resolve_config(Some(stored()), Some(json!({"omp_topp": 9})))
+            .expect_err("unknown fields must not be accepted");
+        assert!(
+            error.to_string().contains("omp_topp"),
+            "the error should name the offending field: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_config_that_is_not_an_object_is_a_bad_request() {
+        let error = resolve_config(None, Some(json!("omp"))).expect_err("not an object");
+        assert!(matches!(error, ServerError::BadRequest(_)));
+    }
 }

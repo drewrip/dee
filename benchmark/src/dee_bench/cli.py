@@ -305,7 +305,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         projects = discover_projects(Path(dag_bench))
         print(f"  {len(projects)} project(s): {', '.join(projects)}")
 
-    ok = _check_optimizer_options(args) and ok
+    ok = _check_server(args) and ok
 
     strays = stray_containers()
     print(f"\nleftover dee-bench containers: {len(strays)}")
@@ -319,14 +319,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def _check_optimizer_options(args: argparse.Namespace) -> bool:
-    """Diff DEE_OPT_SPECS against the server's own option list.
+def _check_server(args: argparse.Namespace) -> bool:
+    """Check the dee binary against what the harness assumes about it.
 
-    `DEE_OPT_SPECS` mirrors `OptimizerConfig` in dee/src/opt.rs, and a mirror
-    that drifts silently is worse than no mirror: a sweep would keep sending an
-    option the optimizer no longer reads. The server publishes the real list at
-    /v1/optimizer/options, so this is a genuine contract check rather than a
-    guess parsed out of `--help`.
+    Two contracts, one server start. `DEE_OPT_SPECS` mirrors `OptimizerConfig`
+    in dee/src/opt.rs, and a mirror that drifts silently is worse than no
+    mirror: a sweep would keep sending an option the optimizer no longer reads.
+    Separately, the run queue behind `execution.repeat_mode: queue` is newer
+    than the rest of the API, so an older dee would fail a sweep on its first
+    cell rather than here. Both are answered by asking the server, not by
+    parsing `--help`.
     """
     import tempfile
 
@@ -344,11 +346,24 @@ def _check_optimizer_options(args: argparse.Namespace) -> bool:
             with DeeServer(dee_bin, Path(tmp)) as client:
                 info = client.info()
                 server_options = {o["name"]: o for o in client.optimizer_options()}
+                # Probed, not inferred from a version: dee keeps one schema
+                # rather than a migration chain, so nothing it reports about
+                # itself says whether the queue is there.
+                try:
+                    client.queue()
+                    has_queue = None
+                except (ServerError, OSError) as e:
+                    has_queue = str(e)
     except (ServerError, OSError) as e:
         print(f"  could not start a server to check options: {e}")
         return False
 
     print(f"  version {info['version']}, metadata schema v{info['schema_version']}")
+    if has_queue is None:
+        print("  run queue: available (execution.repeat_mode may be 'group' or 'queue')")
+    else:
+        print(f"  run queue: NOT AVAILABLE ({has_queue})")
+        print("    execution.repeat_mode must be 'group' with this dee")
 
     ours = {spec.config_field: spec for spec in DEE_OPT_SPECS}
     missing = sorted(set(ours) - set(server_options))
@@ -380,7 +395,7 @@ def _check_optimizer_options(args: argparse.Namespace) -> bool:
 
     if not missing and not mismatched:
         print("  in sync")
-    return not missing and not mismatched
+    return not missing and not mismatched and has_queue is None
 
 
 def _finalize(run_dir: Path, skip_viz: bool = False) -> None:

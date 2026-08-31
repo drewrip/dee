@@ -273,6 +273,11 @@ impl Scheduler {
             cleanup_before: true,
             collect_plans: false,
             sample_interval_ms: None,
+            // A scheduled fire is driven immediately or skipped; it never
+            // waits in the queue, because a window that has passed is not
+            // worth running late.
+            queued: false,
+            pin_version: true,
         };
         let created =
             runs::create_group(&self.state.store, request, self.state.instance_id.clone()).await?;
@@ -410,13 +415,10 @@ mod tests {
 
         let submitted = dags::submit(
             &state.store,
-            "sales".into(),
-            trivial_dag(),
-            Some("wh".into()),
-            None,
-            dags::Origin::Submitted,
-            None,
-            None,
+            dags::SubmitRequest {
+                target: Some("wh".into()),
+                ..dags::SubmitRequest::new("sales".into(), trivial_dag(), dags::Origin::Submitted)
+            },
         )
         .await
         .unwrap();
@@ -517,6 +519,8 @@ mod tests {
                 cleanup_before: true,
                 collect_plans: false,
                 sample_interval_ms: None,
+                queued: false,
+                pin_version: true,
             },
             "test-instance".into(),
         )

@@ -84,6 +84,17 @@ pub async fn trigger(
             ))
         })?;
 
+    // Ask the store before writing anything. The in-memory claim below is the
+    // race-tight check, but it only knows about work this server has started,
+    // and a queue entry waiting its turn has not started. Without this, a
+    // manual trigger would cut in front of a queue that is mid-drain.
+    if let Some(blocking) = runs::active_job(&state.store, dag.dag_id.clone()).await? {
+        return Err(ServerError::Conflict(format!(
+            "'{name}' already has an active job ({blocking}); wait for it, cancel it, \
+             or put this run behind it with `dee queue add {name}`"
+        )));
+    }
+
     // Claim before creating rows so a rejected trigger leaves no trace beyond
     // the conflict it reports.
     let request = runs::RunRequest {
@@ -97,6 +108,8 @@ pub async fn trigger(
         cleanup_before: body.cleanup_before.unwrap_or(true),
         collect_plans: body.collect_plans.unwrap_or(false),
         sample_interval_ms: body.sample_interval_ms,
+        queued: false,
+        pin_version: true,
     };
 
     let created =
@@ -148,7 +161,7 @@ pub async fn trigger(
 ///
 /// Long-polling rather than streaming: a client that just wants the result
 /// should not have to hold a connection open interpreting events.
-async fn wait_for_group(
+pub(crate) async fn wait_for_group(
     state: &AppState,
     group_id: &str,
     timeout_s: u64,
