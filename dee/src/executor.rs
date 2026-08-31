@@ -111,6 +111,16 @@ where
         self.profiling = Some(profiling);
         self
     }
+
+    /// Clear a latched cancellation so this engine can run again.
+    ///
+    /// `run` returns `ExecutorError::Cancelled` as soon as it observes the
+    /// flag, but nothing lowers it again, so a cancelled engine would refuse
+    /// every subsequent `run`. Callers that keep an engine alive across
+    /// executions must call this after handling a cancellation.
+    pub fn reset_cancel(&self) {
+        let _ = self.cancel_tx.send(false);
+    }
 }
 
 #[derive(Clone, Debug)]

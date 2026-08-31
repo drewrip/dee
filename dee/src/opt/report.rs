@@ -6,9 +6,10 @@
 //! into a single [`OptimizeReport`].
 //!
 //! These types replace the previous stringly-typed `HashMap<String, String>`
-//! stats. The benchmarking harness consumes them directly as JSON via
-//! `dee-cli opt --report-json`, so every field here is part of a stable
-//! machine-readable contract — see `benchmark/src/dee_bench/schema.py`.
+//! stats. The server stores an `OptimizeReport` verbatim and serves it from
+//! `GET /v1/optimizations/{id}/report`, which the benchmarking harness consumes
+//! directly; every field here is therefore part of a stable machine-readable
+//! contract — see `benchmark/src/dee_bench/schema.py`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

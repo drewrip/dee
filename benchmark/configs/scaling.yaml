@@ -5,7 +5,7 @@
 # warehouses x skus x 3, so it scales quadratically and dwarfs the others.
 name: scaling
 dag_bench: ${DAG_BENCH}
-dee_cli: ../../target/release/dee-cli
+dee_bin: ../../target/release/dee
 output_dir: ../results/scaling
 verbosity: standard
 

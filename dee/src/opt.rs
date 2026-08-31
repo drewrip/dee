@@ -10,6 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use log::{debug, error, warn};
+use serde::{Deserialize, Serialize};
 
 use thiserror::Error;
 
@@ -297,7 +298,8 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct OptimizerConfig {
     pub run_omp_pass: bool,
     pub run_hmp_pass: bool,
@@ -479,5 +481,61 @@ impl OptimizerConfig {
     pub fn with_explain(mut self, enabled: bool) -> Self {
         self.explain = enabled;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_optimizer_config_round_trips_through_json() {
+        let config = OptimizerConfig {
+            hmp_strategy: HMPStrategy::Greedy,
+            omp_centrality: OMPCentrality::Paths,
+            hmp_max_runs: 7,
+            hmp_top_cpu_time: 0.25,
+            run_pushdown_pass: false,
+            ..OptimizerConfig::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let back: OptimizerConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.hmp_strategy, HMPStrategy::Greedy);
+        assert!(matches!(back.omp_centrality, OMPCentrality::Paths));
+        assert_eq!(back.hmp_max_runs, 7);
+        assert_eq!(back.hmp_top_cpu_time, 0.25);
+        assert!(!back.run_pushdown_pass);
+    }
+
+    #[test]
+    fn test_optimizer_config_fills_missing_fields_from_default() {
+        // The API accepts a partial config, so every absent field must fall
+        // back to the same default the CLI would have used.
+        let partial: OptimizerConfig = serde_json::from_str(r#"{"hmp_max_runs": 4}"#).unwrap();
+        let defaults = OptimizerConfig::default();
+
+        assert_eq!(partial.hmp_max_runs, 4);
+        assert_eq!(partial.hmp_top_cpu_time, defaults.hmp_top_cpu_time);
+        assert_eq!(partial.run_hmp_pass, defaults.run_hmp_pass);
+        assert_eq!(partial.hmp_beam_width, defaults.hmp_beam_width);
+    }
+
+    #[test]
+    fn test_optimizer_config_rejects_unknown_fields() {
+        // A misspelled option in an API body must be an error rather than a
+        // silently ignored setting.
+        let err = serde_json::from_str::<OptimizerConfig>(r#"{"hmp_max_run": 4}"#);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_enum_names_match_cli_value_names() {
+        // The CLI's --hmp-strategy/--omp-node-centrality values and the JSON
+        // encoding must agree, or the same setting means two different things
+        // depending on how it was supplied.
+        assert_eq!(serde_json::to_string(&HMPStrategy::Breadth).unwrap(), "\"breadth\"");
+        assert_eq!(serde_json::to_string(&OMPCentrality::OutDegree).unwrap(), "\"outdegree\"");
     }
 }

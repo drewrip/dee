@@ -27,9 +27,12 @@ HARNESS_VERSION = "0.1.0"
 
 @dataclass(frozen=True)
 class DeeOptSpec:
-    """One dee optimizer option, and how to render it as a `dee-cli opt` flag."""
+    """One dee optimizer option, and how it reaches the server."""
 
     name: str
+    # The equivalent `dee optimize` flag. No longer how the option is sent --
+    # optimizer settings go over HTTP as an OptimizerConfig object -- but kept
+    # because it is what a person types, and what `doctor` reports against.
     flag: str
     kind: str  # "bool" | "int" | "float" | "str"
     # Which passes actually read this option. An option whose passes are all
@@ -37,21 +40,39 @@ class DeeOptSpec:
     # multiply the matrix with duplicate experiments.
     passes: frozenset[str]
     choices: tuple[str, ...] | None = None
-    # True when the flag's presence *disables* something, so the config value
-    # is inverted relative to the flag (e.g. hmp_use_pushdown -> --hmp-no-pushdown).
+    # True when the *flag* disables something the config enables (e.g.
+    # hmp_use_pushdown is set by omitting --hmp-no-pushdown). Documentation
+    # only: the JSON value is never inverted by this.
     negated: bool = False
     doc: str = ""
+    # Field name in the server's OptimizerConfig, when it differs from `name`.
+    field: str | None = None
+    # True when the config value is the logical negation of the harness's
+    # value. Only `omp_exhaust` works this way: it turns off early termination.
+    invert: bool = False
+
+    @property
+    def config_field(self) -> str:
+        return self.field or self.name
+
+    def config_value(self, value: Any) -> Any:
+        """The value to send under `config_field`."""
+        if self.invert:
+            return not bool(value)
+        return value
 
 
-# Mirrors OptimizerConfig in dee/src/opt.rs. Keep in sync; `dee-bench doctor`
-# checks this list against `dee-cli opt --help`.
+# Mirrors OptimizerConfig in dee/src/opt.rs. `dee-bench doctor` checks this
+# list against the server's own GET /v1/optimizer/options, which is a real
+# contract rather than the `--help` scraping it used to do.
 DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
     DeeOptSpec("omp_top", "--omp-top", "int", frozenset({"omp"}),
                doc="Consider only the top N candidate nodes in OMP."),
     DeeOptSpec("omp_node_centrality", "--omp-node-centrality", "str", frozenset({"omp"}),
-               choices=("outdegree", "paths"),
+               choices=("outdegree", "paths"), field="omp_centrality",
                doc="How OMP ranks candidate nodes."),
     DeeOptSpec("omp_exhaust", "--omp-exhaust", "bool", frozenset({"omp"}),
+               field="omp_early_termination", invert=True,
                doc="Disable OMP early termination and evaluate every plan fully."),
     DeeOptSpec("omp_use_pushdown", "--omp-no-pushdown", "bool", frozenset({"omp"}), negated=True,
                doc="Run the pushdown pass on each OMP candidate before measuring it."),
@@ -100,6 +121,22 @@ class Variant:
 
 
 @dataclass(frozen=True)
+class ServerConfig:
+    """How the sweep gets a dee server.
+
+    By default it starts its own on an ephemeral port, so concurrent sweeps on
+    one machine cannot collide, and tears it down afterwards.
+    """
+
+    autostart: bool = True
+    # Attach to an already-running server instead of starting one. The sweep
+    # will not stop it.
+    url: str | None = None
+    bind: str = "127.0.0.1:0"
+    startup_timeout_s: int = 60
+
+
+@dataclass(frozen=True)
 class ExecutionConfig:
     repetitions: int = 5
     warmups: int = 1
@@ -111,7 +148,7 @@ class ExecutionConfig:
 class BenchConfig:
     name: str
     dag_bench: Path
-    dee_cli: Path
+    dee_bin: Path
     output_dir: Path
     verbosity: Verbosity
     matrix: dict[str, list[Any]]
@@ -119,6 +156,7 @@ class BenchConfig:
     dee_opt: dict[str, list[Any]]
     backends: dict[str, dict[str, Any]]
     execution: ExecutionConfig
+    server: ServerConfig = field(default_factory=ServerConfig)
     source_path: Path | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -215,11 +253,15 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
     if not (dag_bench / "projects").is_dir():
         raise ConfigError(f"dag_bench={dag_bench} has no projects/ directory")
 
-    dee_cli = resolve_path(raw.get("dee_cli") or "../../target/release/dee-cli")
-    if not dee_cli.exists():
+    # `dee_cli` is the pre-server name for the same setting; accepted so an
+    # existing config keeps working.
+    dee_bin = resolve_path(
+        raw.get("dee_bin") or raw.get("dee_cli") or "../../target/release/dee"
+    )
+    if not dee_bin.exists():
         raise ConfigError(
-            f"dee_cli={dee_cli} does not exist. Build it with `cargo build --release` "
-            "in the dee checkout, or point `dee_cli` at the binary."
+            f"dee_bin={dee_bin} does not exist. Build it with `cargo build --release` "
+            "in the dee checkout, or point `dee_bin` at the binary."
         )
     output_dir = resolve_path(raw.get("output_dir") or f"results/{name}")
 
@@ -326,10 +368,28 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
     if execution.warmups < 0:
         raise ConfigError("execution.warmups must not be negative")
 
+    # --- server -----------------------------------------------------------
+    server_raw = raw.get("server") or {}
+    if not isinstance(server_raw, dict):
+        raise ConfigError("server must be a mapping")
+    unknown = set(server_raw) - {"autostart", "url", "bind", "startup_timeout_s"}
+    if unknown:
+        raise ConfigError(f"server: unknown key(s): {', '.join(sorted(unknown))}")
+    server = ServerConfig(**server_raw)
+    if server.url and server.autostart:
+        # Attaching and starting are mutually exclusive; picking one silently
+        # would leave a stray server behind or talk to the wrong one.
+        server = ServerConfig(
+            autostart=False,
+            url=server.url,
+            bind=server.bind,
+            startup_timeout_s=server.startup_timeout_s,
+        )
+
     return BenchConfig(
         name=name,
         dag_bench=dag_bench,
-        dee_cli=dee_cli,
+        dee_bin=dee_bin,
         output_dir=output_dir,
         verbosity=verbosity,
         matrix=matrix,
@@ -337,6 +397,7 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
         dee_opt=dee_opt,
         backends=backends,
         execution=execution,
+        server=server,
         source_path=source_path,
         raw=raw,
     )

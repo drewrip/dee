@@ -4,9 +4,17 @@ authors.workspace = true
 version.workspace = true
 edition.workspace = true
 
+# The package keeps its name because the workspace's library crate owns `dee`,
+# but the binary people actually type is `dee`.
+[[bin]]
+name = "dee"
+path = "src/main.rs"
+
 [dependencies]
 dee = { path = "../dee" }
-clap = { version = "4.5.60", features = ["derive"] }
+dee-server = { path = "../dee-server" }
+clap = { version = "4.5.60", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 env_logger = "0.11.9"
 log = "0.4.29"
 tokio = { version = "1.50.0", features = ["full"] }

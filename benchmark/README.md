@@ -52,7 +52,7 @@ A config describes an *experiment matrix*, not a single run. Any key under
 ```yaml
 name: my-eval
 dag_bench: ${DAG_BENCH}
-dee_cli: ../../target/release/dee-cli
+dee_bin: ../../target/release/dee
 output_dir: ../results/my-eval
 verbosity: detailed              # summary | standard | detailed | full
 
@@ -150,23 +150,54 @@ dee-bench viz results/my-eval --only payback --format png,pdf
 
 ## How measurements are taken
 
-**Timing.** `dee-cli run --repeat N --warmups W` executes every repetition
-inside one process, so `runs.engine_wall_ms` measures the DAG rather than CLI
-startup, connection-pool construction and cleanup. `subprocess_wall_ms` records
-the outer bound for comparison.
+**Timing.** A trigger carries the cell's `warmups` and `repetitions`, and the
+whole series executes inside one dee server against one already-warm connection
+pool. So `runs.engine_wall_ms` measures the DAG rather than process startup,
+pool construction and cleanup. `phase_wall_ms` records the client-observed outer
+bound for comparison.
 
 **CPU and memory.** Sampled externally by the harness from `/proc` (the dee
-process tree) and cgroup counters (the Postgres container), as counter deltas
-rather than sampled percentages. This matters more than it sounds: on Postgres
-the dee process burns ~0.1 CPU-seconds while the server does ~96, so anything
-measured only inside dee would describe the orchestrator, not the work. dee's
-own connector samples are still recorded, tagged `source: engine_internal`, as
-supplementary engine-level detail.
+server's process tree) and cgroup counters (the Postgres container), as counter
+deltas rather than sampled percentages. This matters more than it sounds: on
+Postgres the dee process burns ~0.1 CPU-seconds while the server does ~96, so
+anything measured only inside dee would describe the orchestrator, not the work.
+dee's own connector samples are still recorded, tagged
+`source: engine_internal`, as supplementary engine-level detail.
+
+**What the shared server costs.** dee is now one long-lived process for the
+whole sweep rather than a fresh child per phase, which is what makes pool reuse
+possible. CPU and IO are unaffected, because the sampler baselines its counters
+when it attaches and reports deltas. `peak_rss_bytes` *is* affected: resident
+memory is absolute, so a previous cell's DuckDB buffer pool is still resident
+when the next one starts. Use `peak_engine_mem_bytes`, which comes from dee's
+own connector sampling, for memory studies.
 
 **A cross-backend caveat.** DuckDB's per-operator plan timings are CPU time;
 Postgres's are wall time. The optimizer's cost ranking therefore means
 something different on each, so every run records `plan_time_basis` and the two
 must not be silently averaged together.
+
+## The dee server
+
+The harness starts one `dee serve` per sweep, on an ephemeral port so
+concurrent sweeps cannot collide, and stops it on exit. Each prepared project
+registers its own connection and submits its DAG; because every cell builds its
+own warehouse, connections are re-registered per preparation, which is what
+evicts the pool still holding the previous cell's database file.
+
+The server's metadata database is written to `<run_dir>/metadata.duckdb` and is
+an artifact of the sweep in its own right — it holds every run, node timing and
+optimizer decision as queryable tables, alongside the parquet:
+
+```sql
+SELECT d.name, r.dag_version, count(*) AS runs, round(median(r.duration_ms))
+FROM runs r JOIN dags d USING (dag_id)
+WHERE r.status = 'succeeded' AND r.phase = 'measure'
+GROUP BY 1, 2;
+```
+
+To point a sweep at a server you manage yourself, set `server.url`; the harness
+will use it and will not stop it.
 
 ## Infrastructure
 

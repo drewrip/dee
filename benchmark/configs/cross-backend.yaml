@@ -5,7 +5,7 @@
 # has a local server on the default port, and the benchmark must never touch it.
 name: cross-backend
 dag_bench: ${DAG_BENCH}
-dee_cli: ../../target/release/dee-cli
+dee_bin: ../../target/release/dee
 output_dir: ../results/cross-backend
 verbosity: detailed
 

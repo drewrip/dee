@@ -1,5 +1,5 @@
 [workspace]
-members = ["dee", "dee-cli"]
+members = ["dee", "dee-cli", "dee-server"]
 resolver = "3"
 
 [workspace.package]

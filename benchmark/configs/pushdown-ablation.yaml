@@ -20,7 +20,7 @@
 # ~20s on postgres, so the signal is unambiguous there.
 name: pushdown-ablation
 dag_bench: ${DAG_BENCH}
-dee_cli: ../../target/release/dee-cli
+dee_bin: ../../target/release/dee
 output_dir: ../results/pushdown-ablation
 verbosity: detailed
 

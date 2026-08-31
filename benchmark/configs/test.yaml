@@ -6,7 +6,7 @@
 #   dee-bench status <run_dir>
 name: full-eval
 dag_bench: ${DAG_BENCH}
-dee_cli: ../../target/release/dee-cli
+dee_bin: ../../target/release/dee
 output_dir: ../results/full-eval
 verbosity: detailed
 

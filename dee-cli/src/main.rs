@@ -5,56 +5,71 @@ use serde::Serialize;
 use std::error::Error;
 use std::fs;
 
-pub mod opt;
-pub mod run;
+pub mod client;
+pub mod connection;
+pub mod dag;
+pub mod optimize;
+pub mod runs;
+pub mod schedule;
+pub mod serve;
 
 #[derive(Parser)]
 pub struct CliArgs {
+    /// Base URL of the dee server.
+    #[arg(long, global = true, env = "DEE_SERVER", default_value = "http://127.0.0.1:8471")]
+    server: String,
+
     #[command(subcommand)]
     command: CliCommand,
 }
 
 #[derive(Subcommand)]
 pub enum CliCommand {
-    Run(RunCommand),
-    Opt(OptCommand),
+    /// Run the dee server: the DAG registry, scheduler and run history.
+    Serve(ServeCommand),
+    /// Manage the server's named connection targets.
+    #[command(subcommand_value_name = "SUBCOMMAND")]
+    Connection(connection::ConnectionCommand),
+    /// Submit and inspect DAGs in the server's registry.
+    #[command(subcommand_value_name = "SUBCOMMAND")]
+    Dag(dag::DagCommand),
+    /// Run a DAG now.
+    Trigger(runs::TriggerCommand),
+    /// Inspect run history.
+    #[command(subcommand_value_name = "SUBCOMMAND")]
+    Runs(runs::RunsCommand),
+    /// Cancel a run or run group.
+    Cancel {
+        /// A run id or a run group id.
+        id: String,
+    },
+    /// Optimize a registered DAG.
+    Optimize(optimize::OptimizeCommand),
+    /// Put DAGs on a cron schedule.
+    #[command(subcommand_value_name = "SUBCOMMAND")]
+    Schedule(schedule::ScheduleCommand),
+    /// Render a DAG definition file as SVG or graphviz DOT. Runs locally.
     Draw(DrawCommand),
+    /// Convert a dbt manifest into a dee DAG definition. Runs locally.
     Convert(ConvertCommand),
 }
 
 #[derive(Args)]
-pub struct RunCommand {
-    #[arg(short, long)]
-    connections: String,
-    #[arg(short, long)]
-    target: String,
-    #[arg(long, action)]
-    profile: bool,
+pub struct ServeCommand {
+    /// Address to listen on. Use port 0 to let the OS choose; the chosen
+    /// address is printed on stdout.
     #[arg(long)]
-    profile_dump: Option<String>,
+    bind: Option<String>,
+    /// Metadata database file. Defaults to `$DEE_HOME/dee.duckdb`, else
+    /// `~/.dee/dee.duckdb`. Must not be a warehouse database.
     #[arg(long)]
-    profile_viz: Option<String>,
+    metadata_db: Option<String>,
+    /// How often the scheduler checks for due DAGs.
     #[arg(long)]
-    profile_interval_ms: Option<u64>,
+    tick_interval_ms: Option<u64>,
+    /// Maximum DAG runs executing at once across all DAGs.
     #[arg(long)]
-    dump_plans: Option<String>,
-    /// Execute each DAG this many times inside a single process, so
-    /// per-repetition timings exclude process startup, connection-pool
-    /// creation and the initial cleanup. Each repetition is reported
-    /// separately.
-    #[arg(long, default_value_t = 1)]
-    repeat: usize,
-    /// Untimed repetitions run before the measured ones, to warm the page
-    /// cache and the engine. Reported with `phase = "warmup"`.
-    #[arg(long, default_value_t = 0)]
-    warmups: usize,
-    /// Write the machine-readable `ProfileReport` JSON here. Implies
-    /// profiling. This is what the benchmarking harness consumes.
-    #[arg(long)]
-    report_json: Option<String>,
-
-    #[arg(required = true)]
-    dag_files: Vec<String>,
+    max_concurrent_runs: Option<usize>,
 }
 
 #[derive(Args)]
@@ -64,102 +79,6 @@ pub struct DrawCommand {
     dot: bool,
     #[arg(short, long)]
     output: Option<String>,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum CliOMPCentrality {
-    Outdegree,
-    Paths,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum CliHMPStrategy {
-    Breadth,
-    Greedy,
-}
-
-#[derive(Args)]
-pub struct OptCommand {
-    #[arg(short, long)]
-    connections: String,
-    #[arg(short, long)]
-    target: String,
-    #[arg(short, long)]
-    output: Option<String>,
-    #[arg(short, long, action)]
-    stats: bool,
-    #[arg(long)]
-    omp_top: Option<usize>,
-    #[arg(long, default_value = "outdegree")]
-    omp_node_centrality: CliOMPCentrality,
-
-    #[arg(long, value_delimiter = ',', conflicts_with = "disable")]
-    enable: Option<Vec<String>>,
-    #[arg(long, value_delimiter = ',', conflicts_with = "enable")]
-    disable: Option<Vec<String>>,
-
-    /// Rank HMP VIEW candidates by the total cost of the duplicate
-    /// computation they introduce downstream, instead of an estimated cost
-    /// to run the VIEW itself: for each operator in a materialized TABLE's
-    /// EXPLAIN ANALYZE plan, add its CPU cost to every candidate VIEW whose
-    /// own EXPLAIN plan contains that operator.
-    #[arg(long, action)]
-    hmp_downstream_cost: bool,
-    #[arg(long, default_value_t = 1)]
-    hmp_max_runs: usize,
-    #[arg(long, default_value_t = 0.5)]
-    hmp_top_cpu_time: f64,
-    /// Log a table of HMP operator rankings after the baseline run. Pass a
-    /// path to also write the table there, e.g. `--hmp-show-operators=out.txt`.
-    #[arg(long, num_args = 0..=1, default_missing_value = "")]
-    hmp_show_operators: Option<String>,
-    /// Log a table of HMP node rankings after the baseline run. Pass a path
-    /// to also write the table there, e.g. `--hmp-show-nodes=out.txt`.
-    #[arg(long, num_args = 0..=1, default_missing_value = "")]
-    hmp_show_nodes: Option<String>,
-    /// Rank HMP VIEW candidates by total CPU time divided by the View's
-    /// estimated cardinality (from its EXPLAIN plan), instead of raw total
-    /// CPU time.
-    #[arg(long, action)]
-    hmp_normalize_with_cardinality: bool,
-    /// Choose the search strategy HMP uses to select which VIEWs to
-    /// materialize. `breadth` (default) tries all k-sized combinations
-    /// smallest-first. `greedy` walks the node ranking and commits each
-    /// materialization that improves performance.
-    #[arg(long, default_value = "breadth")]
-    hmp_strategy: CliHMPStrategy,
-    /// Number of hypotheses the `greedy` strategy's beam search keeps alive
-    /// at each step. Unused by the `breadth` strategy.
-    #[arg(long, default_value_t = 2)]
-    hmp_beam_width: usize,
-    /// Disable running the PushdownPass before evaluating each HMP
-    /// materialization candidate. Enabled by default for more accurate cost
-    /// measurements.
-    #[arg(long, action)]
-    hmp_no_pushdown: bool,
-    #[arg(long, action)]
-    omp_exhaust: bool,
-    /// Disable running the PushdownPass before evaluating each OMP
-    /// materialization candidate. Enabled by default for more accurate cost
-    /// measurements.
-    #[arg(long, action)]
-    omp_no_pushdown: bool,
-    /// Capture a CPU/memory/disk timeseries for every HMP/OMP candidate run
-    /// and include it in each iteration's `--stats` output.
-    #[arg(long, action)]
-    profile_iterations: bool,
-    /// Write an HTML report explaining what each enabled pass did and why.
-    /// Pass a path to choose the output file, e.g. `--explain=out.html`;
-    /// bare `--explain` writes to `explain.html`.
-    #[arg(long, num_args = 0..=1, default_missing_value = "explain.html")]
-    explain: Option<String>,
-    /// Write the machine-readable `OptimizeReport` JSON here. This is what
-    /// the benchmarking harness consumes; `--stats` remains the
-    /// human-oriented stdout dump.
-    #[arg(long)]
-    report_json: Option<String>,
-
-    dag_file: String,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -178,7 +97,12 @@ pub struct ConvertCommand {
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    // Default to `info` so the server narrates what it is doing -- crash
+    // recovery, schedule fires, released pools. RUST_LOG still wins.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,duckdb=warn,sqlx=warn"),
+    )
+    .init();
     let args = CliArgs::parse();
     if let Err(e) = run(args).await {
         eprintln!("error: {e}");
@@ -187,9 +111,20 @@ async fn main() {
 }
 
 async fn run(args: CliArgs) -> Result<(), Box<dyn Error>> {
+    let server = args.server.clone();
     match args.command {
-        CliCommand::Run(run_cmd) => run::run(run_cmd).await?,
-        CliCommand::Opt(opt_cmd) => opt::opt(opt_cmd).await?,
+        CliCommand::Serve(serve_cmd) => serve::serve(serve_cmd).await?,
+        CliCommand::Connection(cmd) => {
+            connection::run(&client::Client::new(&server), cmd).await?
+        }
+        CliCommand::Dag(cmd) => dag::run(&client::Client::new(&server), cmd).await?,
+        CliCommand::Trigger(cmd) => runs::trigger(&client::Client::new(&server), cmd).await?,
+        CliCommand::Runs(cmd) => runs::run(&client::Client::new(&server), cmd).await?,
+        CliCommand::Cancel { id } => runs::cancel(&client::Client::new(&server), id).await?,
+        CliCommand::Optimize(cmd) => {
+            optimize::optimize(&client::Client::new(&server), cmd).await?
+        }
+        CliCommand::Schedule(cmd) => schedule::run(&client::Client::new(&server), cmd).await?,
         CliCommand::Draw(draw_cmd) => {
             let dag_file: DagFile = serde_json::from_str(&fs::read_to_string(draw_cmd.dag_file)?)?;
             let dag = Dag::try_from(dag_file)?;

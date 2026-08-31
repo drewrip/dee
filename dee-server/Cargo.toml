@@ -1,0 +1,30 @@
+[package]
+name = "dee-server"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dee = { path = "../dee" }
+
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tokio = { version = "1.50.0", features = ["full"] }
+
+duckdb = { version = "1.10505.0", features = ["modern-full", "bundled"] }
+r2d2 = "0.8.10"
+
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10"
+croner = "3"
+
+uuid = { version = "1", features = ["v7"] }
+sha2 = "0.10"
+thiserror = "2.0.18"
+log = "0.4.29"
+
+[dev-dependencies]
+tempfile = "3.27.0"

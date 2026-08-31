@@ -67,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
     p_schema.add_argument("-o", "--output", help="Write to a file instead of stdout")
 
     p_doctor = sub.add_parser("doctor", help="Check the environment and clean up strays")
+    p_doctor.add_argument("--dee-bin", dest="dee_bin", default=None,
+                          help="dee binary to check against (default ../../target/release/dee)")
     p_doctor.add_argument("--clean", action="store_true",
                           help="Remove leftover dee-bench containers")
 
@@ -303,6 +305,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         projects = discover_projects(Path(dag_bench))
         print(f"  {len(projects)} project(s): {', '.join(projects)}")
 
+    ok = _check_optimizer_options(args) and ok
+
     strays = stray_containers()
     print(f"\nleftover dee-bench containers: {len(strays)}")
     for c in strays:
@@ -313,6 +317,70 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("  run with --clean to remove them")
 
     return 0 if ok else 1
+
+
+def _check_optimizer_options(args: argparse.Namespace) -> bool:
+    """Diff DEE_OPT_SPECS against the server's own option list.
+
+    `DEE_OPT_SPECS` mirrors `OptimizerConfig` in dee/src/opt.rs, and a mirror
+    that drifts silently is worse than no mirror: a sweep would keep sending an
+    option the optimizer no longer reads. The server publishes the real list at
+    /v1/optimizer/options, so this is a genuine contract check rather than a
+    guess parsed out of `--help`.
+    """
+    import tempfile
+
+    from .config import DEE_OPT_SPECS
+    from .server import DeeServer, ServerError
+
+    dee_bin = Path(getattr(args, "dee_bin", None) or "../../target/release/dee").resolve()
+    print(f"\ndee binary: {dee_bin if dee_bin.exists() else f'{dee_bin} NOT FOUND'}")
+    if not dee_bin.exists():
+        print("  build it with `cargo build --release`, or pass --dee-bin")
+        return False
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            with DeeServer(dee_bin, Path(tmp)) as client:
+                info = client.info()
+                server_options = {o["name"]: o for o in client.optimizer_options()}
+    except (ServerError, OSError) as e:
+        print(f"  could not start a server to check options: {e}")
+        return False
+
+    print(f"  version {info['version']}, metadata schema v{info['schema_version']}")
+
+    ours = {spec.config_field: spec for spec in DEE_OPT_SPECS}
+    missing = sorted(set(ours) - set(server_options))
+    extra = sorted(set(server_options) - set(ours))
+
+    print(f"\noptimizer options: {len(ours)} known here, {len(server_options)} on the server")
+    for name in missing:
+        print(f"  {name}: in dee-bench but not in the server -- remove it from DEE_OPT_SPECS")
+    for name in extra:
+        # Not every server option needs to be sweepable; the pass toggles are
+        # set from a variant's pass list rather than from dee_opt.
+        if name in ("run_hmp_pass", "run_omp_pass", "run_pushdown_pass"):
+            continue
+        print(f"  {name}: on the server but not in dee-bench -- consider adding it")
+
+    mismatched = []
+    for name, spec in ours.items():
+        server_option = server_options.get(name)
+        if not server_option:
+            continue
+        if spec.choices and server_option.get("choices"):
+            if tuple(spec.choices) != tuple(server_option["choices"]):
+                mismatched.append(
+                    f"  {name}: choices {spec.choices} here, "
+                    f"{tuple(server_option['choices'])} on the server"
+                )
+    for line in mismatched:
+        print(line)
+
+    if not missing and not mismatched:
+        print("  in sync")
+    return not missing and not mismatched
 
 
 def _finalize(run_dir: Path, skip_viz: bool = False) -> None:

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use log::{debug, info, warn};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -24,7 +24,8 @@ use crate::{
 
 /// Strategy HMP uses to search through the node ranking when deciding
 /// which VIEWs to materialize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HMPStrategy {
     /// Walk the node ranking, trying all k-sized combinations smallest-first
     /// (singles, pairs, triples, ...). This is the default / original behavior.

@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DagFile {
     pub metadata: Option<DagFileMetadata>,
     pub nodes: Vec<DagFileNode>,
     pub sources: Vec<DagFileSource>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DagFileMetadata {
     pub sql_dialect: Option<String>,
 }

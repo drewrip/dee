@@ -306,11 +306,11 @@ def ensure_scratch_repo_root(scratch_dir: Path, dag_bench: Path) -> None:
         shutil.copytree(src_utils, dest_utils, ignore=shutil.ignore_patterns("__pycache__"))
 
 
-def convert_dag(dee_cli: Path, prepared: PreparedProject) -> Path:
+def convert_dag(dee_bin: Path, prepared: PreparedProject) -> Path:
     """Convert the compiled dbt manifest into a dee DAG file."""
     run_cmd(
         [
-            str(dee_cli),
+            str(dee_bin),
             "convert",
             "--format",
             "dbt",
@@ -397,3 +397,32 @@ def read_profile_output(project_dir: Path, output: str) -> dict[str, Any]:
 def postgres_schema_for(project_dir: Path) -> str:
     """The postgres schema a project's sources live in."""
     return str(read_profile_output(project_dir, "postgres").get("schema") or "public")
+
+
+def connection_name(prepared: PreparedProject) -> str:
+    """A connection name unique to this prepared project.
+
+    Unique per (project, backend, scale factor) because each preparation builds
+    its own warehouse. Reusing one name across cells would leave the server's
+    cached pool holding the previous cell's database file open.
+    """
+    sf = f"{prepared.sf}".replace(".", "_")
+    return f"{prepared.project}_{prepared.backend}_sf{sf}"
+
+
+def register(client, prepared: PreparedProject, dag_name: str) -> tuple[str, dict]:
+    """Register this project's connection and DAG with the server.
+
+    Returns the connection name and the submit result. The connection is always
+    upserted: replacing the config changes its hash, which is what evicts a
+    pool still pointing at the previous cell's warehouse.
+    """
+    import json
+
+    target = connection_name(prepared)
+    config = json.loads(prepared.connections_json.read_text())[prepared.target]
+    client.register_connection(target, config)
+
+    definition = json.loads(prepared.dag_json.read_text())
+    submitted = client.submit_dag(dag_name, definition, target)
+    return target, submitted

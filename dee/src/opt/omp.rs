@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use itertools::{Itertools, repeat_n};
 use log::debug;
 use std::{marker::PhantomData, sync::Arc};
@@ -38,7 +39,8 @@ struct OMPExplainData {
     attempts: Vec<OMPAttempt>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OMPCentrality {
     #[default]
     OutDegree,

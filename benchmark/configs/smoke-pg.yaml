@@ -4,7 +4,7 @@
 # a local postgres there, and the benchmark must never touch it.
 name: smoke-pg
 dag_bench: ${DAG_BENCH}
-dee_cli: ../../target/release/dee-cli
+dee_bin: ../../target/release/dee
 output_dir: ../results/smoke-pg
 verbosity: detailed
 

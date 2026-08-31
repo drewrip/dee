@@ -2,7 +2,7 @@
 # marginal effect of each is visible rather than only the combined effect.
 name: ablation
 dag_bench: ${DAG_BENCH}
-dee_cli: ../../target/release/dee-cli
+dee_bin: ../../target/release/dee
 output_dir: ../results/ablation
 verbosity: detailed
 

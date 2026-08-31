@@ -1,0 +1,50 @@
+# Quick read on whether the pushdown pass helps. DuckDB, sf 0.1.
+#
+# The ladder separates pushdown's two distinct effects, which a plain
+# "hmp vs hmp+pushdown" comparison would conflate:
+#
+#   hmp                 materialization only, pushdown off everywhere
+#   hmp_then_pushdown   same search, then pushdown as a final rewrite
+#                       -> isolates the REWRITE
+#   hmp_pushdown        pushdown also runs inside HMP's candidate evaluation,
+#                       so it can change which materializations HMP picks
+#                       -> adds the effect on the SEARCH
+#
+# pushdown_only is included as a control: an unoptimized dbt DAG is views
+# terminating in tables, and pushdown only rewrites TempTable nodes, so it
+# should be a no-op. It is here to confirm that, not to compete.
+#
+# These DAGs run in well under a second at sf 0.1, so repetitions are high to
+# push the noise floor below the effects being measured.
+name: pushdown-smoke
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/pushdown-smoke
+verbosity: detailed
+
+matrix:
+  project: [p01_iot, p03_ecommerce, p06_logistics, p08_healthcare]
+  backend: [duckdb]
+  sf: [0.1]
+  variant: [unopt, pushdown_only, hmp, hmp_then_pushdown, hmp_pushdown]
+
+variants:
+  unopt:             {passes: []}
+  pushdown_only:     {passes: [pushdown]}
+  hmp:               {passes: [hmp], hmp_use_pushdown: false}
+  hmp_then_pushdown: {passes: [hmp, pushdown], hmp_use_pushdown: false}
+  hmp_pushdown:      {passes: [hmp, pushdown]}
+
+dee_opt:
+  hmp_max_runs: 4
+  hmp_strategy: breadth
+
+backends:
+  duckdb:
+    threads: 16
+    num_connections: 16
+
+execution:
+  repetitions: 9
+  warmups: 2
+  sample_interval_ms: 50

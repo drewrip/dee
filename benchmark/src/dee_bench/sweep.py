@@ -30,6 +30,7 @@ from .infra import make_backend
 from .infra.base import Backend, BackendContext
 from .matrix import Cell, cells_to_rows, expand, summarize
 from .runner import CellRunner
+from .server import DeeServer
 from .store import ResultStore
 from .workload import prepare
 
@@ -54,7 +55,7 @@ def provenance(cfg: BenchConfig) -> dict[str, Any]:
                 mem_total = int(line.split()[1]) * 1024
                 break
     return {
-        "dee_git_sha": git_sha(cfg.dee_cli.parent.parent.parent),
+        "dee_git_sha": git_sha(cfg.dee_bin.parent.parent.parent),
         "dag_bench_git_sha": git_sha(cfg.dag_bench),
         "harness_version": HARNESS_VERSION,
         "host": socket.gethostname(),
@@ -96,7 +97,7 @@ class Sweep:
         # somewhere else entirely.
         frozen = dict(self.cfg.raw)
         frozen["dag_bench"] = str(self.cfg.dag_bench)
-        frozen["dee_cli"] = str(self.cfg.dee_cli)
+        frozen["dee_bin"] = str(self.cfg.dee_bin)
         frozen["output_dir"] = str(self.run_dir)
         frozen["verbosity"] = self.cfg.verbosity.label()
         (self.run_dir / "config.yaml").write_text(yaml.safe_dump(frozen, sort_keys=False))
@@ -136,6 +137,22 @@ class Sweep:
         return counts
 
     def _execute(self, pending: list[Cell]) -> None:
+        # One server for the whole sweep, not one per cell. Connection pools
+        # then stay warm across cells, which is the same amortization the cell
+        # ordering already assumes for infrastructure and data preparation.
+        server = DeeServer(
+            self.cfg.dee_bin,
+            self.run_dir,
+            bind=self.cfg.server.bind,
+            url=self.cfg.server.url,
+            startup_timeout_s=self.cfg.server.startup_timeout_s,
+            timeout_s=self.cfg.execution.timeout_s,
+        )
+        with server as client:
+            self.log(f"    dee server at {client.url} (metadata: {self.run_dir}/metadata.duckdb)")
+            self._execute_cells(pending, client, server.pid)
+
+    def _execute_cells(self, pending: list[Cell], client, server_pid) -> None:
         prepared_key: tuple[str, str, float] | None = None
         prepared = None
 
@@ -159,9 +176,11 @@ class Sweep:
                     backend.prepare_scale(cell.project, cell.sf, prepared)
                     prepared_key = key
 
-                result = CellRunner(self.cfg, self.store, self.run_dir, self.log).run(
-                    cell, prepared, ctx
+                runner = CellRunner(
+                    self.cfg, self.store, self.run_dir, client, server_pid, self.log
                 )
+                runner.set_cgroup(ctx.cgroup)
+                result = runner.run(cell, prepared, ctx)
                 self._persist(cell, result)
 
                 elapsed = time.monotonic() - started

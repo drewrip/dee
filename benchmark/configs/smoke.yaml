@@ -2,7 +2,7 @@
 # Completes in a couple of minutes and exercises every stage of the harness.
 name: smoke
 dag_bench: ${DAG_BENCH}
-dee_cli: ../../target/release/dee-cli
+dee_bin: ../../target/release/dee
 output_dir: ../results/smoke
 verbosity: detailed
 
