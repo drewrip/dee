@@ -31,7 +31,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -237,8 +237,14 @@ class PhaseSampler:
         self._baselines: dict[str, Sample] = {}
 
     def attach(self, pid: int) -> None:
-        """Point the process-tree sampler at a newly launched process."""
+        """Point the process-tree sampler at the process to measure.
+
+        The baseline for that source is dropped, so the first sample taken
+        after attaching becomes it. Attaching to a different process therefore
+        rebases rather than carrying the previous one's counters.
+        """
         self._pid = pid
+        self._baselines.pop("harness_process", None)
 
     def start(self) -> "PhaseSampler":
         self._t0 = time.monotonic()
@@ -273,12 +279,14 @@ class PhaseSampler:
     def _take(self) -> None:
         elapsed_ms = int((time.monotonic() - self._t0) * 1000)
         for s in self._collect():
-            # The process tree's first sample is its own baseline: the
-            # subprocess starts at zero CPU, so nothing is subtracted. The
-            # container has been running since before the phase, so its
-            # counters must be rebased.
-            base = self._baselines.setdefault(s.source, s if s.source != "harness_process" else
-                                              Sample(s.source, 0, s.timestamp, 0.0, 0, 0, 0))
+            # Every source's first sample of the phase is its own baseline.
+            # Neither source starts at zero: the container has been running
+            # since before the phase, and the dee server is long-lived across
+            # the whole sweep, so both carry counters from work this phase did
+            # not do.
+            # A *copy*, because the sample itself is rebased in place below
+            # and a baseline aliasing it would zero itself out.
+            base = self._baselines.setdefault(s.source, replace(s))
             s.elapsed_ms = elapsed_ms
             s.cpu_seconds_cum = _delta(s.cpu_seconds_cum, base.cpu_seconds_cum)
             s.read_bytes = _delta(s.read_bytes, base.read_bytes)
