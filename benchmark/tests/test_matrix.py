@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 from types import SimpleNamespace
 
@@ -87,7 +89,7 @@ class TestSchedule:
 
 
 
-def _config(**matrix):
+def _config(backends=None, **matrix):
     """The slice of a BenchConfig that `expand` actually reads."""
     return SimpleNamespace(
         name="r",
@@ -98,7 +100,7 @@ def _config(**matrix):
             "unopt": Variant(name="unopt", passes=()),
             "hmp": Variant(name="hmp", passes=("hmp",)),
         },
-        backends={"duckdb": {}},
+        backends=backends or {"duckdb": [{}]},
         execution=SimpleNamespace(
             repetitions=3, warmups=1, repeat_mode="group",
             optimization_mode="batch", converge_runs=12,
@@ -168,3 +170,90 @@ def test_only_a_real_variant_is_continuous():
     by_variant = {c.variant.name: c for c in expand(cfg)}
     assert by_variant["hmp"].is_continuous
     assert not by_variant["unopt"].is_continuous
+
+
+# --- backend configurations ------------------------------------------------
+
+
+def _duckdb(*configs):
+    return {"duckdb": list(configs)}
+
+
+class TestBackendConfigs:
+    def test_each_configuration_becomes_its_own_cell(self):
+        cells = expand(_config(backends=_duckdb(
+            {"threads": 8, "max_memory": "1GB"},
+            {"threads": 8, "max_memory": "8GB"},
+        )))
+        assert len(cells) == 2
+        assert sorted(c.backend_config["max_memory"] for c in cells) == ["1GB", "8GB"]
+
+    def test_the_configuration_is_part_of_a_cells_identity(self):
+        # Two memory ceilings are two experiments over the same DAG, so they
+        # must not collapse into one cell and average two answers together.
+        cells = expand(_config(backends=_duckdb(
+            {"max_memory": "1GB"}, {"max_memory": "8GB"},
+        )))
+        assert len({c.cell_id for c in cells}) == 2
+
+    def test_an_unswept_backend_is_a_single_unlabelled_cell(self):
+        cells = expand(_config(backends=_duckdb({"threads": 8})))
+        assert len(cells) == 1
+        assert cells[0].backend_config_label == ""
+        assert cells[0].describe() == "p01_iot/duckdb/sf0.1/unopt"
+
+    def test_the_label_names_only_what_varies(self):
+        # `threads` is the same everywhere, so naming it in every label would
+        # be noise that hides the one setting the sweep is about.
+        cells = expand(_config(backends=_duckdb(
+            {"threads": 8, "max_memory": "1GB"},
+            {"threads": 8, "max_memory": "8GB"},
+        )))
+        assert sorted(c.backend_config_label for c in cells) == [
+            "max_memory=1GB", "max_memory=8GB",
+        ]
+        assert "duckdb[max_memory=1GB]" in expand(_config(backends=_duckdb(
+            {"threads": 8, "max_memory": "1GB"},
+            {"threads": 8, "max_memory": "8GB"},
+        )))[0].describe()
+
+    def test_a_duckdb_sweep_needs_no_new_backend_instance(self):
+        # Everything DuckDB reads arrives through the connection, so cells
+        # differing only in tuning share one in-process engine and one
+        # preparation.
+        cells = expand(_config(backends=_duckdb(
+            {"max_memory": "1GB"}, {"max_memory": "8GB"},
+        )))
+        assert len({c.backend_setup_id for c in cells}) == 1
+
+    def test_a_postgres_server_setting_needs_a_new_instance(self):
+        cells = expand(_config(
+            backend=["postgres"],
+            backends={"postgres": [
+                {"settings": {"work_mem": "64MB"}},
+                {"settings": {"work_mem": "1GB"}},
+            ]},
+        ))
+        assert len({c.backend_setup_id for c in cells}) == 2
+
+    def test_a_postgres_connection_setting_does_not(self):
+        cells = expand(_config(
+            backend=["postgres"],
+            backends={"postgres": [{"num_connections": 4}, {"num_connections": 16}]},
+        ))
+        assert len(cells) == 2
+        assert len({c.backend_setup_id for c in cells}) == 1
+
+    def test_cells_needing_one_instance_are_scheduled_together(self):
+        # Restarting a backend costs more than a preparation, so cells sharing
+        # an instance must not be interleaved with cells that need another.
+        cells = expand(_config(
+            backend=["postgres"],
+            project=["p01_iot", "p02_adtech"],
+            backends={"postgres": [
+                {"settings": {"work_mem": "64MB"}},
+                {"settings": {"work_mem": "1GB"}},
+            ]},
+        ))
+        setups = [c.backend_setup_id for c in cells]
+        assert len(list(itertools.groupby(setups))) == len(set(setups))

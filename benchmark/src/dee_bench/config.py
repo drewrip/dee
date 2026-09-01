@@ -1,8 +1,8 @@
 """Experiment configuration: load, validate and resolve a benchmark spec.
 
 A config is a YAML file describing an *experiment matrix* rather than a single
-run. Any key under ``matrix`` or ``dee_opt`` may be a list, and the harness
-expands the cross product (see :mod:`dee_bench.matrix`).
+run. Any key under ``matrix``, ``dee_opt`` or ``backends`` may be a list, and
+the harness expands the cross product (see :mod:`dee_bench.matrix`).
 
 The ``dee_opt`` keys mirror ``OptimizerConfig`` in ``dee/src/opt.rs`` one for
 one. :data:`DEE_OPT_SPECS` is the single place that mapping lives: it drives
@@ -12,6 +12,7 @@ from multiplying the matrix.
 
 from __future__ import annotations
 
+import itertools
 import os
 import re
 from dataclasses import dataclass, field
@@ -125,6 +126,36 @@ VALID_STEP_PHASES = ("before", "after", "both")
 VALID_BACKENDS = ("duckdb", "postgres")
 
 
+# Settings each backend understands, and what they mean.
+#
+# Declared rather than accepted loosely because these keys are sweepable: a
+# typo in a swept key would otherwise expand into several cells that differ
+# only in a setting nothing reads, and quietly measure the same thing several
+# times under different cell ids.
+BACKEND_KEYS: dict[str, frozenset[str]] = {
+    "duckdb": frozenset({"threads", "num_connections", "max_memory"}),
+    "postgres": frozenset({
+        "provider", "image", "host", "port", "user", "password", "dbname",
+        "cpus", "memory", "volume_suffix", "num_connections", "settings",
+    }),
+}
+
+# Settings that only describe how the harness *connects* to a backend that is
+# already up. Sweeping one of these needs no new instance: the harness rewrites
+# the prepared project's connections.json and dee replaces the pool on the next
+# cell. Everything else describes the instance itself -- a container's memory
+# ceiling, a postgres server setting -- so a cell that changes it needs the
+# backend brought up again.
+#
+# ``None`` means every setting is client side, which is DuckDB: it is an
+# in-process engine, so its whole configuration reaches it through the
+# connection and there is no instance to restart.
+BACKEND_CLIENT_KEYS: dict[str, frozenset[str] | None] = {
+    "duckdb": None,
+    "postgres": frozenset({"num_connections"}),
+}
+
+
 class ConfigError(Exception):
     """A benchmark config could not be loaded or validated."""
 
@@ -212,7 +243,10 @@ class BenchConfig:
     matrix: dict[str, list[Any]]
     variants: dict[str, Variant]
     dee_opt: dict[str, list[Any]]
-    backends: dict[str, dict[str, Any]]
+    # One entry per backend named in the matrix, holding every concrete
+    # configuration that backend is swept over. A backend block with no
+    # list-valued setting expands to a single configuration.
+    backends: dict[str, list[dict[str, Any]]]
     execution: ExecutionConfig
     server: ServerConfig = field(default_factory=ServerConfig)
     source_path: Path | None = None
@@ -252,6 +286,74 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
     return [value]
+
+
+def expand_backend_config(config: dict[str, Any], path: str = "") -> list[dict[str, Any]]:
+    """Expand a backend block into one concrete configuration per combination.
+
+    Any setting under ``backends.<name>`` may be a list, exactly as under
+    ``matrix`` and ``dee_opt``, and the block expands into the cross product --
+    which is how one run compares two DuckDB memory ceilings against each
+    other. Nested mappings (postgres ``settings``) expand the same way, so
+    ``settings.work_mem: [64MB, 512MB]`` is swept like anything else.
+    """
+    keys: list[str] = []
+    axes: list[list[Any]] = []
+    for key, value in config.items():
+        keys.append(key)
+        if isinstance(value, dict):
+            axes.append(expand_backend_config(value, f"{path}{key}."))
+        elif isinstance(value, list):
+            if not value:
+                raise ConfigError(
+                    f"backends.{path}{key} is an empty list; give it at least one value"
+                )
+            axes.append(value)
+        else:
+            axes.append([value])
+    return [dict(zip(keys, combo)) for combo in itertools.product(*axes)]
+
+
+def flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Flatten a backend configuration to dotted leaf paths."""
+    flat: dict[str, Any] = {}
+    for key, value in config.items():
+        if isinstance(value, dict):
+            flat.update(flatten_config(value, f"{prefix}{key}."))
+        else:
+            flat[f"{prefix}{key}"] = value
+    return flat
+
+
+def config_labels(configs: list[dict[str, Any]]) -> list[str]:
+    """Label each configuration by the settings that differ between them.
+
+    Only the swept settings appear, so a label reads as the one thing that
+    cell changed -- ``max_memory=8GB`` rather than the whole block. A backend
+    that is not swept has a single configuration and nothing to distinguish,
+    so every label is empty and cells describe themselves exactly as they did
+    before backend sweeps existed.
+    """
+    flat = [flatten_config(c) for c in configs]
+    varying = sorted(
+        key for key in {k for f in flat for k in f}
+        if len({str(f.get(key)) for f in flat}) > 1
+    )
+    return [",".join(f"{k}={f.get(k)}" for k in varying) for f in flat]
+
+
+def setup_config(backend: str, config: dict[str, Any]) -> dict[str, Any]:
+    """The part of `config` describing the backend *instance* rather than the
+    connection to it.
+
+    Two cells whose setup configurations agree can share one running backend;
+    two that disagree cannot, and the second needs it brought up again. See
+    :data:`BACKEND_CLIENT_KEYS`.
+    """
+    client = BACKEND_CLIENT_KEYS.get(backend, frozenset())
+    if client is None:
+        return {}
+    return {k: v for k, v in sorted(config.items()) if k not in client}
 
 
 def _coerce(spec: DeeOptSpec, value: Any) -> Any:
@@ -434,9 +536,19 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
     backends_raw = raw.get("backends") or {}
     if not isinstance(backends_raw, dict):
         raise ConfigError("`backends` must be a mapping")
-    backends: dict[str, dict[str, Any]] = {}
+    backends: dict[str, list[dict[str, Any]]] = {}
     for bname in matrix["backend"]:
-        backends[bname] = dict(backends_raw.get(bname) or {})
+        block = backends_raw.get(bname) or {}
+        if not isinstance(block, dict):
+            raise ConfigError(f"backends.{bname} must be a mapping")
+        known = BACKEND_KEYS.get(bname, frozenset())
+        unknown_keys = sorted(set(block) - known)
+        if unknown_keys:
+            raise ConfigError(
+                f"backends.{bname}: unknown setting(s) {', '.join(unknown_keys)}; "
+                f"expected one of {', '.join(sorted(known))}"
+            )
+        backends[bname] = expand_backend_config(block)
 
     # --- execution --------------------------------------------------------
     exec_raw = raw.get("execution") or {}

@@ -24,8 +24,11 @@ from typing import Any
 
 from .store import ResultStore, connect
 
-# Cell identity minus the variant: what a variant is compared against.
-GROUP_KEYS = ("project", "backend", "sf")
+# Cell identity minus the variant: what a variant is compared against. Backend
+# tuning is part of it because a run may sweep it -- a variant measured with an
+# 8GB DuckDB must be repaid against the baseline that also had 8GB, not against
+# whichever baseline happened to be found first.
+GROUP_KEYS = ("project", "backend", "sf", "backend_config")
 
 
 def _median(values: list[float]) -> float | None:
@@ -82,6 +85,7 @@ def compute_payback(run_dir: str | Path) -> list[dict[str, Any]]:
     # distribution rather than a pre-aggregated mean.
     measurements = con.sql("""
         SELECT c.cell_id, c.run_name, c.project, c.backend, c.sf, c.variant,
+               c.backend_config,
                r.engine_wall_ms / 1000.0 AS wall_s,
                r.cpu_seconds,
                r.dag_version
@@ -107,13 +111,15 @@ def compute_payback(run_dir: str | Path) -> list[dict[str, Any]]:
             converged_version[cell_id] = int(version)
 
     by_cell: dict[str, dict[str, Any]] = {}
-    for cell_id, run_name, project, backend, sf, variant, wall_s, cpu_s, version in measurements:
+    for (cell_id, run_name, project, backend, sf, variant, backend_config,
+         wall_s, cpu_s, version) in measurements:
         wanted = converged_version.get(cell_id)
         if wanted is not None and version is not None and int(version) != wanted:
             continue
         entry = by_cell.setdefault(cell_id, {
             "cell_id": cell_id, "run_name": run_name, "project": project,
             "backend": backend, "sf": float(sf), "variant": variant,
+            "backend_config": backend_config,
             "wall": [], "cpu": [],
         })
         entry["wall"].append(float(wall_s))
@@ -173,6 +179,7 @@ def compute_payback(run_dir: str | Path) -> list[dict[str, Any]]:
             "run_name": entry["run_name"],
             "project": entry["project"],
             "backend": entry["backend"],
+            "backend_config": entry["backend_config"],
             "sf": entry["sf"],
             "variant": entry["variant"],
             "cell_id": entry["cell_id"],

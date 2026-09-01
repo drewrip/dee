@@ -46,6 +46,10 @@ class PreparedProject:
     backend: str
     sf: float
     project_dir: Path
+    # The dag-bench source the project was copied from. Kept because the
+    # connection is rewritten per cell (see `apply_backend_config`) and the
+    # postgres profile it falls back on lives in the original checkout.
+    src_dir: Path
     dag_json: Path
     connections_json: Path
     target: str
@@ -244,6 +248,7 @@ def prepare(
         backend=backend,
         sf=sf,
         project_dir=dest,
+        src_dir=src,
         dag_json=dest / "dag.json",
         connections_json=connections_json,
         target=target,
@@ -377,6 +382,25 @@ def write_connections(
     path = dest / "connections.json"
     path.write_text(json.dumps({target: cfg}, indent=2))
     return path, target
+
+
+def apply_backend_config(
+    prepared: PreparedProject,
+    backend_config: dict[str, Any],
+    postgres: dict[str, Any] | None = None,
+) -> None:
+    """Point a prepared project's connection at `backend_config`.
+
+    Cells sharing one preparation can still differ in their backend tuning --
+    two DuckDB memory ceilings over the same compiled project are two cells,
+    not one. Only the connection differs between them, and `register` upserts
+    it per cell, so rewriting the file is enough and the expensive part of the
+    preparation is not repeated.
+    """
+    write_connections(
+        prepared.project_dir, prepared.src_dir, prepared.backend,
+        backend_config, prepared.warehouse, postgres,
+    )
 
 
 def read_profile_output(project_dir: Path, output: str) -> dict[str, Any]:

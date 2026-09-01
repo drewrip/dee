@@ -376,7 +376,7 @@ PLANS = Table(
 
 PAYBACK = Table(
     name="payback",
-    grain="one row per project x backend x sf x variant",
+    grain="one row per project x backend x backend config x sf x variant",
     doc=(
         "How many DAG runs it takes to repay the cost of optimizing (study "
         "3). Derived from `optimizations` and `runs` by `dee-bench analyze`, "
@@ -391,6 +391,7 @@ PAYBACK = Table(
         Column("run_name", pa.string(), "Benchmark run these figures come from."),
         Column("project", pa.string(), "dag-bench project."),
         Column("backend", pa.string(), "'duckdb' or 'postgres'."),
+        Column("backend_config", pa.string(), "JSON of the backend tuning both cells ran under. A variant is only ever repaid against the baseline that shared its tuning, so this holds for the baseline too."),
         Column("sf", pa.float64(), "Scale factor."),
         Column("variant", pa.string(), "Optimizer variant being repaid."),
         Column("cell_id", pa.string(), "Cell the optimized measurements come from."),

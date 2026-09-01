@@ -3,7 +3,10 @@
 The scheduler groups cells by ``(backend, sf, project)`` so infrastructure and
 data preparation are amortized. Preparing a project at a scale factor costs far
 more than running one DAG, so every variant and repetition sharing a dataset
-runs back to back against a single preparation.
+runs back to back against a single preparation. A swept backend setting that
+describes the instance itself groups above that, since changing it means
+bringing the backend up again; one that only describes the connection costs a
+rewritten connections.json per cell and nothing more.
 
 Teardown always happens, including on interruption, and never touches results.
 """
@@ -32,7 +35,7 @@ from .matrix import Cell, cells_to_rows, expand, summarize
 from .runner import CellRunner
 from .server import ApiError, DeeServer, ServerError
 from .store import ResultStore
-from .workload import prepare
+from .workload import apply_backend_config, prepare
 
 
 def git_sha(path: Path) -> str | None:
@@ -78,7 +81,10 @@ class Sweep:
         self.store = ResultStore(self.run_dir, cfg.verbosity)
         self.queue = q.RunQueue(self.run_dir)
         self.cells: list[Cell] = expand(cfg)
-        self._backends: dict[str, Backend] = {}
+        # Keyed by (backend name, setup id): a backend whose instance-level
+        # configuration is swept has one entry per configuration, only one of
+        # which is ever running.
+        self._backends: dict[tuple[str, str], Backend] = {}
 
     # -- setup -------------------------------------------------------------
 
@@ -209,7 +215,7 @@ class Sweep:
                 )
 
     def _execute_cells(self, pending: list[Cell], client, server_pid) -> None:
-        prepared_key: tuple[str, str, float] | None = None
+        prepared_key: tuple[str, str, str, float] | None = None
         prepared = None
 
         for i, cell in enumerate(pending, 1):
@@ -217,9 +223,12 @@ class Sweep:
             self.log(f"[{i}/{len(pending)}] {cell.describe()}  ({cell.cell_id})")
             self.queue.mark_running(cell.cell_id, cell.describe())
             try:
-                backend, ctx = self._backend_for(cell.backend)
+                backend, ctx = self._backend_for(cell)
 
-                key = (cell.backend, cell.project, cell.sf)
+                # The backend instance is part of the key: a restart resets
+                # what the backend has loaded, so its datasets must be
+                # prepared against it again.
+                key = (cell.backend, cell.backend_setup_id, cell.project, cell.sf)
                 if key != prepared_key:
                     self.log(f"    preparing {cell.project} at sf={cell.sf:g} for {cell.backend}")
                     prepared = prepare(
@@ -231,6 +240,10 @@ class Sweep:
                     )
                     backend.prepare_scale(cell.project, cell.sf, prepared)
                     prepared_key = key
+                # Cells sharing a preparation may still differ in their
+                # backend tuning, so the connection is written per cell rather
+                # than per preparation.
+                apply_backend_config(prepared, cell.backend_config, ctx.postgres)
 
                 runner = CellRunner(
                     self.cfg, self.store, self.run_dir, client, server_pid, self.log
@@ -261,17 +274,27 @@ class Sweep:
             if rows:
                 self.store.write(table, rows, cell_id=cell.cell_id)
 
-    def _backend_for(self, name: str) -> tuple[Backend, BackendContext]:
-        if name not in self._backends:
+    def _backend_for(self, cell: Cell) -> tuple[Backend, BackendContext]:
+        key = (cell.backend, cell.backend_setup_id)
+        if key not in self._backends:
+            # One instance of a backend at a time: a second postgres container
+            # would collide with the first on its name and published port. A
+            # cell whose configuration describes a different instance
+            # therefore replaces the running one, which the cell ordering
+            # keeps down to one changeover per configuration.
+            for existing in [k for k in self._backends if k[0] == cell.backend]:
+                self.log(f"  backend configuration changed; restarting {cell.backend}")
+                with suppress(Exception):
+                    self._backends.pop(existing).teardown()
             backend = make_backend(
-                name, self.cfg.backends.get(name), dag_bench=self.cfg.dag_bench,
+                cell.backend, cell.backend_config, dag_bench=self.cfg.dag_bench,
                 fresh=self.fresh, keep=self.keep_infra, log=self.log,
             )
             self.log(f"  bringing up {backend.describe()}")
             ctx = backend.setup()
-            self._backends[name] = backend
+            self._backends[key] = backend
             backend._ctx = ctx  # type: ignore[attr-defined]
-        backend = self._backends[name]
+        backend = self._backends[key]
         return backend, backend._ctx  # type: ignore[attr-defined]
 
     def _teardown_all(self) -> None:

@@ -1,0 +1,38 @@
+# What is a memory ceiling worth? One project, one scale factor, three DuckDB
+# memory limits, each measured unoptimized and under HMP.
+#
+# Everything DuckDB reads arrives through the connection, so the three ceilings
+# share one prepared dataset and one in-process engine -- the sweep costs the
+# extra runs and nothing else. Payback is computed per ceiling, against the
+# baseline that ran under the same one.
+name: duckdb-memory
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/duckdb-memory
+verbosity: detailed
+
+matrix:
+  project: [p01_iot]
+  backend: [duckdb]
+  sf: [0.5]
+  variant: [unopt, hmp]
+
+variants:
+  unopt: {passes: []}
+  hmp:   {passes: [hmp], hmp_use_pushdown: false}
+
+dee_opt:
+  hmp_max_runs: 3
+  hmp_strategy: breadth
+
+backends:
+  duckdb:
+    threads: 8
+    num_connections: 16
+    # The swept axis: six cells, two variants at each ceiling.
+    max_memory: [1GB, 4GB, 16GB]
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100

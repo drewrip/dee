@@ -7,8 +7,10 @@ returning a :class:`Study`. A study with no data returns an explicit
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
+from ..config import config_labels
 from .spec import ChartSpec, Series, Study
 from .theme import ordered
 
@@ -22,6 +24,63 @@ def _rows(con, sql: str) -> list[tuple]:
         return con.sql(sql).fetchall()
     except Exception:  # noqa: BLE001 - a missing table is a normal partial-run state
         return []
+
+
+def label_backends(con) -> None:
+    """Fold swept backend tuning into the `backend` column of every view.
+
+    A study identifies a measurement by project, backend, scale factor and
+    variant. When a run sweeps backend settings, two cells agree on all four
+    and differ only in their tuning, so one would silently overwrite the other
+    in every chart and table. Rewriting `backend` as ``duckdb[max_memory=8GB]``
+    separates them everywhere at once, and reads as what actually differs --
+    rather than teaching each study about backend configurations one by one.
+
+    A run that sweeps nothing has one configuration per backend, no label to
+    add, and its views are left exactly as they were.
+    """
+    tables = _tables(con)
+    if "cells" not in tables:
+        return
+
+    by_backend: dict[str, set[str]] = {}
+    for backend, config in _rows(con, "SELECT DISTINCT backend, backend_config FROM cells"):
+        by_backend.setdefault(backend, set()).add(config or "{}")
+
+    mapping: dict[tuple[str, str], str] = {}
+    for backend, configs in by_backend.items():
+        ordered_configs = sorted(configs)
+        labels = config_labels([json.loads(c) for c in ordered_configs])
+        for config, label in zip(ordered_configs, labels):
+            mapping[(backend, config)] = f"{backend}[{label}]" if label else backend
+    if all(label == backend for (backend, _), label in mapping.items()):
+        return
+
+    con.execute(
+        "CREATE OR REPLACE TEMP TABLE backend_labels"
+        "(backend VARCHAR, backend_config VARCHAR, label VARCHAR)"
+    )
+    con.executemany(
+        "INSERT INTO backend_labels VALUES (?, ?, ?)",
+        [[backend, config, label] for (backend, config), label in mapping.items()],
+    )
+    for table in ("cells", "payback"):
+        if table not in tables:
+            continue
+        columns = {c[0] for c in _rows(con, f"DESCRIBE {table}")}
+        # A payback table computed before backend sweeps existed has no
+        # tuning to join on. Leaving it alone is right: it cannot have swept
+        # one either.
+        if not {"backend", "backend_config"} <= columns:
+            continue
+        con.execute(f"CREATE OR REPLACE TEMP TABLE _{table}_raw AS SELECT * FROM {table}")
+        con.execute(f"DROP VIEW {table}")
+        con.execute(
+            f"CREATE VIEW {table} AS "
+            f"SELECT r.* REPLACE (COALESCE(l.label, r.backend) AS backend) "
+            f"FROM _{table}_raw r "
+            f"LEFT JOIN backend_labels l USING (backend, backend_config)"
+        )
 
 
 def _drop_empty_labels(labels: list[str], by_variant: dict[str, list]) -> tuple[list[str], dict[str, list]]:
@@ -430,6 +489,12 @@ BUILDERS = [
 
 
 def build_all(con) -> list[Study]:
+    # Before any study runs, so every one of them sees backends that already
+    # name the tuning they were measured under.
+    try:
+        label_backends(con)
+    except Exception:  # noqa: BLE001 - labelling must never lose the studies
+        pass
     out = []
     for fn in BUILDERS:
         try:

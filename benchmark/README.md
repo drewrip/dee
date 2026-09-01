@@ -71,8 +71,8 @@ dee_opt:                         # every dee optimizer option; lists sweep
   hmp_max_runs: [1, 4]
   hmp_strategy: [breadth, greedy]
 
-backends:
-  duckdb:   {threads: 16, max_memory: 16GB, num_connections: 16}
+backends:                        # backend tuning; lists sweep here too
+  duckdb:   {threads: 16, max_memory: [4GB, 16GB], num_connections: 16}
   postgres:
     provider: container          # or `external` to use a server you run
     image: postgres:18
@@ -91,6 +91,42 @@ execution:
 Every `dee_opt` key mirrors a field of `OptimizerConfig` in
 `dee/src/opt.rs`; `src/dee_bench/config.py` holds the mapping, including which
 passes read each option.
+
+### Sweeping backend configuration
+
+Any setting under `backends.<name>` may be a list, exactly as under `matrix`
+and `dee_opt`, and the block expands into one cell per combination — which is
+how a run asks what a DuckDB memory ceiling is worth:
+
+```yaml
+backends:
+  duckdb:
+    threads: 16
+    max_memory: [1GB, 4GB, 16GB]   # three cells per variant, one per ceiling
+```
+
+Nested settings expand the same way, so `settings: {work_mem: [64MB, 512MB]}`
+sweeps a Postgres server setting. `configs/duckdb-memory.yaml` is a worked
+example.
+
+The tuning is part of a cell's identity, so two ceilings are two experiments
+rather than one counted twice, and `analyze` only ever repays a variant against
+the baseline that shared its tuning. Cells carry a label naming just the
+settings that vary — `duckdb[max_memory=8GB]` — which is what the console, the
+charts and the dashboard tables identify them by.
+
+What a swept setting costs depends on what it describes. DuckDB is in-process,
+so its whole configuration arrives through the connection: cells differing only
+in tuning share one preparation and one engine, and cost nothing beyond a
+rewritten `connections.json`. A setting describing a Postgres *instance* — its
+container memory, its server settings — means bringing the backend up again, so
+those cells are scheduled together and the backend changes over once per
+configuration. `num_connections` is the exception there: it only describes the
+connection, so sweeping it restarts nothing.
+
+Settings are validated against what each backend understands, because a typo in
+a swept key would otherwise expand into several cells that differ only in a
+setting nothing reads.
 
 ### Batch and continuous optimization
 
@@ -138,8 +174,10 @@ importantly, stops identical experiments being double-counted in aggregates.
 
 Cells are ordered by `(backend, sf, project)` so infrastructure and data
 preparation are amortized: a scale factor's data is generated and loaded once,
-then every variant and repetition sharing it runs back to back. Cells run
-strictly one at a time — concurrency would destroy timing fidelity.
+then every variant and repetition sharing it runs back to back. A swept backend
+setting that describes the instance itself groups above that, since changing it
+costs a restart rather than a preparation. Cells run strictly one at a time —
+concurrency would destroy timing fidelity.
 
 ## Results
 
