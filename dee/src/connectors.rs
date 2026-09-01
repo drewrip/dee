@@ -17,12 +17,19 @@ pub enum ConnectorError {
     Execute(String),
 }
 
-/// What can be pushed down into a single relation, as reported by a
+/// What can be pushed down into **one scan** of a relation, as reported by a
 /// connector's native query planner (e.g. DuckDB's `EXPLAIN (FORMAT JSON)`).
 ///
-/// `projections` are the column names the plan actually reads from the
-/// relation; `filters` are raw SQL predicate strings (in the connector's own
-/// dialect) that the plan applies directly against a scan of the relation.
+/// `projections` are the column names that scan actually reads; `filters` are
+/// raw SQL predicate strings (in the connector's own dialect) that the plan
+/// applies directly against that scan, and are **conjuncts** — the scan keeps
+/// a row only if every one of them holds.
+///
+/// One query can scan the same relation more than once (a self-join, or two
+/// branches of a UNION), and each such scan gets its own `PushdownInfo`,
+/// which is why [`Connector::pushdown`] reports a `Vec` per relation. Merging
+/// them would be unsound: two scans' filters are alternatives (the relation
+/// must keep every row either scan reads), never conjuncts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PushdownInfo {
     pub projections: Vec<String>,
@@ -64,7 +71,10 @@ pub trait Connector {
     async fn get_schema(&self, name: String) -> Option<Result<SchemaRef, ConnectorError>>;
 
     /// Ask the connector's own query planner what can be pushed down into
-    /// each relation `query_text` scans, keyed by relation name.
+    /// each relation `query_text` scans, keyed by relation name — one
+    /// [`PushdownInfo`] per scan of that relation, in plan order, since a
+    /// query can scan the same relation several times with different
+    /// predicates each time.
     ///
     /// Returns `Ok(None)` when the connector has no native way to answer
     /// this (e.g. Postgres today). Returns `Ok(Some(map))` — possibly with
@@ -73,7 +83,7 @@ pub trait Connector {
     async fn pushdown(
         &self,
         _query_text: &str,
-    ) -> Result<Option<HashMap<String, PushdownInfo>>, ConnectorError> {
+    ) -> Result<Option<HashMap<String, Vec<PushdownInfo>>>, ConnectorError> {
         Ok(None)
     }
 

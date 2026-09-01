@@ -3,7 +3,7 @@ use duckdb::arrow::datatypes::SchemaRef;
 use log::{debug, trace, warn};
 use polyglot_sql::{
     dialects::DialectType,
-    expressions::{Expression, Null, Select, With},
+    expressions::{Expression, JoinKind, Null, Select},
     traversal::ExpressionWalk,
 };
 use std::{
@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    connectors::Connector,
+    connectors::{Connector, PushdownInfo},
     dag::MaterializeMode,
     executor::Executor,
     opt::common::dialect_for_db,
@@ -42,40 +42,43 @@ fn bare_table_name(node_id: &str) -> String {
 // ---------------------------------------------------------------------------
 // Dead-column elimination
 //
-// When a TempTable's rewritten schema is pruned to only the columns a
-// downstream frontier query actually needs, that frontier's own SQL text can
-// still contain a *nested* subquery selecting extra columns from the
-// TempTable that were never propagated further up (e.g. `SELECT x.a FROM
-// (SELECT a, b, c FROM staging) x` — `b`/`c` are dead beyond that subquery).
-// If we don't also prune those references, the frontier's own SQL breaks at
-// bind time once the TempTable no longer physically has those columns.
+// A TempTable's schema is pruned to only the columns its downstream frontier
+// queries actually need. Deciding *which* columns those are cannot be
+// delegated to the connector's plan-level analysis: the planner is free to
+// report a column as unread because some computation over it is itself dead
+// (an unused aggregate, say), while the frontier's SQL *text* still names
+// that column somewhere we don't rewrite. Pruning on that basis produces a
+// TempTable whose consumers no longer bind.
 //
-// This targets exactly that case: for every *nested* SELECT (never the
-// outermost statement — its own projection list is the frontier's real
-// output, not a "dead" intermediate) whose FROM clause is a single, unjoined
-// reference to `source`, prune its projection list down to `keep` (the
-// authoritative column set computed from the connector's pushdown analysis).
+// So the keep-list is derived from the frontier's own text instead, after
+// running the dead-column elimination below over it. The pass rewrites the
+// query so that every *nested* relation (a derived table, a CTE body, a
+// branch of a `UNION ALL`) projects only the columns something above it
+// actually references, propagating that top-down to fixpoint. The outermost
+// statement's projection list is never touched — that is the frontier's own
+// output contract. Whatever survives in a scan of the TempTable after that is
+// exactly what the TempTable must keep, so the rewritten text and the pruned
+// schema are consistent by construction.
+//
+// This matters most after `graph_minor` inlines views: a view exposing
+// twenty columns to a consumer that reads three leaves seventeen dead column
+// references behind, and eliminating them is what lets the TempTable narrow.
 // ---------------------------------------------------------------------------
 
-/// Return the name of the *physical source column* a SELECT-list item reads,
-/// if and only if that item is a plain pass-through column reference —
-/// `Expression::Column`, or `Expression::Alias` wrapping one (e.g. `a AS
-/// foo`, which still reads physical column `a`; the rename is preserved,
-/// only the keep/drop decision is based on `a`).
-///
-/// Returns `None` for anything else — computed expressions, aggregates,
-/// function calls, `CASE`, `*`, literals, ... — which are always left
-/// untouched: `keep`/`required_cols` only ever contains `source`'s own
-/// physical column names, so testing a *computed* column's output alias
-/// (e.g. `mean_temp` in `avg(avg_temp) AS mean_temp`) against that set would
-/// almost always miss and wrongly drop it.
-fn column_output_name(expr: &Expression) -> Option<String> {
+/// The set of output column names something above this relation references,
+/// or `None` when that is unknowable (a `*` is in play, or the relation's own
+/// row shape is a contract we must not touch) and every column must survive.
+type Needed<'a> = Option<&'a HashSet<String>>;
+
+/// The name a select-list item contributes to its relation's output: the
+/// alias if there is one, otherwise the bare column name. `None` for anything
+/// whose output name we can't read off the syntax (a `*`, or an unaliased
+/// computed expression whose name the dialect derives itself) — those items
+/// are never dropped.
+fn output_name(expr: &Expression) -> Option<String> {
     match expr {
+        Expression::Alias(alias) => Some(alias.alias.name.clone()),
         Expression::Column(col) => Some(col.name.name.clone()),
-        Expression::Alias(alias) => match &alias.this {
-            Expression::Column(col) => Some(col.name.name.clone()),
-            _ => None,
-        },
         _ => None,
     }
 }
@@ -88,29 +91,46 @@ fn select_has_star(select: &Select) -> bool {
         .any(|e| matches!(e, Expression::Star(_)))
 }
 
-/// `true` if `select` has exactly one, unjoined FROM source and that source
-/// is a direct reference to `bare_source` — the only shape this pass will
-/// prune, so it never has to reason about join ambiguity or DISTINCT/`*`.
-fn is_single_unjoined_source(select: &Select, bare_source: &str) -> bool {
-    if !select.joins.is_empty() || select.distinct || select.distinct_on.is_some() {
+/// `true` if a star appears anywhere inside `expr`.
+fn contains_star(expr: &Expression) -> bool {
+    expr.dfs().any(|e| matches!(e, Expression::Star(_)))
+}
+
+/// `true` if `table` is a reference to the DAG node `node_id`.
+///
+/// Node IDs can be one-, two-, or three-part quoted identifiers such as
+/// `"warehouse"."main"."stg_orders"`. Matching compares from the right and
+/// only on the parts both sides actually spell out, so an unqualified
+/// `stg_orders` in a query matches the node, while a *different* schema's
+/// `"warehouse"."raw"."stg_orders"` does not.
+fn table_ref_matches(table: &polyglot_sql::expressions::TableRef, node_id: &str) -> bool {
+    let parts: Vec<&str> = node_id.split('.').map(|p| p.trim_matches('"')).collect();
+    let Some(name) = parts.last() else {
+        return false;
+    };
+    if !table.name.name.eq_ignore_ascii_case(name) {
         return false;
     }
-    if select_has_star(select) {
-        return false;
+    let qualifiers: Vec<&str> = parts[..parts.len() - 1].to_vec();
+    let refs: Vec<&str> = [table.catalog.as_ref(), table.schema.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|i| i.name.as_str())
+        .collect();
+    // Compare the qualifiers both sides spell out, right-aligned.
+    for (r, q) in refs.iter().rev().zip(qualifiers.iter().rev()) {
+        if !r.eq_ignore_ascii_case(q) {
+            return false;
+        }
     }
-    match &select.from {
-        Some(from) if from.expressions.len() == 1 => matches!(
-            &from.expressions[0],
-            Expression::Table(t) if t.name.name.eq_ignore_ascii_case(bare_source)
-        ),
-        _ => false,
-    }
+    true
 }
 
 /// `true` if any of `select`'s FROM/JOIN targets is a direct reference to
-/// `bare_source` (regardless of how many other sources/joins are present).
-fn select_scans_source(select: &Select, bare_source: &str) -> bool {
-    let is_match = |e: &Expression| matches!(e, Expression::Table(t) if t.name.name.eq_ignore_ascii_case(bare_source));
+/// `source_id` (regardless of how many other sources/joins are present).
+fn select_scans_source(select: &Select, source_id: &str) -> bool {
+    let is_match =
+        |e: &Expression| matches!(e, Expression::Table(t) if table_ref_matches(t, source_id));
     select
         .from
         .as_ref()
@@ -119,232 +139,592 @@ fn select_scans_source(select: &Select, bare_source: &str) -> bool {
         || select.joins.iter().any(|j| is_match(&j.this))
 }
 
-/// Every column `select` references *outside* of a bare pass-through
-/// select-list position — i.e. inside WHERE/GROUP BY/HAVING/ORDER BY/JOIN-ON,
-/// or inside a select-list item that computes something (an aggregate,
-/// function call, arithmetic, `CASE`, ...) rather than just reading a column
-/// straight through. [`prune_dead_source_columns`] only ever rewrites bare
-/// pass-through select-list items (see `column_output_name`) — everywhere
-/// else is always left exactly as written, so every column referenced there
-/// must always survive pruning of `source`'s own schema.
-fn columns_needed_regardless(select: &Select) -> HashSet<String> {
-    let mut trimmed = select.clone();
-    trimmed
-        .expressions
-        .retain(|e| column_output_name(e).is_none());
-    polyglot_sql::ast_transforms::get_column_names(&Expression::Select(Box::new(trimmed)))
-        .into_iter()
-        .collect()
+/// Every column name referenced anywhere inside `expr`, plus the identifiers
+/// named by any `JOIN ... USING (...)` (which are column references the AST
+/// stores as bare identifiers) and by `SELECT * EXCLUDE (...)`.
+///
+/// This is deliberately over-broad: it does not attribute a name to the
+/// relation it came from, so a name belonging to a sibling source keeps a
+/// same-named column alive in this one. That costs a little pruning and never
+/// correctness — the reverse mistake would drop a live column.
+fn names_referenced(expr: &Expression) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for node in expr.dfs() {
+        match node {
+            Expression::Column(col) => {
+                out.insert(col.name.name.clone());
+            }
+            Expression::Select(select) => {
+                for join in &select.joins {
+                    out.extend(join.using.iter().map(|i| i.name.clone()));
+                }
+            }
+            Expression::Star(star) => {
+                if let Some(except) = &star.except {
+                    out.extend(except.iter().map(|i| i.name.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
-/// Return every column name referenced by a scan of `source` in `sql` that
-/// [`prune_dead_source_columns`] will *not* rewrite. These columns must
-/// survive projection pruning of `source` even if the connector's own
-/// analysis reports them as unused overall, since we won't touch the text
-/// that still references them. Two cases:
+/// The names `select` references outside of its own select-list items --
+/// WHERE, GROUP BY, HAVING, QUALIFY, ORDER BY, join conditions, and so on.
 ///
-/// - A select eligible for pruning (single, unjoined, no `DISTINCT`/`*`):
-///   only its bare pass-through select-list items are actually subject to
-///   the prune/keep decision (see [`columns_needed_regardless`]) —
-///   everything else in it always survives regardless.
-/// - A select *not* eligible for pruning (joined, `DISTINCT`, or the
-///   outermost statement, which is never pruned regardless of shape):
-///   nothing in it is ever rewritten, so *every* column it references
-///   always survives.
+/// A select-list item whose output name appears here is never dropped: those
+/// clauses may refer to it by its output alias (DuckDB resolves lateral
+/// column aliases in WHERE as well as in GROUP BY/HAVING/ORDER BY), and
+/// dropping the item would leave the reference dangling.
+fn names_referenced_outside_select_list(select: &Select) -> HashSet<String> {
+    let mut trimmed = select.clone();
+    trimmed.expressions.clear();
+    names_referenced_in_own_scope(&trimmed)
+}
+
+/// The names `select` references *in its own scope*: its select list, WHERE,
+/// GROUP BY, ORDER BY, join conditions and so on, but not the interior of the
+/// relations it reads from.
 ///
-/// Returns `None` if pruning `source`'s projection must be abandoned
-/// entirely for this frontier: a `SELECT *`/`table.*` anywhere touching a
-/// scan of `source` (e.g. `SELECT pp.*, ... FROM source AS pp`) needs *every*
-/// column, and unlike a plain column reference, a star gives us no column
-/// names to collect at all — there's nothing a keep-list could represent.
+/// Those interiors are separate scopes — a derived table's own `SELECT a, b`
+/// says nothing about whether the query above it still needs `b`, and folding
+/// them in would make every column look live and nothing would ever prune.
+/// CTE bodies are excluded for the same reason (they are narrowed against the
+/// whole statement instead, see [`dce_ctes`]).
+fn names_referenced_in_own_scope(select: &Select) -> HashSet<String> {
+    let mut trimmed = select.clone();
+    trimmed.with = None;
+    if let Some(from) = trimmed.from.as_mut() {
+        for e in from.expressions.iter_mut() {
+            *e = Expression::Null(Null);
+        }
+    }
+    for join in trimmed.joins.iter_mut() {
+        // The join *condition* is part of this scope; the relation isn't.
+        join.this = Expression::Null(Null);
+    }
+    names_referenced(&Expression::Select(Box::new(trimmed)))
+}
+
+/// `true` if any source of `select` can see another source's columns — a
+/// LATERAL/APPLY join, or a lateral derived table. Sibling relations are
+/// otherwise independent scopes, and this is the exception that makes
+/// [`names_referenced_in_own_scope`] too narrow to prune against.
+fn has_lateral_source(select: &Select) -> bool {
+    let lateral_join = select.joins.iter().any(|j| {
+        matches!(
+            j.kind,
+            JoinKind::Lateral | JoinKind::LeftLateral | JoinKind::CrossApply | JoinKind::OuterApply
+        )
+    });
+    let lateral_from = select
+        .from
+        .as_ref()
+        .map(|f| {
+            f.expressions
+                .iter()
+                .any(|e| matches!(e, Expression::Subquery(sub) if sub.lateral))
+        })
+        .unwrap_or(false);
+    let lateral_join_target = select
+        .joins
+        .iter()
+        .any(|j| matches!(&j.this, Expression::Subquery(sub) if sub.lateral));
+    lateral_join || lateral_from || lateral_join_target
+}
+
+/// `true` if `select` refers to its own output columns *by position* --
+/// `GROUP BY 1, 2`, `ORDER BY 2 DESC`, and friends.
 ///
-/// Where it *can* return a concrete set, this is intentionally over-broad
-/// when it can't cleanly attribute a column to `source` specifically (e.g.
-/// inside a join) — it just returns every column name in scope, and the
-/// caller only keeps the ones that actually exist in `source`'s schema, so a
-/// false positive here costs a little pruning, never correctness.
-fn collect_unprunable_source_columns(
-    sql: &str,
-    source_id: &str,
-    dialect: DialectType,
-) -> Option<HashSet<String>> {
-    let bare_source = bare_table_name(source_id);
-    let mut out = HashSet::new();
-    let Ok(root) = polyglot_sql::parse_one(sql, dialect) else {
-        // Can't analyze what we can't parse — fail closed like the `SELECT
-        // *`/`table.*` case, not open like "this frontier needs nothing".
-        return None;
+/// Dropping a select-list item renumbers everything after it, so a select
+/// that counts positions has to keep its projection exactly as written even
+/// when some of it is dead.
+fn has_positional_references(select: &Select) -> bool {
+    let is_ordinal = |e: &Expression| {
+        matches!(
+            e,
+            Expression::Literal(lit) if matches!(**lit, polyglot_sql::expressions::Literal::Number(_))
+        )
+    };
+    let group_by = select
+        .group_by
+        .as_ref()
+        .map(|g| g.expressions.iter().any(is_ordinal))
+        .unwrap_or(false);
+    let order_by = select
+        .order_by
+        .as_ref()
+        .map(|o| o.expressions.iter().any(|ord| is_ordinal(&ord.this)))
+        .unwrap_or(false);
+    let distinct_on = select
+        .distinct_on
+        .as_ref()
+        .map(|d| d.iter().any(is_ordinal))
+        .unwrap_or(false);
+    group_by || order_by || distinct_on
+}
+
+/// Run dead-column elimination over a whole statement, to fixpoint.
+///
+/// The statement's own output columns are all live by definition, so only
+/// nested relations are ever narrowed. Iterating lets a column dropped from
+/// an outer relation make the reference that fed it dead in turn, one level
+/// per pass; the loop stops as soon as a pass changes nothing.
+fn eliminate_dead_columns(mut expr: Expression) -> Expression {
+    const MAX_PASSES: usize = 8;
+    for _ in 0..MAX_PASSES {
+        let before = expr.clone();
+        dce_relation(&mut expr, None);
+        if expr == before {
+            break;
+        }
+    }
+    expr
+}
+
+/// Narrow one relation (a statement, derived table, CTE body, or set-op) to
+/// `needed`, then recurse into the relations it reads from.
+fn dce_relation(expr: &mut Expression, needed: Needed) {
+    match expr {
+        Expression::Subquery(sub) => dce_relation(&mut sub.this, needed),
+        Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => {
+            dce_set_operation(expr, needed)
+        }
+        Expression::Select(select) => {
+            dce_select_list(select, needed);
+            dce_children(select);
+        }
+        Expression::JoinedTable(joined) => {
+            dce_relation(&mut joined.left, needed);
+            for join in joined.joins.iter_mut() {
+                dce_relation(&mut join.this, needed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Drop `select`'s select-list items that nothing references.
+///
+/// Left alone entirely when the output row shape is itself load-bearing: a
+/// `*` (whose columns can't be named, so nothing can be proven dead),
+/// `DISTINCT`/`DISTINCT ON` (dropping a column changes which rows survive
+/// deduplication), a positional `GROUP BY`/`ORDER BY` (whose ordinals would
+/// renumber, see [`has_positional_references`]), or a `needed` of `None`.
+fn dce_select_list(select: &mut Select, needed: Needed) {
+    let Some(needed) = needed else {
+        return;
+    };
+    if select_has_star(select)
+        || select.distinct
+        || select.distinct_on.is_some()
+        || has_positional_references(select)
+    {
+        return;
+    }
+    let keep_regardless = names_referenced_outside_select_list(select);
+    let original = select.expressions.clone();
+    select.expressions.retain(|item| match output_name(item) {
+        Some(name) => needed.contains(&name) || keep_regardless.contains(&name),
+        // No readable output name — can't prove it dead, so keep it.
+        None => true,
+    });
+    if select.expressions.is_empty() {
+        // Never emit an empty select list.
+        select.expressions = vec![original.into_iter().next().unwrap_or_else(|| {
+            Expression::Literal(Box::new(polyglot_sql::expressions::Literal::Number(
+                "1".to_string(),
+            )))
+        })];
+    }
+}
+
+/// Recurse into every relation `select` reads from — FROM entries, join
+/// targets, and its own CTE bodies — carrying the set of names `select`
+/// references.
+///
+/// The same (over-broad) set goes to every source: it is everything this
+/// select could possibly read, so a column outside it is dead in all of them.
+fn dce_children(select: &mut Select) {
+    let child_needed: Option<HashSet<String>> = if select_has_star(select) {
+        // A star's columns can't be named, so nothing under it is provably
+        // dead.
+        None
+    } else if has_lateral_source(select) {
+        // A lateral source reads a sibling's columns from inside its own
+        // body, where this scope can't see the reference.
+        None
+    } else {
+        Some(names_referenced_in_own_scope(select))
+    };
+    let child_needed = child_needed.as_ref();
+
+    // A NATURAL join matches on whatever column names the two sides happen to
+    // share, so narrowing either side changes which rows join.
+    let natural = select.joins.iter().any(|j| {
+        matches!(
+            j.kind,
+            JoinKind::Natural | JoinKind::NaturalLeft | JoinKind::NaturalRight | JoinKind::NaturalFull
+        )
+    });
+    let from_needed = if natural { None } else { child_needed };
+
+    if let Some(from) = select.from.as_mut() {
+        for e in from.expressions.iter_mut() {
+            dce_relation(e, from_needed);
+        }
+    }
+    for join in select.joins.iter_mut() {
+        dce_relation(&mut join.this, from_needed);
+    }
+
+    dce_ctes(select);
+}
+
+/// Narrow the bodies of `select`'s own CTEs.
+///
+/// A CTE is referenced by name from anywhere in the statement rather than
+/// from one syntactic position, so what it must keep is everything the rest
+/// of the statement references — computed with that CTE's own body swapped
+/// out, so a name only the body itself uses doesn't keep the body's output
+/// alive. Later CTEs are processed first, since a CTE can only be referenced
+/// by ones defined after it.
+fn dce_ctes(select: &mut Select) {
+    let Some(mut with) = select.with.take() else {
+        return;
+    };
+    // A recursive CTE refers to itself from inside its own body, which is
+    // exactly the reference the swap below hides, so its columns can't be
+    // reasoned about this way at all.
+    if with.recursive {
+        for cte in with.ctes.iter_mut() {
+            let mut body = std::mem::replace(&mut cte.this, Expression::Null(Null));
+            dce_relation(&mut body, None);
+            cte.this = body;
+        }
+        select.with = Some(with);
+        return;
+    }
+
+    // Any star anywhere else in the statement could be selecting the CTE's
+    // columns wholesale, and column-aliased CTEs (`cte(a, b) AS ...`) bind
+    // positionally, so in either case nothing may be dropped.
+    let star_elsewhere = {
+        let mut body = select.clone();
+        body.with = None;
+        contains_star(&Expression::Select(Box::new(body)))
+            || with.ctes.iter().any(|c| contains_star(&c.this))
     };
 
-    // Every "top-level" select — the root itself, or a branch reached from
-    // it purely through UNION (never through a nested subquery/derived-table
-    // FROM position) — has its own projection list left untouched by
-    // `prune_dead_source_columns` no matter its shape (see
-    // `prune_root_query`), so any such select that directly scans `source`
-    // needs every column it references to survive, not just its bare
-    // pass-through columns.
-    let mut top_level_selects = HashSet::new();
-    collect_top_level_select_ptrs(&root, &mut top_level_selects);
+    for i in (0..with.ctes.len()).rev() {
+        let mut body = std::mem::replace(&mut with.ctes[i].this, Expression::Null(Null));
 
+        let needed: Option<HashSet<String>> =
+            if star_elsewhere || !with.ctes[i].columns.is_empty() {
+                None
+            } else {
+                let mut names = {
+                    let mut outer = select.clone();
+                    outer.with = None;
+                    names_referenced(&Expression::Select(Box::new(outer)))
+                };
+                for (j, cte) in with.ctes.iter().enumerate() {
+                    if j != i {
+                        names.extend(names_referenced(&cte.this));
+                    }
+                }
+                Some(names)
+            };
+
+        dce_relation(&mut body, needed.as_ref());
+        with.ctes[i].this = body;
+    }
+
+    select.with = Some(with);
+}
+
+/// Narrow a `UNION`/`INTERSECT`/`EXCEPT`.
+///
+/// Branches line up positionally, so a column can only be dropped from one
+/// branch if it is dropped from every branch at the same position — and only
+/// when the operation compares rows column-by-column nowhere: a deduplicating
+/// `UNION`, `INTERSECT` or `EXCEPT` would change its result if a column
+/// vanished, as would DuckDB's `UNION BY NAME`. In those cases the branch
+/// projections stay exactly as written and only their own sources are
+/// narrowed.
+fn dce_set_operation(expr: &mut Expression, needed: Needed) {
+    let prunable = matches!(expr, Expression::Union(u) if u.all && !u.distinct && !u.by_name);
+
+    // The set operation's own ORDER BY refers to the branches' output names.
+    let mut needed_here: Option<HashSet<String>> = needed.cloned();
+    if let (Some(set), Expression::Union(u)) = (needed_here.as_mut(), &*expr)
+        && let Some(order_by) = &u.order_by
+    {
+        for ordered in &order_by.expressions {
+            set.extend(names_referenced(&ordered.this));
+        }
+    }
+
+    let mut branches: Vec<&mut Expression> = Vec::new();
+    collect_set_operation_branches(expr, &mut branches);
+
+    let branch_needed = if prunable { needed_here.clone() } else { None };
+    if let Some(needed_here) = branch_needed.as_ref() {
+        prune_set_operation_branches(&mut branches, needed_here);
+    }
+
+    for branch in branches {
+        // The branch's own list has already been handled positionally above;
+        // recursing with `None` narrows its sources without touching it again.
+        dce_relation(branch, None);
+    }
+}
+
+/// Collect every leaf branch of a chain of set operations, in left-to-right
+/// order, unwrapping the parentheses a branch may be written with.
+fn collect_set_operation_branches<'a>(
+    expr: &'a mut Expression,
+    out: &mut Vec<&'a mut Expression>,
+) {
+    match expr {
+        Expression::Union(u) => {
+            let (left, right) = (&mut u.left, &mut u.right);
+            collect_set_operation_branches(left, out);
+            collect_set_operation_branches(right, out);
+        }
+        Expression::Intersect(i) => {
+            let (left, right) = (&mut i.left, &mut i.right);
+            collect_set_operation_branches(left, out);
+            collect_set_operation_branches(right, out);
+        }
+        Expression::Except(e) => {
+            let (left, right) = (&mut e.left, &mut e.right);
+            collect_set_operation_branches(left, out);
+            collect_set_operation_branches(right, out);
+        }
+        Expression::Subquery(sub) => collect_set_operation_branches(&mut sub.this, out),
+        other => out.push(other),
+    }
+}
+
+/// Drop the same select-list positions from every branch of a set operation.
+///
+/// The output names of the whole operation come from its first branch, so
+/// that branch decides which positions are live. Nothing is dropped unless
+/// every branch is a plain `SELECT` of the same arity with no star and no
+/// `DISTINCT`, since otherwise the positions don't line up or the row shape
+/// is load-bearing.
+fn prune_set_operation_branches(branches: &mut [&mut Expression], needed: &HashSet<String>) {
+    let mut selects: Vec<&Select> = Vec::new();
+    for branch in branches.iter() {
+        match branch {
+            Expression::Select(select) => selects.push(select),
+            _ => return,
+        }
+    }
+    let Some(first) = selects.first() else {
+        return;
+    };
+    let arity = first.expressions.len();
+    if selects.iter().any(|s| {
+        s.expressions.len() != arity
+            || select_has_star(s)
+            || s.distinct
+            || s.distinct_on.is_some()
+            || has_positional_references(s)
+    }) {
+        return;
+    }
+
+    let keep_regardless: HashSet<String> = selects
+        .iter()
+        .flat_map(|s| names_referenced_outside_select_list(s))
+        .collect();
+
+    let keep: Vec<bool> = first
+        .expressions
+        .iter()
+        .map(|item| match output_name(item) {
+            Some(name) => needed.contains(&name) || keep_regardless.contains(&name),
+            None => true,
+        })
+        .collect();
+    if keep.iter().all(|k| *k) || !keep.iter().any(|k| *k) {
+        return;
+    }
+
+    for branch in branches.iter_mut() {
+        if let Expression::Select(select) = branch {
+            let mut i = 0;
+            select.expressions.retain(|_| {
+                let k = keep[i];
+                i += 1;
+                k
+            });
+        }
+    }
+}
+
+/// The predicate a single frontier node applies to `source`, or `None` when
+/// that node needs every row.
+///
+/// `scans` is one entry per scan of `source` in that node's plan. Within one
+/// scan the reported filters are conjuncts — the scan keeps a row only if
+/// all of them hold. *Across* scans they are alternatives: a self-join whose
+/// two sides filter on different regions needs the rows either side reads, so
+/// the node's predicate is their disjunction. AND-ing them instead would ask
+/// for rows satisfying both at once, which for that example is none at all.
+///
+/// A scan with no filters reads the relation whole, so the node needs every
+/// row and no predicate can be pushed on its behalf; likewise if a predicate
+/// can't be parsed, since then we can't tell which columns it needs to keep.
+fn node_predicate(scans: &[PushdownInfo], n_id: &str, dialect: DialectType) -> Option<String> {
+    if scans.is_empty() {
+        return None;
+    }
+    let mut conjunctions: Vec<String> = Vec::new();
+    for scan in scans {
+        if scan.filters.is_empty() {
+            trace!("  frontier '{n_id}': a scan of the source applies no filter");
+            return None;
+        }
+        for f in &scan.filters {
+            if filter_referenced_columns(f, dialect).is_none() {
+                warn!(
+                    "pushdown: couldn't parse filter predicate '{f}' for frontier '{n_id}', \
+                     assuming all rows needed"
+                );
+                return None;
+            }
+        }
+        conjunctions.push(scan.filters.join(" AND "));
+    }
+    match conjunctions.len() {
+        1 => conjunctions.pop(),
+        _ => Some(
+            conjunctions
+                .into_iter()
+                .map(|c| format!("({c})"))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        ),
+    }
+}
+
+/// Every column of `source_id` that `root` still references, after dead-column
+/// elimination has run over it.
+///
+/// Returns `None` when a `SELECT *`/`table.*` sits on a scan of `source_id`:
+/// a star needs every column and names none of them, so there is nothing a
+/// keep-list could represent.
+///
+/// Like [`names_referenced`], this is over-broad where it can't attribute a
+/// name to `source_id` specifically (inside a join, say) — it returns every
+/// name in scope, and the caller keeps only those that exist in the source's
+/// schema.
+fn source_columns_referenced(root: &Expression, source_id: &str) -> Option<HashSet<String>> {
+    let mut out = HashSet::new();
     for node in root.dfs() {
         if let Expression::Select(select) = node {
-            if !select_scans_source(select, &bare_source) {
+            if !select_scans_source(select, source_id) {
                 continue;
             }
             if select_has_star(select) {
                 return None;
             }
-            if top_level_selects.contains(&(node as *const Expression)) {
-                out.extend(polyglot_sql::ast_transforms::get_column_names(&root));
-            } else if is_single_unjoined_source(select, &bare_source) {
-                out.extend(columns_needed_regardless(select));
-            } else {
-                out.extend(polyglot_sql::ast_transforms::get_column_names(node));
-            }
+            out.extend(names_referenced(node));
         }
     }
-
     Some(out)
 }
 
-/// Collect the identities of every "top-level" select reachable from `expr`
-/// by descending only through `UNION`/`INTERSECT`/`EXCEPT` branches — i.e.
-/// every select whose own output row shape is part of the frontier query's
-/// final result, never a droppable intermediate. `prune_root_query` never
-/// rewrites these selects' own projection lists (only their FROM/JOIN/CTE
-/// positions), matching the guarantee the plain root-`Select` case already
-/// relied on before `UNION` support existed here.
-fn collect_top_level_select_ptrs<'a>(
-    expr: &'a Expression,
-    out: &mut HashSet<*const Expression>,
-) {
-    match expr {
-        Expression::Select(_) => {
-            out.insert(expr as *const Expression);
-        }
-        Expression::Union(u) => {
-            collect_top_level_select_ptrs(&u.left, out);
-            collect_top_level_select_ptrs(&u.right, out);
-        }
-        Expression::Intersect(i) => {
-            collect_top_level_select_ptrs(&i.left, out);
-            collect_top_level_select_ptrs(&i.right, out);
-        }
-        Expression::Except(e) => {
-            collect_top_level_select_ptrs(&e.left, out);
-            collect_top_level_select_ptrs(&e.right, out);
-        }
-        _ => {}
-    }
-}
-
-/// Prune every CTE's definition in `with` (if any) as a derived table — same
-/// treatment as a FROM/JOIN position, since a CTE's body is exactly that,
-/// just referenced by name instead of inline.
-fn prune_with_ctes(with: &mut Option<With>, bare_source: &str, keep: &HashSet<String>) {
-    if let Some(with) = with.as_mut() {
-        for cte in with.ctes.iter_mut() {
-            let taken = std::mem::replace(&mut cte.this, Expression::Null(Null));
-            cte.this = prune_derived_table(taken, bare_source, keep);
-        }
-    }
-}
-
-/// Descend into every FROM/JOIN/CTE position of `select` (but never mutate
-/// `select`'s own projection list) so nested derived tables get pruned.
-fn descend_into_from_positions(select: &mut Select, bare_source: &str, keep: &HashSet<String>) {
-    if let Some(mut from) = select.from.take() {
-        from.expressions = from
-            .expressions
-            .into_iter()
-            .map(|e| prune_derived_table(e, bare_source, keep))
-            .collect();
-        select.from = Some(from);
-    }
-    for join in select.joins.iter_mut() {
-        let taken = std::mem::replace(&mut join.this, Expression::Null(Null));
-        join.this = prune_derived_table(taken, bare_source, keep);
-    }
-    prune_with_ctes(&mut select.with, bare_source, keep);
-}
-
-/// Applied to an expression sitting in a FROM/JOIN/CTE position: recurse into
-/// its own nested derived tables first (bottom-up), then, if this expression
-/// is itself a single unjoined scan of `bare_source`, prune its projection
-/// list down to `keep`.
+/// The columns of `source` that `sql` still needs once its dead columns are
+/// eliminated, together with `sql` rewritten that way.
 ///
-/// `UNION`/`INTERSECT`/`EXCEPT` branches are recursed into structurally
-/// (their own output rows are never pruned — same as this function never
-/// touching a `Select`'s own projection list beyond the single-unjoined-scan
-/// case — only their FROM/JOIN/CTE positions), matching
-/// [`collect_top_level_select_ptrs`]'s notion of which selects are eligible.
-fn prune_derived_table(expr: Expression, bare_source: &str, keep: &HashSet<String>) -> Expression {
-    // A parenthesized derived table (`FROM (SELECT ...) AS alias`) parses as
-    // `Expression::Subquery`, wrapping the actual `Select` in `.this`. Unwrap
-    // it, recurse/prune the inner Select, then rewrap so the alias survives.
-    if let Expression::Subquery(mut sub) = expr {
-        sub.this = prune_derived_table(sub.this, bare_source, keep);
-        return Expression::Subquery(sub);
+/// Reading this off the query's own text rather than the connector's plan is
+/// what keeps the two consistent: the planner reports what its *plan* reads,
+/// which can be narrower than what the text still names, and the text is what
+/// has to bind against the narrowed relation. See the dead-column
+/// elimination notes at the top of this module.
+///
+/// `None` means every column of `source` has to survive — the query doesn't
+/// parse, can't be regenerated, or a star sits on a scan of `source`.
+fn columns_needed_from(
+    sql: &str,
+    source: &str,
+    dialect: DialectType,
+) -> Option<(HashSet<String>, String)> {
+    let parsed = polyglot_sql::parse_one(sql, dialect)
+        .inspect_err(|e| trace!("pushdown: can't parse frontier query ({e})"))
+        .ok()?;
+    let eliminated = eliminate_dead_columns(parsed);
+    let cols = source_columns_referenced(&eliminated, source)?;
+    // The keep-list above describes the *eliminated* query, so it is only
+    // usable together with that query's text.
+    let rewritten = polyglot_sql::generate(&eliminated, dialect)
+        .inspect_err(|e| trace!("pushdown: can't regenerate frontier query ({e})"))
+        .ok()?;
+    Some((cols, rewritten))
+}
+
+/// Rewrite every reference to a DAG node in `sql` to the name it is
+/// materialized under for analysis, at the AST level.
+///
+/// `mapping` is keyed by node ID. Matching happens on parsed table
+/// references (see [`table_ref_matches`]), so a node ID that also occurs as a
+/// substring of a string literal, a column name, or a longer identifier is
+/// left alone — unlike the plain `str::replace` this replaced, which would
+/// happily rewrite `WHERE env = 'staging'` into a comparison against a
+/// scratch table name and hand the connector a query that means something
+/// else entirely.
+///
+/// Returns `None` if `sql` doesn't parse or can't be regenerated; callers
+/// fall back to textual substitution, which is what this did before.
+fn rewrite_node_refs(
+    sql: &str,
+    mapping: &HashMap<String, String>,
+    dialect: DialectType,
+) -> Option<String> {
+    let parsed = polyglot_sql::parse_one(sql, dialect).ok()?;
+    let rewritten = polyglot_sql::traversal::transform(parsed, &|node| {
+        let Expression::Table(table) = &node else {
+            return Ok(Some(node));
+        };
+        let Some((_, new_name)) = mapping
+            .iter()
+            .find(|(node_id, _)| table_ref_matches(table, node_id))
+        else {
+            return Ok(Some(node));
+        };
+        let mut table = table.clone();
+        table.name = polyglot_sql::expressions::Identifier::new(new_name.clone());
+        table.schema = None;
+        table.catalog = None;
+        Ok(Some(Expression::Table(table)))
+    })
+    .ok()?;
+    polyglot_sql::generate(&rewritten, dialect).ok()
+}
+
+/// Apply [`rewrite_node_refs`], falling back to longest-first textual
+/// substitution when the SQL can't be parsed (an exotic dialect construct);
+/// the fallback is exactly what this pass did for every query before.
+fn rewrite_node_refs_or_replace(
+    sql: &str,
+    mapping: &HashMap<String, String>,
+    sorted_ids: &[&String],
+    dialect: DialectType,
+) -> String {
+    if let Some(rewritten) = rewrite_node_refs(sql, mapping, dialect) {
+        return rewritten;
     }
-
-    match expr {
-        // `Union`/`Intersect`/`Except` implement `Drop` (to iteratively
-        // flatten deeply left-recursive chains), which forbids partially
-        // moving out of `.left`/`.right` — take each field via
-        // `mem::replace` first instead.
-        Expression::Union(mut u) => {
-            let left = std::mem::replace(&mut u.left, Expression::Null(Null));
-            let right = std::mem::replace(&mut u.right, Expression::Null(Null));
-            u.left = prune_derived_table(left, bare_source, keep);
-            u.right = prune_derived_table(right, bare_source, keep);
-            prune_with_ctes(&mut u.with, bare_source, keep);
-            return Expression::Union(u);
-        }
-        Expression::Intersect(mut i) => {
-            let left = std::mem::replace(&mut i.left, Expression::Null(Null));
-            let right = std::mem::replace(&mut i.right, Expression::Null(Null));
-            i.left = prune_derived_table(left, bare_source, keep);
-            i.right = prune_derived_table(right, bare_source, keep);
-            prune_with_ctes(&mut i.with, bare_source, keep);
-            return Expression::Intersect(i);
-        }
-        Expression::Except(mut e) => {
-            let left = std::mem::replace(&mut e.left, Expression::Null(Null));
-            let right = std::mem::replace(&mut e.right, Expression::Null(Null));
-            e.left = prune_derived_table(left, bare_source, keep);
-            e.right = prune_derived_table(right, bare_source, keep);
-            prune_with_ctes(&mut e.with, bare_source, keep);
-            return Expression::Except(e);
-        }
-        _ => {}
+    warn!("pushdown: couldn't parse query for AST-level scratch rewriting, falling back to text substitution");
+    let mut out = sql.to_string();
+    for id in sorted_ids {
+        out = out.replace(id.as_str(), &mapping[*id]);
     }
-
-    let Expression::Select(mut select) = expr else {
-        return expr;
-    };
-
-    descend_into_from_positions(&mut select, bare_source, keep);
-
-    if is_single_unjoined_source(&select, bare_source) {
-        select
-            .expressions
-            .retain(|e| column_output_name(e).map(|n| keep.contains(&n)).unwrap_or(true));
-        if select.expressions.is_empty() {
-            // Safety net: never produce an empty SELECT list.
-            select.expressions.push(Expression::Star(
-                polyglot_sql::expressions::Star {
-                    table: None,
-                    except: None,
-                    replace: None,
-                    rename: None,
-                    trailing_comments: vec![],
-                    span: None,
-                },
-            ));
-        }
-    }
-
-    Expression::Select(select)
+    out
 }
 
 /// Inline `view_sql` (the query text of `view_id`) into `table_sql` by
@@ -382,7 +762,7 @@ fn inline_view_ast(
         let Expression::Table(t) = &node else {
             return Ok(Some(node));
         };
-        if !t.name.name.eq_ignore_ascii_case(&bare_view) {
+        if !table_ref_matches(t, view_id) {
             return Ok(Some(node));
         }
         replaced_any.set(true);
@@ -417,77 +797,6 @@ fn inline_view_ast(
     }
 
     polyglot_sql::generate(&rewritten, dialect).ok()
-}
-
-/// Rewrite `sql` so that every *nested* (non-outermost) SELECT statement
-/// scanning `source` directly (with no join, no `*`, no DISTINCT) has its
-/// projection list pruned to `keep_cols`. The outermost statement's own
-/// projection list is never touched — see the module-level doc comment.
-///
-/// Returns `None` if `sql` doesn't parse, or regenerating it fails; callers
-/// treat that as "leave this query's text unchanged" (safe — just misses an
-/// opportunity to prune, never breaks anything).
-fn prune_dead_source_columns(
-    sql: &str,
-    source_id: &str,
-    keep_cols: &[String],
-    dialect: DialectType,
-) -> Option<String> {
-    if keep_cols.is_empty() {
-        return None;
-    }
-    let bare_source = bare_table_name(source_id);
-    let keep: HashSet<String> = keep_cols.iter().cloned().collect();
-
-    let root = polyglot_sql::parse_one(sql, dialect).ok()?;
-    let pruned = prune_root_query(root, &bare_source, &keep)?;
-    polyglot_sql::generate(&pruned, dialect).ok()
-}
-
-/// Prune the FROM/JOIN/CTE positions of the outermost query `expr` — a
-/// `Select`, or a `UNION`/`INTERSECT`/`EXCEPT` of such — without ever
-/// mutating any top-level branch's own projection list, matching
-/// [`collect_top_level_select_ptrs`]'s notion of which selects are eligible
-/// for pruning. Returns `None` if `expr` is some other statement shape this
-/// pass doesn't know how to descend into (e.g. a bare `VALUES` list).
-fn prune_root_query(
-    expr: Expression,
-    bare_source: &str,
-    keep: &HashSet<String>,
-) -> Option<Expression> {
-    match expr {
-        Expression::Select(mut select) => {
-            descend_into_from_positions(&mut select, bare_source, keep);
-            Some(Expression::Select(select))
-        }
-        // See the `mem::replace` note in `prune_derived_table` — `Union`'s
-        // `Drop` impl forbids partially moving out of `.left`/`.right`.
-        Expression::Union(mut u) => {
-            let left = std::mem::replace(&mut u.left, Expression::Null(Null));
-            let right = std::mem::replace(&mut u.right, Expression::Null(Null));
-            u.left = prune_root_query(left, bare_source, keep)?;
-            u.right = prune_root_query(right, bare_source, keep)?;
-            prune_with_ctes(&mut u.with, bare_source, keep);
-            Some(Expression::Union(u))
-        }
-        Expression::Intersect(mut i) => {
-            let left = std::mem::replace(&mut i.left, Expression::Null(Null));
-            let right = std::mem::replace(&mut i.right, Expression::Null(Null));
-            i.left = prune_root_query(left, bare_source, keep)?;
-            i.right = prune_root_query(right, bare_source, keep)?;
-            prune_with_ctes(&mut i.with, bare_source, keep);
-            Some(Expression::Intersect(i))
-        }
-        Expression::Except(mut e) => {
-            let left = std::mem::replace(&mut e.left, Expression::Null(Null));
-            let right = std::mem::replace(&mut e.right, Expression::Null(Null));
-            e.left = prune_root_query(left, bare_source, keep)?;
-            e.right = prune_root_query(right, bare_source, keep)?;
-            prune_with_ctes(&mut e.with, bare_source, keep);
-            Some(Expression::Except(e))
-        }
-        _ => None,
-    }
 }
 
 /// Extract the column names referenced by a raw SQL predicate string (as
@@ -550,18 +859,21 @@ where
         .map(|(i, id)| (id.clone(), format!("dee_tmp_pushdown_all_{i}")))
         .collect();
 
+    // Longest-first, so that if a query has to fall back to textual
+    // substitution a shorter ID that is a substring of a longer one is never
+    // matched first.
     let mut sorted_ids: Vec<&String> = scratch_names.keys().collect();
     sorted_ids.sort_by_key(|id| std::cmp::Reverse(id.len()));
+
+    let dialect = dialect_for_db(&dag.db);
 
     for id in &topo {
         let node = dag.nodes.get(id.clone()).ok_or_else(|| {
             OptimizerError::Exec(format!("materialize_scratch_dag: node '{id}' not found"))
         })?;
 
-        let mut query = node.query_text.clone();
-        for other_id in &sorted_ids {
-            query = query.replace(other_id.as_str(), &scratch_names[*other_id]);
-        }
+        let query =
+            rewrite_node_refs_or_replace(&node.query_text, &scratch_names, &sorted_ids, dialect);
 
         conn.new_relation(MaterializeMode::Table, scratch_names[id].clone(), query)
             .await
@@ -603,12 +915,14 @@ where
 // ---------------------------------------------------------------------------
 
 /// Return type for [`pushdown`]: the rewritten source SQL and schema, plus
-/// dead-column-pruned SQL for any frontier node whose nested references to
-/// `source` needed adjusting to match the source's new, narrower schema.
+/// the dead-column-eliminated SQL of any frontier node whose text had to
+/// change for the source's new, narrower schema to bind.
 pub struct PushdownResult {
     pub source_sql: String,
     pub source_schema: SchemaRef,
-    /// Pruned SQL for each frontier node whose text changed, keyed by node ID.
+    /// Rewritten SQL for each frontier node whose text changed, keyed by node
+    /// ID. Applied together with `source_schema` or not at all: the narrowed
+    /// schema is only consistent with the rewritten text.
     pub frontier_sql: HashMap<String, String>,
 }
 
@@ -623,16 +937,21 @@ pub struct PushdownResult {
 /// a frontier's) may reference *other* TempTables that aren't real relations
 /// under their original names either.
 ///
-/// For each node in `frontier_materializes(source)`:
-/// 1. The frontier node's query text (rewritten so every DAG node reference
-///    resolves to its scratch relation) is analyzed via [`Connector::pushdown`].
-/// 2. Filter predicates are combined across all frontier nodes with a
-///    logical **OR** (each frontier's own predicates are AND-ed together
-///    first, matching how DuckDB's `Filters` already reports each predicate
-///    as a separate conjunct).
-/// 3. Projected columns are collected and **unioned** across all frontier
-///    nodes, plus any column referenced only by a pushed-down filter, so
-///    every consumer's required columns are present.
+/// **Rows.** Each node in `frontier_materializes(source)` is analyzed via
+/// [`Connector::pushdown`], which reports what the planner pushed into each
+/// scan of `source`. One node's predicate is the disjunction of its scans'
+/// own conjunctions (see [`node_predicate`]), and the pushed filter is the
+/// disjunction of every node's predicate: `source` has to keep a row that
+/// *any* consumer reads. That only holds if every consumer's rows are
+/// accounted for, so a node that reads `source` unfiltered — or that we
+/// can't analyze at all — means no filter is pushed.
+///
+/// **Columns.** Dead columns are eliminated from each frontier node's own SQL
+/// (see the notes at the top of this module), and what its scans of `source`
+/// still reference afterwards is what `source` must keep; the union across
+/// frontier nodes, plus any column the pushed filter needs, is the keep-list.
+/// Deriving it from the text rather than from the planner's own projection
+/// list is what keeps the narrowed schema and the frontier SQL consistent.
 ///
 /// The combined filter and projection are then applied to `source`'s own
 /// query by wrapping it as a subquery — the original query text is preserved
@@ -700,11 +1019,20 @@ where
     let mut sorted_ids: Vec<&String> = scratch_names.keys().collect();
     sorted_ids.sort_by_key(|id| std::cmp::Reverse(id.len()));
 
-    // per-frontier-node filter predicates (each entry = the filters for one node)
-    let mut per_node_filters: Vec<Vec<String>> = Vec::new();
-    // union of projected columns across all frontier nodes
+    // One entry per frontier node: the predicate that node's scans of
+    // `source` apply, already combined across those scans.
+    let mut per_node_filters: Vec<String> = Vec::new();
+    // Union, across frontier nodes, of the columns of `source` their SQL
+    // still references once dead columns have been eliminated from it.
     let mut required_cols: HashSet<String> = HashSet::new();
+    // Dead-column-eliminated SQL for each frontier node whose text changed.
+    let mut dce_sql: HashMap<String, String> = HashMap::new();
     let mut any_node_needs_all_cols = false;
+    // Set whenever we cannot account for every row some frontier node reads.
+    // Pushing a filter then would delete rows that node still needs, so the
+    // filter is dropped entirely — a predicate is only sound to push when
+    // *every* consumer's row requirement is known and expressible.
+    let mut any_node_needs_all_rows = false;
 
     for n_id in &frontier {
         trace!("trying to pushdown frontier node {} into {}", n_id, source);
@@ -719,105 +1047,80 @@ where
             n_node.id, n_node.query_text,
         );
 
-        let mut rewritten_query = n_node.query_text.clone();
-        for id in &sorted_ids {
-            rewritten_query = rewritten_query.replace(id.as_str(), &scratch_names[*id]);
-        }
+        // ---- which rows this node needs ----
 
-        let pushdown_map = match conn.pushdown(&rewritten_query).await {
-            Ok(m) => m,
+        let rewritten_query = rewrite_node_refs_or_replace(
+            &n_node.query_text,
+            scratch_names,
+            &sorted_ids,
+            dialect,
+        );
+
+        match conn.pushdown(&rewritten_query).await {
             Err(e) => {
                 warn!(
                     "pushdown: connector pushdown failed for frontier '{n_id}': {e}, \
-                     assuming all columns needed"
+                     assuming all rows needed"
                 );
-                any_node_needs_all_cols = true;
-                continue;
+                any_node_needs_all_rows = true;
             }
-        };
-
-        match pushdown_map.and_then(|m| m.get(&scratch_name).cloned()) {
-            Some(info) => {
-                if info.projections.is_empty() {
-                    trace!("  frontier '{n_id}': needs all columns");
-                    any_node_needs_all_cols = true;
-                } else {
+            Ok(pushdown_map) => match pushdown_map.and_then(|m| m.get(&scratch_name).cloned()) {
+                None => {
                     trace!(
-                        "  frontier '{n_id}': projected columns = [{}]",
-                        info.projections.join(", ")
+                        "  frontier '{n_id}': scratch scan not found in connector pushdown \
+                         result, assuming all rows needed"
                     );
-                    required_cols.extend(info.projections.iter().cloned());
+                    any_node_needs_all_rows = true;
                 }
-
-                // Filter-only columns (e.g. `WHERE is_active` when
-                // `is_active` is never selected) must survive projection
-                // pruning even though DuckDB's own `Projections` list
-                // excludes them.
-                for f in &info.filters {
-                    match filter_referenced_columns(f, dialect) {
-                        Some(cols) => required_cols.extend(cols),
-                        None => {
-                            warn!(
-                                "pushdown: couldn't parse filter predicate '{f}' for frontier \
-                                 '{n_id}', assuming all columns needed"
-                            );
-                            any_node_needs_all_cols = true;
-                        }
+                Some(scans) => match node_predicate(&scans, n_id, dialect) {
+                    Some(predicate) => {
+                        trace!("  frontier '{n_id}': predicate = {predicate}");
+                        per_node_filters.push(predicate);
                     }
-                }
-
-                if info.filters.is_empty() {
-                    trace!("  frontier '{n_id}': no filter predicates found");
-                } else {
-                    trace!("  frontier '{n_id}': predicates = [{}]", info.filters.join(", "));
-                    per_node_filters.push(info.filters);
-                }
-            }
-            None => {
-                trace!(
-                    "  frontier '{n_id}': scratch scan not found in connector pushdown result, \
-                     assuming all columns needed"
-                );
-                any_node_needs_all_cols = true;
-            }
+                    None => {
+                        trace!("  frontier '{n_id}': needs all rows");
+                        any_node_needs_all_rows = true;
+                    }
+                },
+            },
         }
 
-        // Safety net: the connector's own pushdown analysis is (correctly)
-        // dead-column-aware — it may legitimately report a column as unused
-        // even though it's still selected inside a *joined* (or DISTINCT/`*`)
-        // nested scan of `source`, one `prune_dead_source_columns` won't
-        // rewrite later. Any such column must still survive pruning of
-        // `source`'s schema, or that untouched text will fail to bind.
-        match collect_unprunable_source_columns(&n_node.query_text, source, dialect) {
-            Some(unprunable) if !unprunable.is_empty() => {
-                trace!(
-                    "  frontier '{n_id}': columns kept regardless (referenced by an un-prunable scan) = [{}]",
-                    unprunable.iter().cloned().collect::<Vec<_>>().join(", ")
-                );
-                required_cols.extend(unprunable);
-            }
-            Some(_) => {}
+        // ---- which columns this node needs ----
+
+        match columns_needed_from(&n_node.query_text, source, dialect) {
             None => {
-                trace!(
-                    "  frontier '{n_id}': a `SELECT *`/`table.*` touches a scan of '{source}', \
-                     assuming all columns needed"
-                );
+                trace!("  frontier '{n_id}': needs every column of '{source}'");
                 any_node_needs_all_cols = true;
+            }
+            Some((cols, rewritten)) => {
+                trace!(
+                    "  frontier '{n_id}': columns referenced from '{source}' = [{}]",
+                    cols.iter().cloned().collect::<Vec<_>>().join(", ")
+                );
+                required_cols.extend(cols);
+                if rewritten != n_node.query_text {
+                    dce_sql.insert(n_id.clone(), rewritten);
+                }
             }
         }
     }
 
-    // Build the combined filter: OR of each frontier node's AND-conjunction.
-    let combined_filter: Option<String> = {
-        let per_node_conjunctions: Vec<String> = per_node_filters
-            .into_iter()
-            .map(|fs| fs.join(" AND "))
-            .collect();
-        match per_node_conjunctions.len() {
+    // Build the combined filter: the disjunction of every frontier node's own
+    // predicate. `source` must keep a row that *any* consumer reads, so the
+    // combination is a union of row sets, never an intersection — and it is
+    // only sound at all if every consumer accounted for its rows.
+    let combined_filter: Option<String> = if any_node_needs_all_rows {
+        debug!(
+            "pushdown '{source}': at least one frontier node needs every row, \
+             not pushing any filter"
+        );
+        None
+    } else {
+        match per_node_filters.len() {
             0 => None,
-            1 => per_node_conjunctions.into_iter().next(),
+            1 => per_node_filters.into_iter().next(),
             _ => Some(
-                per_node_conjunctions
+                per_node_filters
                     .into_iter()
                     .map(|f| format!("({f})"))
                     .collect::<Vec<_>>()
@@ -825,6 +1128,21 @@ where
             ),
         }
     };
+
+    // Columns a pushed-down filter references must survive projection pruning
+    // even when nothing selects them (`WHERE is_active`, say).
+    if let Some(filter) = &combined_filter {
+        match filter_referenced_columns(filter, dialect) {
+            Some(cols) => required_cols.extend(cols),
+            None => {
+                warn!(
+                    "pushdown: couldn't parse the combined filter '{filter}' for '{source}', \
+                     assuming all columns needed"
+                );
+                any_node_needs_all_cols = true;
+            }
+        }
+    }
 
     // Build the combined projection: union of required columns.
     // If any node needed all columns, skip projection pruning.
@@ -852,23 +1170,15 @@ where
         });
     }
 
-    // Prune dead columns from every frontier query's nested references to
-    // `source` so their SQL text stays consistent with source's new,
-    // narrower materialized schema (see the module-level doc comment).
-    let mut frontier_sql: HashMap<String, String> = HashMap::new();
-    if let Some(cols) = &projection_cols {
-        for n_id in &frontier {
-            let Some(n_node) = dag.nodes.get(n_id.clone()) else {
-                continue;
-            };
-            if let Some(pruned) = prune_dead_source_columns(&n_node.query_text, source, cols, dialect)
-            {
-                if pruned != n_node.query_text {
-                    frontier_sql.insert(n_id.clone(), pruned);
-                }
-            }
-        }
-    }
+    // The narrowed schema is only consistent with frontier queries that have
+    // had their dead columns eliminated — that elimination is exactly what
+    // proved those columns dead — so the two are applied together or not at
+    // all.
+    let frontier_sql: HashMap<String, String> = if projection_cols.is_some() {
+        dce_sql
+    } else {
+        HashMap::new()
+    };
 
     // Construct the final SQL by wrapping the original query as a subquery and
     // applying the pushed-down filter and projection as an outer SELECT.
@@ -1119,7 +1429,7 @@ where
     conn: Arc<C>,
     engine: Arc<E>,
     /// Which side of an execution to step on. A rewrite is only useful before
-    /// the DAG runs, so `Before` is the author's default -- but the setting is
+    /// the DAG runs, so `Before` is the author's default — but the setting is
     /// still honoured, because a `Once` optimization is stepped explicitly and
     /// never around a run, which makes the value moot rather than wrong.
     step_phase: StepPhase,
@@ -1368,8 +1678,8 @@ where
         self.step_phase = phase;
     }
 
-    /// Nothing to set up. Pushdown keeps no state between steps -- it reads
-    /// the DAG and the warehouse's own schemas each time -- so it owns no
+    /// Nothing to set up. Pushdown keeps no state between steps — it reads
+    /// the DAG and the warehouse's own schemas each time — so it owns no
     /// tables, and says so rather than creating an empty one.
     async fn register(
         &self,
@@ -1496,6 +1806,22 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+
+    fn scalar_i64(conn: &DuckDBConnection, sql: &str) -> i64 {
+        conn.pool
+            .get()
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn orders_source() -> Vec<SourceNode> {
+        vec![SourceNode {
+            name: "orders".to_string(),
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
+        }]
     }
 
     // ------------------------------------------------------------------
@@ -2159,33 +2485,295 @@ mod tests {
         );
     }
 
+
+    // DAG layout:
+    //
+    //   orders (source, real table)
+    //       │
+    //   staging (TempTable)
+    //       ├──► t_us   (Table)  SELECT ... FROM staging WHERE region = 'US'
+    //       └──► t_all  (Table)  SELECT ... FROM staging          — every row
+    //
+    // A consumer that reads the TempTable unfiltered contributes no predicate
+    // to OR against, so there is no predicate the TempTable can be narrowed
+    // by at all. Pushing the *other* consumer's filter anyway silently
+    // deletes rows `t_all` needs.
+    //
+    // Regression test for the dominant dag-bench failure: `lp_stg_employees`
+    // was narrowed to `WHERE (is_active) OR (is_active) OR ...` across five
+    // consumers that agreed, dropping the rows a sixth still counted.
+    #[tokio::test]
+    async fn test_unfiltered_consumer_blocks_filter_pushdown() {
+        let conn = in_memory_conn().await;
+        setup_orders_table(&conn).await;
+        let engine = Arc::new(SimpleEngine::new(Arc::clone(&conn)).unwrap());
+
+        let staging = node(
+            "staging",
+            "SELECT order_id, region, amount, status FROM orders",
+            MaterializeMode::TempTable,
+            &[],
+        );
+        let t_us = node(
+            "t_us",
+            "SELECT order_id, amount FROM staging WHERE region = 'US'",
+            MaterializeMode::Table,
+            &["staging"],
+        );
+        let t_all = node(
+            "t_all",
+            "SELECT order_id, region FROM staging",
+            MaterializeMode::Table,
+            &["staging"],
+        );
+
+        let mut dag = make_dag(vec![staging, t_us, t_all]);
+        dag.sources = orders_source();
+
+        let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::clone(&engine));
+        pass.rewrite(&mut dag).await.expect("pass should succeed");
+        let rewritten = dag
+            .nodes
+            .get("staging".to_string())
+            .unwrap()
+            .query_text
+            .clone();
+        assert!(
+            !rewritten.contains("WHERE"),
+            "no filter may be pushed while a consumer reads every row; got: {rewritten}"
+        );
+
+        engine.run(&dag).await.expect("rewritten dag should run");
+        assert_eq!(
+            scalar_i64(&conn, "SELECT count(*) FROM t_all"),
+            20,
+            "the unfiltered consumer must still see every row"
+        );
+        assert_eq!(scalar_i64(&conn, "SELECT count(*) FROM t_us"), 10);
+    }
+
+    // One consumer scanning the TempTable twice with a different predicate on
+    // each side. The two scans are alternatives — the TempTable must keep the
+    // rows either side reads — so they combine with OR. AND-ing them (which
+    // is what merging the two scans into one filter list did) asks for rows
+    // that are both 'US' and 'EU', i.e. none.
+    #[tokio::test]
+    async fn test_self_join_scans_combine_with_or() {
+        let conn = in_memory_conn().await;
+        setup_orders_table(&conn).await;
+        let engine = Arc::new(SimpleEngine::new(Arc::clone(&conn)).unwrap());
+
+        let staging = node(
+            "staging",
+            "SELECT order_id, region, amount, status FROM orders",
+            MaterializeMode::TempTable,
+            &[],
+        );
+        let sink = node(
+            "sink",
+            "SELECT a.order_id AS a_id, b.order_id AS b_id \
+             FROM staging a JOIN staging b ON a.order_id = b.order_id + 1 \
+             WHERE a.region = 'US' AND b.region = 'EU'",
+            MaterializeMode::Table,
+            &["staging"],
+        );
+        let mut dag = make_dag(vec![staging, sink]);
+        dag.sources = orders_source();
+
+        let expected = scalar_i64(
+            &conn,
+            "SELECT count(*) FROM orders a JOIN orders b ON a.order_id = b.order_id + 1 \
+             WHERE a.region = 'US' AND b.region = 'EU'",
+        );
+        assert!(expected > 0, "baseline should be non-empty");
+
+        let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::clone(&engine));
+        pass.rewrite(&mut dag).await.expect("pass should succeed");
+        let rewritten = dag
+            .nodes
+            .get("staging".to_string())
+            .unwrap()
+            .query_text
+            .clone();
+
+        engine.run(&dag).await.expect("rewritten dag should run");
+        assert_eq!(
+            scalar_i64(&conn, "SELECT count(*) FROM sink"),
+            expected,
+            "both scans' rows must survive; staging rewritten to: {rewritten}"
+        );
+    }
+
+    // A node ID that also appears inside a string literal must not be
+    // rewritten when the query is handed to the connector for analysis: the
+    // planner would report a predicate over a scratch table name, and that
+    // nonsense predicate would then be pushed into the TempTable for real.
+    #[tokio::test]
+    async fn test_node_id_inside_a_string_literal_is_not_rewritten() {
+        let conn = in_memory_conn().await;
+        conn.execute(
+            "CREATE TABLE events AS SELECT range AS id, \
+             CASE range % 4 WHEN 0 THEN 'staging' WHEN 1 THEN 'prod' \
+                            WHEN 2 THEN 'aaa' ELSE 'zzz' END AS env FROM range(20)"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(SimpleEngine::new(Arc::clone(&conn)).unwrap());
+
+        let staging = node(
+            "staging",
+            "SELECT id, env FROM events",
+            MaterializeMode::TempTable,
+            &[],
+        );
+        let sink = node(
+            "sink",
+            "SELECT id FROM staging WHERE env = 'staging'",
+            MaterializeMode::Table,
+            &["staging"],
+        );
+        let mut dag = make_dag(vec![staging, sink]);
+        dag.sources = vec![SourceNode {
+            name: "events".to_string(),
+            schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
+        }];
+
+        let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::clone(&engine));
+        pass.rewrite(&mut dag).await.expect("pass should succeed");
+        let rewritten = dag
+            .nodes
+            .get("staging".to_string())
+            .unwrap()
+            .query_text
+            .clone();
+        assert!(
+            !rewritten.contains("dee_tmp_pushdown"),
+            "a scratch relation name must never reach the rewritten DAG; got: {rewritten}"
+        );
+
+        engine.run(&dag).await.expect("rewritten dag should run");
+        assert_eq!(
+            scalar_i64(&conn, "SELECT count(*) FROM sink"),
+            5,
+            "staging rewritten to: {rewritten}"
+        );
+    }
+
+    // End-to-end version of `test_dce_keeps_columns_a_later_cte_reads`: the
+    // rewritten DAG has to bind.
+    #[tokio::test]
+    async fn test_frontier_reading_a_temp_table_through_chained_ctes_still_binds() {
+        let conn = in_memory_conn().await;
+        setup_orders_table(&conn).await;
+        let engine = Arc::new(SimpleEngine::new(Arc::clone(&conn)).unwrap());
+
+        let staging = node(
+            "staging",
+            "SELECT order_id, region, amount, status FROM orders",
+            MaterializeMode::TempTable,
+            &[],
+        );
+        let sink = node(
+            "sink",
+            "WITH a AS (SELECT order_id, region, amount, status FROM staging), \
+             b AS (SELECT order_id, region, amount, status FROM a) \
+             SELECT region, count(*) AS n FROM b GROUP BY region",
+            MaterializeMode::Table,
+            &["staging"],
+        );
+        let mut dag = make_dag(vec![staging, sink]);
+        dag.sources = orders_source();
+
+        let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::clone(&engine));
+        pass.rewrite(&mut dag).await.expect("pass should succeed");
+        let staging_sql = dag
+            .nodes
+            .get("staging".to_string())
+            .unwrap()
+            .query_text
+            .clone();
+        let sink_sql = dag.nodes.get("sink".to_string()).unwrap().query_text.clone();
+
+        engine.run(&dag).await.unwrap_or_else(|e| {
+            panic!("rewritten dag should run: {e}\nstaging = {staging_sql}\nsink = {sink_sql}")
+        });
+        assert_eq!(scalar_i64(&conn, "SELECT count(*) FROM sink"), 2);
+    }
+
     // ------------------------------------------------------------------
-    // Dead-column pruning unit tests
+    // Dead-column elimination unit tests
     // ------------------------------------------------------------------
 
+    /// Run dead-column elimination over `sql` and print it back out.
+    fn dce(sql: &str) -> String {
+        let parsed = polyglot_sql::parse_one(sql, DialectType::DuckDB).expect("parses");
+        polyglot_sql::generate(&eliminate_dead_columns(parsed), DialectType::DuckDB)
+            .expect("regenerates")
+    }
+
+    /// The columns of `source` that survive dead-column elimination of `sql`.
+    fn surviving_source_columns(sql: &str, source: &str) -> Option<HashSet<String>> {
+        let parsed = polyglot_sql::parse_one(sql, DialectType::DuckDB).expect("parses");
+        source_columns_referenced(&eliminate_dead_columns(parsed), source)
+    }
+
     #[test]
-    fn test_prune_dead_source_columns_removes_unused_nested_column() {
-        let sql = r#"SELECT x."a" FROM (SELECT "a", "b", "c" FROM "staging") AS x"#;
-        let pruned = prune_dead_source_columns(
-            sql,
-            "staging",
-            &["a".to_string()],
-            DialectType::DuckDB,
-        )
-        .expect("should prune");
+    fn test_dce_removes_unused_nested_column() {
+        let pruned = dce(r#"SELECT x."a" FROM (SELECT "a", "b", "c" FROM "staging") AS x"#);
         assert!(pruned.contains('a'));
         assert!(!pruned.contains('b'), "got: {pruned}");
         assert!(!pruned.contains('c'), "got: {pruned}");
     }
 
-    // Regression test for a real benchmark failure: a nested SELECT that
-    // computes an *aggregate* over a source column (not a plain pass-through)
-    // must never be pruned based on the aggregate's own output alias, since
-    // that alias (`mean_temp`) will never match any of `staging`'s physical
-    // column names (`avg_temp`) — a naive alias-based check would wrongly
-    // drop it even though it's the CTE's entire reason for existing.
+    // A nested select's output is read by *other parts of the same query*,
+    // not just by whatever encloses it syntactically. Here the CTE `b` reads
+    // columns from the CTE `a`, so narrowing `a` to what the final SELECT
+    // uses would leave `b` referencing columns that no longer exist.
+    //
+    // Regression test for four dag-bench DAGs (p07_saas) that stopped
+    // binding: `Referenced column "event_id" not found in FROM clause`.
     #[test]
-    fn test_prune_dead_source_columns_never_drops_computed_aggregate_columns() {
+    fn test_dce_keeps_columns_a_later_cte_reads() {
+        let sql = r#"WITH a AS (SELECT order_id, region, status FROM staging),
+                          b AS (SELECT order_id, region, status FROM a)
+                     SELECT region FROM b"#;
+        let pruned = dce(sql);
+        assert!(
+            pruned.contains("order_id") && pruned.contains("status"),
+            "columns a later CTE reads must survive; got: {pruned}"
+        );
+    }
+
+    // ...but a column nothing else in the statement mentions is still dead,
+    // even inside a CTE — otherwise CTE-shaped queries would never prune.
+    #[test]
+    fn test_dce_prunes_a_cte_column_nothing_reads() {
+        let sql = r#"WITH a AS (SELECT order_id, region, source_system FROM staging)
+                     SELECT order_id, region FROM a"#;
+        let pruned = dce(sql);
+        assert!(
+            !pruned.contains("source_system"),
+            "a CTE column nothing references is dead; got: {pruned}"
+        );
+    }
+
+    // Dropping a live intermediate makes what fed it dead in turn, so the
+    // elimination has to run to fixpoint rather than one level deep.
+    #[test]
+    fn test_dce_propagates_through_nested_derived_tables() {
+        let sql = r#"SELECT z."a"
+                     FROM (SELECT y."a", y."b" FROM (SELECT "a", "b", "c" FROM "staging") AS y) AS z"#;
+        let pruned = dce(sql);
+        assert!(!pruned.contains('b'), "got: {pruned}");
+        assert!(!pruned.contains('c'), "got: {pruned}");
+    }
+
+    // A nested SELECT that computes an *aggregate* over a source column must
+    // keep it: `mean_temp` is what the outer query reads, and `avg_temp` is
+    // what `staging` must therefore still provide.
+    #[test]
+    fn test_dce_never_drops_computed_aggregate_columns() {
         let sql = r#"WITH stats AS (
             SELECT device_id, AVG(avg_temp) AS mean_temp, STDDEV(avg_temp) AS std_temp
             FROM "staging"
@@ -2194,173 +2782,318 @@ mod tests {
         SELECT h.device_id, s.mean_temp, s.std_temp
         FROM "staging" AS h JOIN stats AS s USING (device_id)"#;
 
-        // `keep_cols` only contains `device_id` and `avg_temp` — the CTE's
-        // computed `mean_temp`/`std_temp` outputs are correctly absent from
-        // this list (they aren't physical columns of `staging` at all), but
-        // that must not cause them to be pruned from the CTE's SELECT list.
-        let pruned = prune_dead_source_columns(
-            sql,
-            "staging",
-            &["device_id".to_string(), "avg_temp".to_string()],
-            DialectType::DuckDB,
-        )
-        .expect("should parse/regenerate");
-
+        let pruned = dce(sql);
         assert!(
             pruned.contains("mean_temp") && pruned.contains("std_temp"),
-            "computed aggregate columns must never be pruned; got: {pruned}"
+            "computed aggregate columns the outer query reads must survive; got: {pruned}"
+        );
+        let cols = surviving_source_columns(sql, "staging").expect("no star");
+        assert!(
+            cols.contains("avg_temp") && cols.contains("device_id"),
+            "the aggregate's argument is still needed from the source; got: {cols:?}"
         );
     }
 
-    // Regression test for a real benchmark failure: `SELECT pp.*, ...` needs
-    // every column of `staging` (via the star), but `get_column_names` never
-    // enumerates the physical columns a star expands to, so a naive
-    // safety-net that only looks at `Expression::Column` nodes would miss
-    // this entirely and let genuinely-needed columns get pruned away.
+    // `SELECT pp.*` needs every column of `staging` and names none of them,
+    // so there is nothing a keep-list could represent.
     #[test]
-    fn test_collect_unprunable_source_columns_bails_out_on_star() {
+    fn test_source_columns_bail_out_on_star() {
         let sql = r#"SELECT pp.*, ROW_NUMBER() OVER (ORDER BY x) AS rn FROM "staging" AS pp"#;
-        let result = collect_unprunable_source_columns(sql, "staging", DialectType::DuckDB);
+        let result = surviving_source_columns(sql, "staging");
         assert!(
             result.is_none(),
             "a star touching a scan of source must force 'need all columns'; got: {result:?}"
         );
     }
 
-    // Regression test for a real benchmark failure: `avg(avg_voltage) AS
-    // avg_voltage` is a single, unjoined (i.e. "prunable"-shaped) scan of
-    // `staging`, but the select-list item computes an aggregate rather than
-    // passing a column straight through — `avg_voltage` (the argument) must
-    // still be treated as needed even though the select's *shape* would
-    // otherwise be eligible for pruning, and even though the output alias
-    // happens to share its name with the underlying physical column.
     #[test]
-    fn test_collect_unprunable_source_columns_keeps_aggregate_arguments_in_prunable_select() {
+    fn test_source_columns_keep_aggregate_arguments_and_group_keys() {
         let sql = r#"SELECT region, AVG(avg_voltage) AS avg_voltage FROM "staging" GROUP BY region"#;
-        let cols = collect_unprunable_source_columns(sql, "staging", DialectType::DuckDB)
-            .expect("no star present, should return a concrete set");
+        let cols = surviving_source_columns(sql, "staging").expect("no star present");
         assert!(
             cols.contains("avg_voltage"),
-            "aggregate argument must be kept regardless; got: {cols:?}"
+            "aggregate argument must be kept; got: {cols:?}"
         );
         assert!(
             cols.contains("region"),
-            "GROUP BY column must be kept regardless; got: {cols:?}"
+            "GROUP BY column must be kept; got: {cols:?}"
         );
     }
 
     #[test]
-    fn test_prune_dead_source_columns_never_touches_outermost_select() {
-        // staging is scanned directly at the top level here — nothing "above"
-        // this statement to prune against, so it must be left untouched even
-        // though `keep_cols` is narrower than what's selected.
-        let sql = r#"SELECT "a", "b" FROM "staging""#;
-        let pruned = prune_dead_source_columns(
-            sql,
-            "staging",
-            &["a".to_string()],
-            DialectType::DuckDB,
-        )
-        .expect("should parse/regenerate");
-        assert!(pruned.contains('b'), "outermost SELECT must be untouched; got: {pruned}");
+    fn test_dce_never_touches_the_outermost_select() {
+        // Nothing sits above this statement, so its projection list is its
+        // own output contract.
+        let pruned = dce(r#"SELECT "a", "b" FROM "staging""#);
+        assert!(
+            pruned.contains('b'),
+            "outermost SELECT must be untouched; got: {pruned}"
+        );
+    }
+
+    // A joined nested scan is prunable too — its output feeds only the outer
+    // query — but the column set attributed to `staging` stays over-broad
+    // (the join key from the *other* side is kept as well), which costs a
+    // little pruning and never correctness.
+    #[test]
+    fn test_dce_prunes_joined_nested_scan_but_keeps_join_keys() {
+        let sql =
+            r#"SELECT x."a" FROM (SELECT "a", "b" FROM "staging" JOIN "other" ON "a" = "id") AS x"#;
+        let pruned = dce(sql);
+        assert!(!pruned.contains('b'), "got: {pruned}");
+        let cols = surviving_source_columns(sql, "staging").expect("no star");
+        assert!(cols.contains("a") && cols.contains("id"), "got: {cols:?}");
     }
 
     #[test]
-    fn test_prune_dead_source_columns_skips_joined_scan() {
-        // staging appears in a JOIN here — the conservative pruning pass must
-        // leave it alone rather than risk ambiguous column attribution.
-        let sql = r#"SELECT x."a" FROM (SELECT "a", "b" FROM "staging" JOIN "other" ON "a" = "id") AS x"#;
-        let pruned = prune_dead_source_columns(
-            sql,
-            "staging",
-            &["a".to_string()],
-            DialectType::DuckDB,
-        )
-        .expect("should parse/regenerate");
-        assert!(pruned.contains('b'), "joined scan must be left untouched; got: {pruned}");
-    }
-
-    // Regression test for a real benchmark failure: a bare pass-through
-    // column selected inside a UNION ALL branch (itself the root statement)
-    // must be treated exactly like the plain-root-Select case — never
-    // classified as "prunable" — since `prune_dead_source_columns` never
-    // rewrites a top-level branch's own projection list.
-    #[test]
-    fn test_collect_unprunable_source_columns_keeps_union_branch_passthrough_columns() {
+    fn test_dce_never_touches_a_top_level_union_branch() {
         let sql = r#"SELECT "a", "b" FROM "staging"
                      UNION ALL
                      SELECT "a", "b" FROM "other""#;
-        let cols = collect_unprunable_source_columns(sql, "staging", DialectType::DuckDB)
-            .expect("no star present, should return a concrete set");
+        let pruned = dce(sql);
+        assert!(
+            pruned.contains('b'),
+            "top-level UNION branch must be untouched; got: {pruned}"
+        );
+        let cols = surviving_source_columns(sql, "staging").expect("no star");
         assert!(
             cols.contains("b"),
-            "a bare pass-through column in a top-level UNION branch must survive; got: {cols:?}"
+            "a top-level branch's own output columns all survive; got: {cols:?}"
         );
     }
 
-    // Same shape but as the actual rewriter: since the branch is top-level,
-    // pruning must leave its projection list untouched even though
-    // `keep_cols` is narrower than what's selected.
+    // A nested UNION ALL is prunable, but only *positionally* — branches line
+    // up by position, so a column dropped from one has to be dropped from all
+    // of them or the arity stops matching.
     #[test]
-    fn test_prune_dead_source_columns_never_touches_union_branch() {
-        let sql = r#"SELECT "a", "b" FROM "staging"
-                     UNION ALL
-                     SELECT "a", "b" FROM "other""#;
-        let pruned = prune_dead_source_columns(
-            sql,
-            "staging",
-            &["a".to_string()],
-            DialectType::DuckDB,
-        )
-        .expect("should parse/regenerate");
-        assert!(pruned.contains('b'), "top-level UNION branch must be untouched; got: {pruned}");
-    }
-
-    // A nested (non-top-level) single-unjoined scan of `source` inside a
-    // UNION branch that itself lives inside a CTE must still get pruned —
-    // this is the "real" pruning opportunity a UNION-aware rewriter unlocks,
-    // not just a safety net.
-    #[test]
-    fn test_prune_dead_source_columns_prunes_nested_scan_inside_cte_union() {
+    fn test_dce_prunes_every_branch_of_a_nested_union_together() {
         let sql = r#"WITH combined AS (
             SELECT "a", "b" FROM "staging"
             UNION ALL
             SELECT "a", "b" FROM "other"
         )
         SELECT c."a" FROM combined AS c"#;
-        let pruned = prune_dead_source_columns(
-            sql,
-            "staging",
-            &["a".to_string()],
-            DialectType::DuckDB,
-        )
-        .expect("should parse/regenerate");
+        let pruned = dce(sql);
         assert!(
-            pruned.contains(r#"SELECT "a" FROM "staging""#),
-            "nested scan inside a CTE's UNION branch must be pruned to just 'a' \
-             (the 'other' branch's own 'b' column is untouched); got: {pruned}"
+            !pruned.contains(r#""b""#),
+            "'b' is dead in both branches; got: {pruned}"
+        );
+        assert_eq!(
+            pruned.matches("SELECT \"a\" FROM").count(),
+            2,
+            "both branches must be pruned to the same arity; got: {pruned}"
+        );
+        let cols = surviving_source_columns(sql, "staging").expect("no star");
+        assert!(!cols.contains("b"), "got: {cols:?}");
+    }
+
+    // A deduplicating set operation compares whole rows, so dropping a column
+    // from its branches changes which rows come out.
+    #[test]
+    fn test_dce_leaves_deduplicating_set_operations_alone() {
+        for op in ["UNION", "INTERSECT", "EXCEPT"] {
+            let sql = format!(
+                r#"WITH combined AS (
+                    SELECT "a", "b" FROM "staging" {op} SELECT "a", "b" FROM "other"
+                )
+                SELECT c."a" FROM combined AS c"#
+            );
+            let pruned = dce(&sql);
+            assert!(
+                pruned.contains('b'),
+                "{op} dedups on every column, so none may be dropped; got: {pruned}"
+            );
+        }
+    }
+
+    // DISTINCT is the same argument one level down.
+    #[test]
+    fn test_dce_leaves_distinct_selects_alone() {
+        let sql = r#"SELECT x."a" FROM (SELECT DISTINCT "a", "b" FROM "staging") AS x"#;
+        let pruned = dce(sql);
+        assert!(
+            pruned.contains('b'),
+            "dropping a column changes what DISTINCT deduplicates; got: {pruned}"
         );
     }
 
-    // The connector's own pushdown analysis (`DuckDB` EXPLAIN-based
-    // projection discovery) sees through this exact CTE/UNION nesting and
-    // will correctly report `b` as unused overall. The classifier must not
-    // re-flag `b` as unprunable here (only the two tests above's top-level
-    // branches deserve that), or genuine pruning opportunities regress.
+    // An output column referenced only by the select's own ORDER BY/GROUP BY
+    // (never by anything above it) still has a live reference to satisfy.
     #[test]
-    fn test_collect_unprunable_source_columns_treats_nested_cte_union_scan_as_prunable() {
-        let sql = r#"WITH combined AS (
-            SELECT "a", "b" FROM "staging"
-            UNION ALL
-            SELECT "a", "b" FROM "other"
-        )
-        SELECT c."a" FROM combined AS c"#;
-        let cols = collect_unprunable_source_columns(sql, "staging", DialectType::DuckDB)
-            .expect("no star present, should return a concrete set");
+    fn test_dce_keeps_columns_the_select_itself_orders_by() {
+        let sql = r#"SELECT x."a" FROM (SELECT "a", "b" FROM "staging" ORDER BY "b") AS x"#;
+        let pruned = dce(sql);
         assert!(
-            !cols.contains("b"),
-            "nested scan inside a CTE's UNION branch is prunable; got: {cols:?}"
+            pruned.contains('b'),
+            "ORDER BY may reference the output alias; got: {pruned}"
         );
+    }
+
+
+    // `GROUP BY 1, 2` counts select-list positions, so dropping an item ahead
+    // of them would silently regroup the query.
+    #[test]
+    fn test_dce_leaves_selects_with_positional_group_by_alone() {
+        let sql = r#"SELECT x."a" FROM (
+            SELECT "a", "b", COUNT(*) AS n FROM "staging" GROUP BY 1, 2
+        ) AS x"#;
+        let pruned = dce(sql);
+        assert!(
+            pruned.contains(r#""b""#),
+            "a positional GROUP BY pins every position; got: {pruned}"
+        );
+    }
+
+    #[test]
+    fn test_dce_leaves_selects_with_positional_order_by_alone() {
+        let sql = r#"SELECT x."a" FROM (SELECT "a", "b" FROM "staging" ORDER BY 2 DESC) AS x"#;
+        let pruned = dce(sql);
+        assert!(
+            pruned.contains(r#""b""#),
+            "a positional ORDER BY pins every position; got: {pruned}"
+        );
+    }
+
+
+    // A recursive CTE's own body references it by name, which is the one
+    // reference the "everything else in the statement" rule can't see.
+    #[test]
+    fn test_dce_leaves_recursive_ctes_alone() {
+        let sql = r#"WITH RECURSIVE walk AS (
+            SELECT "id", "parent_id" FROM "staging" WHERE "parent_id" IS NULL
+            UNION ALL
+            SELECT s."id", s."parent_id" FROM "staging" AS s JOIN walk AS w ON s."parent_id" = w."id"
+        )
+        SELECT "id" FROM walk"#;
+        let pruned = dce(sql);
+        assert!(
+            pruned.contains("parent_id"),
+            "a recursive CTE's own columns must survive; got: {pruned}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Table-reference matching / rewriting unit tests
+    // ------------------------------------------------------------------
+
+    // A node ID that also occurs inside a string literal must not be
+    // rewritten: the connector would then be handed `WHERE env =
+    // '<scratch table>'` and report a predicate that means something else.
+    #[test]
+    fn test_rewrite_node_refs_leaves_string_literals_alone() {
+        let mapping = HashMap::from([("staging".to_string(), "scratch_0".to_string())]);
+        let rewritten = rewrite_node_refs(
+            "SELECT id FROM staging WHERE env = 'staging'",
+            &mapping,
+            DialectType::DuckDB,
+        )
+        .expect("rewrites");
+        assert!(rewritten.contains("FROM scratch_0"), "got: {rewritten}");
+        assert!(
+            rewritten.contains("'staging'"),
+            "the literal must survive verbatim; got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_node_refs_leaves_longer_identifiers_alone() {
+        let mapping = HashMap::from([("orders".to_string(), "scratch_0".to_string())]);
+        let rewritten = rewrite_node_refs(
+            "SELECT orders_total FROM orders",
+            &mapping,
+            DialectType::DuckDB,
+        )
+        .expect("rewrites");
+        assert!(rewritten.contains("orders_total"), "got: {rewritten}");
+        assert!(rewritten.contains("FROM scratch_0"), "got: {rewritten}");
+    }
+
+    #[test]
+    fn test_rewrite_node_refs_handles_qualified_node_ids() {
+        let mapping = HashMap::from([(
+            r#""warehouse"."main"."stg_orders""#.to_string(),
+            "scratch_0".to_string(),
+        )]);
+        let rewritten = rewrite_node_refs(
+            r#"SELECT a FROM "warehouse"."main"."stg_orders" AS o"#,
+            &mapping,
+            DialectType::DuckDB,
+        )
+        .expect("rewrites");
+        assert!(rewritten.contains("scratch_0"), "got: {rewritten}");
+        assert!(
+            rewritten.contains(" AS o") || rewritten.contains(" o"),
+            "the alias must survive; got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn test_table_ref_matches_respects_a_differing_schema() {
+        let expr = polyglot_sql::parse_one(
+            r#"SELECT a FROM "warehouse"."raw"."orders""#,
+            DialectType::DuckDB,
+        )
+        .unwrap();
+        let table = expr
+            .dfs()
+            .find_map(|e| match e {
+                Expression::Table(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(table_ref_matches(&table, r#""warehouse"."raw"."orders""#));
+        assert!(table_ref_matches(&table, "orders"), "unqualified ID matches");
+        assert!(
+            !table_ref_matches(&table, r#""warehouse"."main"."orders""#),
+            "a different schema is a different relation"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Predicate combination unit tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_node_predicate_ands_within_a_scan_and_ors_across_scans() {
+        let scans = vec![
+            PushdownInfo {
+                projections: vec!["a".to_string()],
+                filters: vec!["a<10".to_string(), "b>1".to_string()],
+            },
+            PushdownInfo {
+                projections: vec!["a".to_string()],
+                filters: vec!["a>90".to_string()],
+            },
+        ];
+        assert_eq!(
+            node_predicate(&scans, "n", DialectType::DuckDB),
+            Some("(a<10 AND b>1) OR (a>90)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_node_predicate_is_none_when_any_scan_is_unfiltered() {
+        let scans = vec![
+            PushdownInfo {
+                projections: vec!["a".to_string()],
+                filters: vec!["a<10".to_string()],
+            },
+            PushdownInfo::default(),
+        ];
+        assert_eq!(
+            node_predicate(&scans, "n", DialectType::DuckDB),
+            None,
+            "an unfiltered scan reads the relation whole"
+        );
+    }
+
+    #[test]
+    fn test_node_predicate_is_none_when_a_predicate_cannot_be_parsed() {
+        let scans = vec![PushdownInfo {
+            projections: vec!["a".to_string()],
+            filters: vec!["((((".to_string()],
+        }];
+        assert_eq!(node_predicate(&scans, "n", DialectType::DuckDB), None);
     }
 
     // Regression test: a filter predicate the connector can't attribute

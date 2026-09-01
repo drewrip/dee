@@ -55,13 +55,18 @@ where
 /// filters of every scan operator (identified by the presence of a `Table`
 /// key in `extra_info`) into `out`, keyed by the relation's bare name (any
 /// catalog/schema qualification DuckDB reports is stripped).
-fn collect_scan_pushdowns(node: &ExplainNode, out: &mut HashMap<String, PushdownInfo>) {
+///
+/// Each scan gets its own entry in the relation's `Vec`: a query that scans
+/// one relation twice (a self-join, or two UNION branches) reports two
+/// independent sets of filters, and folding them together would turn two
+/// alternatives into one conjunction.
+fn collect_scan_pushdowns(node: &ExplainNode, out: &mut HashMap<String, Vec<PushdownInfo>>) {
     if let Some(table) = &node.extra_info.table {
         let relation = table.rsplit('.').next().unwrap_or(table).to_string();
-        let entry = out.entry(relation).or_default();
+        let mut info = PushdownInfo::default();
         for p in &node.extra_info.projections {
-            if !entry.projections.contains(p) {
-                entry.projections.push(p.clone());
+            if !info.projections.contains(p) {
+                info.projections.push(p.clone());
             }
         }
         for f in &node.extra_info.filters {
@@ -70,10 +75,11 @@ fn collect_scan_pushdowns(node: &ExplainNode, out: &mut HashMap<String, Pushdown
             if f.starts_with("optional:") {
                 continue;
             }
-            if !entry.filters.contains(f) {
-                entry.filters.push(f.clone());
+            if !info.filters.contains(f) {
+                info.filters.push(f.clone());
             }
         }
+        out.entry(relation).or_default().push(info);
     }
     for child in &node.children {
         collect_scan_pushdowns(child, out);
@@ -419,7 +425,7 @@ impl Connector for DuckDBConnection {
     async fn pushdown(
         &self,
         query_text: &str,
-    ) -> Result<Option<HashMap<String, PushdownInfo>>, ConnectorError> {
+    ) -> Result<Option<HashMap<String, Vec<PushdownInfo>>>, ConnectorError> {
         let conn = self
             .pool
             .get()
@@ -447,7 +453,7 @@ impl Connector for DuckDBConnection {
             ))
         })?;
 
-        let mut result: HashMap<String, PushdownInfo> = HashMap::new();
+        let mut result: HashMap<String, Vec<PushdownInfo>> = HashMap::new();
         for plan in &plans {
             collect_scan_pushdowns(plan, &mut result);
         }
@@ -557,7 +563,9 @@ mod tests {
             .unwrap()
             .expect("duckdb connector should support pushdown");
 
-        let t = result.get("t").expect("scan of t should be reported");
+        let scans = result.get("t").expect("scan of t should be reported");
+        assert_eq!(scans.len(), 1, "one scan of t");
+        let t = &scans[0];
         assert_eq!(t.projections, vec!["a", "b"]);
         assert_eq!(t.filters.len(), 2);
         assert!(t.filters.iter().any(|f| f.contains('a')));
@@ -577,7 +585,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let t = result.get("t").unwrap();
+        let t = &result.get("t").unwrap()[0];
         assert_eq!(t.projections, vec!["a"]);
         assert_eq!(t.filters, vec!["a>5"]);
     }
@@ -600,7 +608,34 @@ mod tests {
         // Only the base table shows up; the view is inlined by DuckDB's planner.
         assert!(result.contains_key("t"));
         assert!(!result.contains_key("v"));
-        assert_eq!(result["t"].projections, vec!["a"]);
+        assert_eq!(result["t"][0].projections, vec!["a"]);
+    }
+
+    // A self-join scans one relation twice with a different predicate on each
+    // side. Reporting them as one merged entry would let the caller AND two
+    // alternatives together and ask for rows that satisfy both.
+    #[tokio::test]
+    async fn test_pushdown_reports_each_scan_of_a_relation_separately() {
+        let conn = in_memory_conn().await;
+        conn.execute(
+            "CREATE TABLE t AS SELECT range AS a, range % 7 AS b FROM range(100)".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let result = conn
+            .pushdown("SELECT x.a FROM t x JOIN t y ON x.b = y.b WHERE x.a < 10 AND y.a > 90")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let scans = result.get("t").expect("scans of t should be reported");
+        assert_eq!(scans.len(), 2, "each scan reported separately: {scans:?}");
+        assert!(
+            scans.iter().any(|s| s.filters.iter().any(|f| f.contains('<')))
+                && scans.iter().any(|s| s.filters.iter().any(|f| f.contains('>'))),
+            "each scan keeps its own predicate: {scans:?}"
+        );
     }
 
     #[tokio::test]
@@ -612,7 +647,7 @@ mod tests {
 
         let result = conn.pushdown("SELECT a FROM t").await.unwrap().unwrap();
 
-        let t = result.get("t").unwrap();
+        let t = &result.get("t").unwrap()[0];
         assert_eq!(t.projections, vec!["a"]);
         assert!(t.filters.is_empty());
     }

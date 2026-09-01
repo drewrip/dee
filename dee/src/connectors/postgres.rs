@@ -136,20 +136,25 @@ fn strip_qualifier(expr: &str, relation: &str) -> String {
 ///
 /// Any node naming a `Relation Name` is a scan; `Output` is the set of columns
 /// it must produce and `Filter` / `Index Cond` / `Recheck Cond` are the
-/// predicates evaluated at the scan itself.
-fn collect_pg_scan_pushdowns(node: &serde_json::Value, out: &mut HashMap<String, PushdownInfo>) {
+/// predicates evaluated at the scan itself. Each scan is reported separately
+/// (see [`PushdownInfo`]) -- one query can scan the same relation several
+/// times with entirely different predicates.
+fn collect_pg_scan_pushdowns(
+    node: &serde_json::Value,
+    out: &mut HashMap<String, Vec<PushdownInfo>>,
+) {
     if let Some(relation) = node.get("Relation Name").and_then(|v| v.as_str()) {
         let alias = node
             .get("Alias")
             .and_then(|v| v.as_str())
             .unwrap_or(relation);
-        let entry = out.entry(relation.to_string()).or_default();
+        let mut info = PushdownInfo::default();
 
         if let Some(outputs) = node.get("Output").and_then(|v| v.as_array()) {
             for o in outputs.iter().filter_map(|v| v.as_str()) {
                 let col = strip_qualifier(o, alias);
-                if is_bare_column(&col) && !entry.projections.contains(&col) {
-                    entry.projections.push(col);
+                if is_bare_column(&col) && !info.projections.contains(&col) {
+                    info.projections.push(col);
                 }
             }
         }
@@ -160,11 +165,12 @@ fn collect_pg_scan_pushdowns(node: &serde_json::Value, out: &mut HashMap<String,
                     continue;
                 }
                 let pred = strip_qualifier(f, alias);
-                if !entry.filters.contains(&pred) {
-                    entry.filters.push(pred);
+                if !info.filters.contains(&pred) {
+                    info.filters.push(pred);
                 }
             }
         }
+        out.entry(relation.to_string()).or_default().push(info);
     }
     if let Some(children) = node.get("Plans").and_then(|v| v.as_array()) {
         for child in children {
@@ -295,7 +301,7 @@ impl Connector for PostgresConnection {
     async fn pushdown(
         &self,
         query_text: &str,
-    ) -> Result<Option<HashMap<String, PushdownInfo>>, ConnectorError> {
+    ) -> Result<Option<HashMap<String, Vec<PushdownInfo>>>, ConnectorError> {
         let json = self
             .explain_json(&format!("EXPLAIN (VERBOSE, FORMAT JSON) {}", query_text))
             .await?;
@@ -303,7 +309,7 @@ impl Connector for PostgresConnection {
             ConnectorError::Execute(format!("Failed to parse explain JSON: {e} - json:\n{json}"))
         })?;
 
-        let mut out: HashMap<String, PushdownInfo> = HashMap::new();
+        let mut out: HashMap<String, Vec<PushdownInfo>> = HashMap::new();
         if let Some(items) = wrappers.as_array() {
             for item in items {
                 if let Some(plan) = item.get("Plan") {
@@ -355,7 +361,7 @@ mod tests {
         .unwrap();
         let mut out = HashMap::new();
         collect_pg_scan_pushdowns(&plan, &mut out);
-        let info = &out["readings"];
+        let info = &out["readings"][0];
         // Qualifiers are stripped so the info matches what DuckDB reports and
         // the pushdown pass can rewrite with it.
         assert_eq!(info.projections, vec!["device_id", "temperature_c"]);
@@ -371,8 +377,8 @@ mod tests {
         .unwrap();
         let mut out = HashMap::new();
         collect_pg_scan_pushdowns(&plan, &mut out);
-        assert_eq!(out["readings"].projections, vec!["device_id"]);
-        assert_eq!(out["readings"].filters, vec!["(battery_pct < 15)"]);
+        assert_eq!(out["readings"][0].projections, vec!["device_id"]);
+        assert_eq!(out["readings"][0].filters, vec!["(battery_pct < 15)"]);
     }
 
     #[test]
@@ -386,8 +392,27 @@ mod tests {
         let mut out = HashMap::new();
         collect_pg_scan_pushdowns(&plan, &mut out);
         assert_eq!(out.len(), 2);
-        assert_eq!(out["a"].projections, vec!["x"]);
-        assert_eq!(out["b"].projections, vec!["y"]);
+        assert_eq!(out["a"][0].projections, vec!["x"]);
+        assert_eq!(out["b"][0].projections, vec!["y"]);
+    }
+
+    // Two scans of the same relation are two independent sets of predicates:
+    // merging them would turn alternatives into a conjunction.
+    #[test]
+    fn scan_pushdown_keeps_each_scan_of_a_relation_separate() {
+        let plan: serde_json::Value = serde_json::from_str(
+            r#"{"Node Type":"Hash Join","Plans":[
+                {"Node Type":"Seq Scan","Relation Name":"t","Alias":"x","Output":["x.a"],
+                 "Filter":"(x.a < 10)","Plans":[]},
+                {"Node Type":"Seq Scan","Relation Name":"t","Alias":"y","Output":["y.a"],
+                 "Filter":"(y.a > 90)","Plans":[]}]}"#,
+        )
+        .unwrap();
+        let mut out = HashMap::new();
+        collect_pg_scan_pushdowns(&plan, &mut out);
+        assert_eq!(out["t"].len(), 2);
+        assert_eq!(out["t"][0].filters, vec!["(a < 10)"]);
+        assert_eq!(out["t"][1].filters, vec!["(a > 90)"]);
     }
 
     #[test]
@@ -399,7 +424,7 @@ mod tests {
         .unwrap();
         let mut out = HashMap::new();
         collect_pg_scan_pushdowns(&plan, &mut out);
-        assert_eq!(out["t"].filters, vec!["(id = 42)"]);
+        assert_eq!(out["t"][0].filters, vec!["(id = 42)"]);
     }
 
     #[test]
@@ -437,9 +462,9 @@ mod pushdown_guard_tests {
         .unwrap();
         let mut out = HashMap::new();
         collect_pg_scan_pushdowns(&plan, &mut out);
-        assert!(out["stats"].filters.is_empty());
+        assert!(out["stats"][0].filters.is_empty());
         // The projection is still usable even though the filter is not.
-        assert_eq!(out["stats"].projections, vec!["ts_hour"]);
+        assert_eq!(out["stats"][0].projections, vec!["ts_hour"]);
     }
 
     #[test]
@@ -451,7 +476,7 @@ mod pushdown_guard_tests {
         .unwrap();
         let mut out = HashMap::new();
         collect_pg_scan_pushdowns(&plan, &mut out);
-        assert_eq!(out["t"].filters, vec!["(a > 5)"]);
+        assert_eq!(out["t"][0].filters, vec!["(a > 5)"]);
     }
 
     #[test]
@@ -463,7 +488,7 @@ mod pushdown_guard_tests {
         .unwrap();
         let mut out = HashMap::new();
         collect_pg_scan_pushdowns(&plan, &mut out);
-        assert_eq!(out["t"].projections, vec!["a"]);
+        assert_eq!(out["t"][0].projections, vec!["a"]);
     }
 
     #[test]
@@ -475,6 +500,6 @@ mod pushdown_guard_tests {
         .unwrap();
         let mut out = HashMap::new();
         collect_pg_scan_pushdowns(&plan, &mut out);
-        assert!(out["t"].filters.is_empty());
+        assert!(out["t"][0].filters.is_empty());
     }
 }
