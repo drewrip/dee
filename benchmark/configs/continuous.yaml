@@ -1,0 +1,62 @@
+# Batch optimization against continuous optimization, on the same DAGs.
+#
+# The two are different propositions, not two settings of one thing:
+#
+#   batch        `dee optimize` runs the search to convergence up front, buying
+#                the DAG runs it needs. The measured runs that follow all
+#                execute the result. This is what every earlier result in
+#                results/ was produced under.
+#
+#   continuous   the optimization is registered on the DAG and steps around the
+#                measured runs themselves, spending no runs of its own. The DAG
+#                is slower while the search is exploring and faster once it has
+#                converged, and `payback` is computed from the converged runs
+#                only -- runs at the promoted version, which is what
+#                `runs.dag_version` is recorded for.
+#
+# The question this config asks is whether continuous optimization reaches the
+# same plan batch optimization finds, and how many of a DAG's own runs it
+# spends getting there. Repetitions are high because a continuous cell spends
+# its early runs searching: a cell with fewer runs than the search needs is
+# recorded as `converging` rather than as a result, and contributes no payback
+# row at all.
+#
+# `unopt` is pinned to batch by the harness -- a baseline runs no optimization,
+# so there is nothing for a mode to describe and sweeping it would only produce
+# a duplicate baseline.
+name: continuous
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/continuous
+verbosity: detailed
+
+matrix:
+  project: [p01_iot, p03_ecommerce, p06_logistics]
+  backend: [duckdb]
+  sf: [0.1]
+  variant: [unopt, hmp, hmp_pushdown]
+  optimization_mode: [batch, continuous]
+
+variants:
+  unopt:        {passes: []}
+  hmp:          {passes: [hmp], hmp_use_pushdown: false}
+  # Pushdown runs once and is not stepped around runs, so a continuous cell
+  # naming it registers HMP as the thing that steps and applies pushdown inside
+  # each candidate it evaluates -- which is what `hmp_use_pushdown` already
+  # means, and why this rung is the one that carries over unchanged.
+  hmp_pushdown: {passes: [hmp], hmp_use_pushdown: true}
+
+dee_opt:
+  hmp_max_runs: 4
+  hmp_strategy: breadth
+
+backends:
+  duckdb:
+    threads: 16
+    num_connections: 16
+
+execution:
+  repetitions: 12
+  warmups: 1
+  sample_interval_ms: 50
+  optimization_mode: batch

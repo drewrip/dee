@@ -2,6 +2,7 @@ pub mod connections;
 pub mod dags;
 pub mod meta;
 pub mod optimize;
+pub mod optimizations;
 pub mod queue;
 pub mod runs;
 pub mod schedules;
@@ -78,6 +79,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/run-groups/{group_id}/report.html", get(runs::group_report_html))
         .route("/v1/run-groups/{group_id}/cancel", post(runs::cancel_group_route))
         .route("/v1/dags/{name}/optimize", post(optimize::start))
+        .route(
+            "/v1/dags/{name}/optimizations",
+            get(optimizations::list).post(optimizations::register),
+        )
+        .route(
+            "/v1/dags/{name}/optimizations/{optimization}",
+            axum::routing::patch(optimizations::set_phase).delete(optimizations::deregister),
+        )
+        .route("/v1/optimizations/available", get(optimizations::available))
         .route("/v1/optimizations", get(optimize::list))
         .route("/v1/optimizations/{id}", get(optimize::get))
         .route("/v1/optimizations/{id}/report", get(optimize::report))

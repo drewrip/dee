@@ -87,6 +87,36 @@ impl Client {
         decode(response).await
     }
 
+    pub async fn patch<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let response = self
+            .http
+            .patch(self.url(path))
+            .json(body)
+            .send()
+            .await
+            .map_err(explain)?;
+        decode(response).await
+    }
+
+    /// A DELETE whose response body matters -- deregistering an optimization
+    /// reports what it tore down.
+    pub async fn delete_for<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let response = self
+            .http
+            .delete(self.url(path))
+            .send()
+            .await
+            .map_err(explain)?;
+        decode(response).await
+    }
+
     pub async fn delete(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let response = self
             .http

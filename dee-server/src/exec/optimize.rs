@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use dee::dag::Dag;
-use dee::executor::{Executor, SimpleEngine};
+use dee::executor::{Executor, ProfilingConfig, SimpleEngine};
 use dee::file::DagFile;
 use dee::opt::explain::render_explain_html;
 use dee::opt::{Optimizer, OptimizerConfig};
@@ -17,6 +17,7 @@ use dee::opt::{Optimizer, OptimizerConfig};
 use crate::error::ServerError;
 use crate::exec::connectors::ConnectorHandle;
 use crate::state::AppState;
+use crate::store::optstore::StoreFactory;
 use crate::store::repo::{connections, dags, optimizations, runs};
 
 pub struct OptimizeJob {
@@ -79,8 +80,12 @@ async fn drive_inner(state: AppState, job: OptimizeJob) -> Result<(), ServerErro
 
     let (report, explain_sections, mut optimized) =
         match state.connectors.acquire(&connection).await? {
-            ConnectorHandle::DuckDb(conn) => optimize_with(conn, dag, job.config.clone()).await?,
-            ConnectorHandle::Postgres(conn) => optimize_with(conn, dag, job.config.clone()).await?,
+            ConnectorHandle::DuckDb(conn) => {
+                optimize_with(conn, dag, &job, &state.store).await?
+            }
+            ConnectorHandle::Postgres(conn) => {
+                optimize_with(conn, dag, &job, &state.store).await?
+            }
         };
 
     // The optimizer calls `resolve_schemas`, which fills in `sources[].columns`
@@ -128,10 +133,18 @@ async fn drive_inner(state: AppState, job: OptimizeJob) -> Result<(), ServerErro
     Ok(())
 }
 
+/// Run every enabled optimization to convergence against `dag`.
+///
+/// This is the batch face of the step interface: the same optimizations the
+/// server steps around scheduled runs, driven here by a loop that supplies the
+/// executions itself rather than waiting for the schedule to provide them.
+/// Registration is transient -- the driver registers, converges and
+/// deregisters -- so `dee optimize` leaves nothing attached to the DAG.
 async fn optimize_with<C>(
     conn: Arc<C>,
     mut dag: Dag,
-    config: OptimizerConfig,
+    job: &OptimizeJob,
+    store: &crate::store::Store,
 ) -> Result<
     (
         dee::opt::report::OptimizeReport,
@@ -143,9 +156,18 @@ async fn optimize_with<C>(
 where
     C: dee::connectors::Connector + Send + Sync + 'static,
 {
+    // Plans, not just timings: HMP ranks candidate views by the operator CPU
+    // time its EXPLAIN ANALYZE plans attribute to them, so a run without them
+    // leaves it with nothing to rank. Under the server's own driver plan
+    // collection is a property of the run group; here the runs exist only to
+    // feed the search, so it is always on.
     let engine = Arc::new(
         SimpleEngine::new(Arc::clone(&conn))
-            .map_err(|e| ServerError::Internal(format!("building the engine: {e}")))?,
+            .map_err(|e| ServerError::Internal(format!("building the engine: {e}")))?
+            .with_profiling(ProfilingConfig {
+                collect_plans: true,
+                sample_interval: std::time::Duration::from_millis(250),
+            }),
     );
 
     // The optimizer measures candidate DAGs by running them, so it has to
@@ -156,10 +178,17 @@ where
         .await
         .map_err(|e| ServerError::Internal(format!("preparing the warehouse: {e}")))?;
 
+    let stores = StoreFactory::new(store.clone());
     let mut optimizer =
-        Optimizer::new_with_config(conn, engine, config).stats_on_passes(true);
+        Optimizer::new_with_config(conn, engine, job.config.clone()).stats_on_passes(true);
     let report = optimizer
-        .run(&mut dag)
+        .run(
+            &mut dag,
+            &job.dag_id,
+            &job.dag_name,
+            job.source_version,
+            &stores,
+        )
         .await
         .map_err(|e| ServerError::Internal(format!("optimizing: {e}")))?;
 

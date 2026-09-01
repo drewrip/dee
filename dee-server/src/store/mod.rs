@@ -13,6 +13,7 @@
 //! writes mostly touch disjoint rows, serializing them costs nothing at a few
 //! hundred rows per run and removes the conflict-retry question entirely.
 
+pub mod optstore;
 pub mod repo;
 pub mod schema;
 

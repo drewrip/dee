@@ -17,9 +17,13 @@ use crate::{
     executor::Executor,
     opt::common::dialect_for_db,
     opt::{
-        Dag, Explain, OptimizerError, OptimizerPass,
+        Dag, Optimization, OptimizerError,
         explain::{render_card_grid, render_ranked_table},
         report::{PassDetail, PassOutcome, PushdownDetail, PushdownOutcome},
+        step::{
+            OptimizationType, RegisterContext, StepContext, StepOutcome, StepPhase,
+        },
+        store::Registration,
     },
 };
 
@@ -1114,12 +1118,17 @@ where
 {
     conn: Arc<C>,
     engine: Arc<E>,
-    /// Data collected during the last `run()`, used by `Explain::explain`.
+    /// Which side of an execution to step on. A rewrite is only useful before
+    /// the DAG runs, so `Before` is the author's default -- but the setting is
+    /// still honoured, because a `Once` optimization is stepped explicitly and
+    /// never around a run, which makes the value moot rather than wrong.
+    step_phase: StepPhase,
+    /// Data collected during the last `step()`, used by `explain`.
     explain_data: Option<PushdownExplainData>,
 }
 
-/// Everything `Explain::explain` needs to describe what the last `run()`
-/// did and why, retained from otherwise-local data computed during `run()`.
+/// Everything `explain` needs to describe what the last `step()`
+/// did and why, retained from otherwise-local data computed during `step()`.
 #[derive(Debug, Clone)]
 struct PushdownExplainData {
     /// `(node_id, outcome)` for every TempTable considered, deepest-first.
@@ -1136,18 +1145,20 @@ where
         Self {
             conn,
             engine,
+            step_phase: StepPhase::Before,
             explain_data: None,
         }
     }
-}
 
-#[async_trait]
-impl<C, E> OptimizerPass<C, E> for PushdownPass<C, E>
-where
-    C: Connector + Send + 'static + Sync,
-    E: Executor<C> + Send + Sync,
-{
-    async fn run(&mut self, dag: &mut Dag) -> Result<PassOutcome, OptimizerError> {
+    /// Rewrite `dag` in place, reporting what it changed.
+    ///
+    /// Split out from `step` because HMP and OMP call pushdown on each
+    /// candidate before measuring it (`hmp_use_pushdown`, `omp_use_pushdown`).
+    /// That is a rewrite inside another optimization's step, not an
+    /// optimization registered on the DAG, so it needs the work without the
+    /// step machinery around it.
+    pub async fn rewrite(&mut self, dag: &mut Dag) -> Result<PassOutcome, OptimizerError> {
+
         debug!("PushdownPass: starting");
 
         // Prerequisite — resolve the Arrow output schema of every node in the
@@ -1332,16 +1343,70 @@ where
     }
 }
 
-impl<C, E> Explain for PushdownPass<C, E>
+#[async_trait]
+impl<C, E> Optimization<C, E> for PushdownPass<C, E>
 where
     C: Connector + Send + 'static + Sync,
     E: Executor<C> + Send + Sync,
 {
-    fn explain_label(&self) -> String {
-        "PushdownPass".to_string()
+    fn name(&self) -> &'static str {
+        "pushdown"
     }
 
-    fn explain(&self) -> String {
+    /// Pushdown decides everything from the DAG in front of it. There is no
+    /// measurement to wait for and nothing a later run could teach it, so it
+    /// runs once and is finished.
+    fn optimization_type(&self) -> OptimizationType {
+        OptimizationType::Once
+    }
+
+    fn step_phase(&self) -> StepPhase {
+        self.step_phase
+    }
+
+    fn set_step_phase(&mut self, phase: StepPhase) {
+        self.step_phase = phase;
+    }
+
+    /// Nothing to set up. Pushdown keeps no state between steps -- it reads
+    /// the DAG and the warehouse's own schemas each time -- so it owns no
+    /// tables, and says so rather than creating an empty one.
+    async fn register(
+        &self,
+        _ctx: &RegisterContext<'_>,
+    ) -> Result<Option<Registration>, OptimizerError> {
+        Ok(None)
+    }
+
+    /// Nothing to tear down, for the same reason.
+    async fn deregister(
+        &self,
+        _ctx: &RegisterContext<'_>,
+    ) -> Result<Option<Registration>, OptimizerError> {
+        Ok(None)
+    }
+
+    async fn step(
+        &mut self,
+        ctx: &mut StepContext<'_, C, E>,
+    ) -> Result<StepOutcome, OptimizerError> {
+        let record = self.rewrite(ctx.dag).await?;
+        Ok(StepOutcome::Rewrote {
+            record: Box::new(record),
+        })
+    }
+
+    fn explain(&self) -> Option<(String, String)> {
+        Some(("PushdownPass".to_string(), self.explain_html()))
+    }
+}
+
+impl<C, E> PushdownPass<C, E>
+where
+    C: Connector + Send + 'static + Sync,
+    E: Executor<C> + Send + Sync,
+{
+    fn explain_html(&self) -> String {
         let Some(data) = &self.explain_data else {
             return r#"<div class="panel"><p class="subtle">PushdownPass did not run.</p></div>"#
                 .to_string();
@@ -1486,7 +1551,7 @@ mod tests {
             .clone();
 
         let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::new(engine));
-        pass.run(&mut dag).await.expect("pass should succeed");
+        pass.rewrite(&mut dag).await.expect("pass should succeed");
 
         assert_eq!(
             dag.nodes.get("staging".to_string()).unwrap().query_text,
@@ -1532,7 +1597,7 @@ mod tests {
         }];
 
         let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::new(engine));
-        pass.run(&mut dag).await.expect("pass should succeed");
+        pass.rewrite(&mut dag).await.expect("pass should succeed");
 
         let rewritten = dag
             .nodes
@@ -1597,7 +1662,7 @@ mod tests {
         }];
 
         let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::new(engine));
-        pass.run(&mut dag).await.expect("pass should succeed");
+        pass.rewrite(&mut dag).await.expect("pass should succeed");
 
         let rewritten = dag
             .nodes
@@ -1674,7 +1739,7 @@ mod tests {
         }];
 
         let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::new(engine));
-        pass.run(&mut dag)
+        pass.rewrite(&mut dag)
             .await
             .expect("pass should succeed even when one TempTable's query references another");
 
@@ -1723,7 +1788,7 @@ mod tests {
         }];
 
         let mut pass = PushdownPass::new(Arc::clone(&conn), Arc::new(engine));
-        pass.run(&mut dag).await.expect("pass should succeed");
+        pass.rewrite(&mut dag).await.expect("pass should succeed");
 
         let rewritten_node = dag.nodes.get("staging".to_string()).unwrap();
         let rewritten = rewritten_node.query_text.clone();

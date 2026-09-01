@@ -36,8 +36,10 @@ pub fn dialect_for_db(db: &str) -> DialectType {
 /// without creating any `TempTable → View` edges.
 ///
 /// Algorithm:
-/// 1. Create a landing-pad node `lp_<counter>` (TempTable, `SELECT * FROM
-///    view_name`).  Add edge `view_name → lp`.
+/// 1. Create a landing-pad node `lp_<view_name>` (TempTable, `SELECT * FROM
+///    view_name`).  Add edge `view_name → lp`.  Deriving the name from the
+///    node being materialized keeps landing pads collision-free when several
+///    nodes are materialized in the same trial.
 /// 2. Find the materialization frontier `M` = `frontier_materializes(view_name)`:
 ///    the nearest Table / TempTable nodes downstream from `view_name`.
 /// 3. For each `m` in `M`, iteratively inline every intermediate View that lies
@@ -53,26 +55,13 @@ pub fn dialect_for_db(db: &str) -> DialectType {
 /// - No `TempTable → View` edge exists in the graph.
 ///
 /// Returns the name of the created landing-pad node.
-pub fn make_temp(
-    dag: &mut Dag,
-    view_name: &str,
-    counter: &mut usize,
-) -> Result<String, OptimizerError> {
+pub fn make_temp(dag: &mut Dag, view_name: &str) -> Result<String, OptimizerError> {
     // 2. Compute the materialization frontier BEFORE inserting the landing pad,
     //    so lp itself is not included in the frontier set.
     let frontier: HashSet<String> = dag.nodes.frontier_materializes(view_name);
 
-    // 1. Create the landing-pad TempTable.
-    // Use the same schema prefix as view_name so the executor places the
-    // landing pad in the same catalog/schema (e.g. "warehouse"."main"."lp_0").
-    // schema_prefix("warehouse"."main"."foo") → "warehouse"."main".
-    let prefix = schema_prefix(view_name);
-    let lp_name = if prefix.is_empty() {
-        format!("lp_{counter}")
-    } else {
-        format!("{prefix}\"lp_{counter}\"")
-    };
-    *counter += 1;
+    // 1. Create the landing-pad TempTable, named after the node it backs.
+    let lp_name = landing_pad_name(view_name);
 
     let mut lp_deps = HashSet::new();
     lp_deps.insert(view_name.to_string());
@@ -159,6 +148,27 @@ pub fn make_temp(
     Ok(lp_name)
 }
 
+/// The landing-pad node ID for `node_id`: the same schema prefix, with the
+/// base name prefixed by `lp_`.
+///
+/// Examples:
+///   `"warehouse"."main"."foo"` → `"warehouse"."main"."lp_foo"`
+///   `foo`                      → `lp_foo`
+///
+/// Deriving the name from the node keeps landing pads unique, so materializing
+/// several nodes in one pass cannot collide.
+pub fn landing_pad_name(node_id: &str) -> String {
+    // Use the same schema prefix as node_id so the executor places the landing
+    // pad in the same catalog/schema.
+    let prefix = schema_prefix(node_id);
+    let base = &node_id[prefix.len()..];
+    if base.starts_with('"') {
+        format!("{prefix}\"lp_{}\"", base.trim_matches('"'))
+    } else {
+        format!("{prefix}lp_{base}")
+    }
+}
+
 /// Extract the schema prefix from a qualified node ID.
 ///
 /// Examples:
@@ -226,9 +236,9 @@ mod tests {
     // Layout: n (View) --> m (Table)
     //
     // After make_temp(n):
-    //   n (View) --> lp_0 (TempTable) --> m (Table)
-    //   m.query_text references lp_0, not n
-    //   m.depends_on = {lp_0}
+    //   n (View) --> lp_n (TempTable) --> m (Table)
+    //   m.query_text references lp_n, not n
+    //   m.depends_on = {lp_n}
     #[test]
     fn test_make_temp_direct_table_dep() {
         let mut dag = make_dag(vec![
@@ -236,23 +246,22 @@ mod tests {
             node("m", MaterializeMode::Table, &["n"], "SELECT x FROM n"),
         ]);
 
-        let mut counter = 0;
-        make_temp(&mut dag, "n", &mut counter).unwrap();
+        make_temp(&mut dag, "n").unwrap();
 
-        // lp_0 exists and is TempTable
-        let lp = dag.nodes.get("lp_0".to_string()).expect("lp_0 must exist");
+        // lp_n exists and is TempTable
+        let lp = dag.nodes.get("lp_n".to_string()).expect("lp_n must exist");
         assert!(matches!(lp.materialize, MaterializeMode::TempTable));
         assert_eq!(lp.query_text, "SELECT * FROM n");
         assert!(lp.depends_on.contains("n"));
 
-        // m now references lp_0, not n
+        // m now references lp_n, not n
         let m = dag.nodes.get("m".to_string()).unwrap();
-        assert!(m.query_text.contains("lp_0"), "m must reference lp_0");
+        assert!(m.query_text.contains("lp_n"), "m must reference lp_n");
         assert!(
             !m.query_text.contains(" n"),
             "m must not reference n directly"
         );
-        assert!(m.depends_on.contains("lp_0"));
+        assert!(m.depends_on.contains("lp_n"));
         assert!(!m.depends_on.contains("n"));
 
         // n is still a View
@@ -263,7 +272,7 @@ mod tests {
     // Layout: n (View) --> v1 (View) --> m (Table)
     //
     // After make_temp(n):
-    //   n (View) --> lp_0 (TempTable) --> m (Table, v1 inlined)
+    //   n (View) --> lp_n (TempTable) --> m (Table, v1 inlined)
     //   No TempTable → View edge.
     #[test]
     fn test_make_temp_intermediate_view_inlined() {
@@ -278,24 +287,23 @@ mod tests {
             node("m", MaterializeMode::Table, &["v1"], "SELECT x FROM v1"),
         ]);
 
-        let mut counter = 0;
-        make_temp(&mut dag, "n", &mut counter).unwrap();
+        make_temp(&mut dag, "n").unwrap();
 
-        // m must depend on lp_0 only, not v1 or n
+        // m must depend on lp_n only, not v1 or n
         let m = dag.nodes.get("m".to_string()).unwrap();
-        assert!(m.depends_on.contains("lp_0"), "m must depend on lp_0");
+        assert!(m.depends_on.contains("lp_n"), "m must depend on lp_n");
         assert!(!m.depends_on.contains("v1"), "m must not depend on v1");
         assert!(!m.depends_on.contains("n"), "m must not depend on n");
 
-        // m's query must reference lp_0 (v1 was inlined then n replaced by lp_0)
+        // m's query must reference lp_n (v1 was inlined then n replaced by lp_n)
         assert!(
-            m.query_text.contains("lp_0"),
-            "m query must reference lp_0; got: {}",
+            m.query_text.contains("lp_n"),
+            "m query must reference lp_n; got: {}",
             m.query_text
         );
 
-        // No TempTable → View edge: lp_0's only successor is m (Table)
-        let lp = dag.nodes.get("lp_0".to_string()).unwrap();
+        // No TempTable → View edge: lp_n's only successor is m (Table)
+        let lp = dag.nodes.get("lp_n".to_string()).unwrap();
         assert!(matches!(lp.materialize, MaterializeMode::TempTable));
         assert!(lp.depends_on.contains("n"));
     }
@@ -303,7 +311,7 @@ mod tests {
     // Layout: n (View) --> v1 (View) --> m1 (Table)
     //                  \-> m2 (Table)
     //
-    // After make_temp(n), both m1 and m2 must be rebased onto lp_0.
+    // After make_temp(n), both m1 and m2 must be rebased onto lp_n.
     #[test]
     fn test_make_temp_multiple_frontier_nodes() {
         let mut dag = make_dag(vec![
@@ -313,16 +321,15 @@ mod tests {
             node("m2", MaterializeMode::Table, &["n"], "SELECT x FROM n"),
         ]);
 
-        let mut counter = 0;
-        make_temp(&mut dag, "n", &mut counter).unwrap();
+        make_temp(&mut dag, "n").unwrap();
 
         let m1 = dag.nodes.get("m1".to_string()).unwrap();
-        assert!(m1.depends_on.contains("lp_0"));
+        assert!(m1.depends_on.contains("lp_n"));
         assert!(!m1.depends_on.contains("n"));
         assert!(!m1.depends_on.contains("v1"));
 
         let m2 = dag.nodes.get("m2".to_string()).unwrap();
-        assert!(m2.depends_on.contains("lp_0"));
+        assert!(m2.depends_on.contains("lp_n"));
         assert!(!m2.depends_on.contains("n"));
     }
 

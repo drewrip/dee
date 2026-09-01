@@ -130,6 +130,11 @@ pub enum PassDetail {
     Hmp(HmpDetail),
     Omp(OmpDetail),
     Pushdown(PushdownDetail),
+    /// A step that advanced an optimization's state without reaching a
+    /// conclusion worth describing -- a continuous pass recording a
+    /// measurement, say. Pass-specific detail is reported when the search
+    /// finishes, not on every run it observes.
+    None,
 }
 
 /// What a pass reports about its own run. The [`Optimizer`](crate::opt::Optimizer)
@@ -146,6 +151,49 @@ pub struct PassOutcome {
     pub working_set_size: u32,
     pub iterations: Vec<IterationStat>,
     pub detail: PassDetail,
+}
+
+impl PassOutcome {
+    /// An outcome that reports no work and no pass-specific detail.
+    ///
+    /// The starting point for a step that only advanced its own state; a pass
+    /// fills in the counters it actually moved.
+    pub fn empty() -> Self {
+        Self {
+            dag_runs_used: 0,
+            changes_applied: 0,
+            candidates_considered: 0,
+            working_set_size: 0,
+            iterations: Vec::new(),
+            detail: PassDetail::None,
+        }
+    }
+
+    pub fn with_detail(mut self, detail: PassDetail) -> Self {
+        self.detail = detail;
+        self
+    }
+
+    pub fn with_iterations(mut self, iterations: Vec<IterationStat>) -> Self {
+        self.iterations = iterations;
+        self
+    }
+
+    pub fn with_changes(mut self, changes_applied: u32) -> Self {
+        self.changes_applied = changes_applied;
+        self
+    }
+
+    pub fn with_dag_runs(mut self, dag_runs_used: u32) -> Self {
+        self.dag_runs_used = dag_runs_used;
+        self
+    }
+
+    pub fn with_candidates(mut self, considered: u32, working_set_size: u32) -> Self {
+        self.candidates_considered = considered;
+        self.working_set_size = working_set_size;
+        self
+    }
 }
 
 /// A [`PassOutcome`] plus the ordering and timing the optimizer observed.

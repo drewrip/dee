@@ -9,6 +9,7 @@ pub mod client;
 pub mod connection;
 pub mod dag;
 pub mod optconfig;
+pub mod optimization;
 pub mod optimize;
 pub mod queue;
 pub mod runs;
@@ -50,6 +51,8 @@ pub enum CliCommand {
     },
     /// Optimize a registered DAG.
     Optimize(optimize::OptimizeCommand),
+    /// Attach an optimization to a DAG so it steps around the DAG's runs.
+    Optimization(optimization::OptimizationCommand),
     /// Put DAGs on a cron schedule.
     #[command(subcommand_value_name = "SUBCOMMAND")]
     Schedule(schedule::ScheduleCommand),
@@ -129,6 +132,9 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn Error>> {
         CliCommand::Cancel { id } => runs::cancel(&client::Client::new(&server), id).await?,
         CliCommand::Optimize(cmd) => {
             optimize::optimize(&client::Client::new(&server), cmd).await?
+        }
+        CliCommand::Optimization(cmd) => {
+            optimization::optimization(&client::Client::new(&server), cmd).await?
         }
         CliCommand::Schedule(cmd) => schedule::run(&client::Client::new(&server), cmd).await?,
         CliCommand::Draw(draw_cmd) => {

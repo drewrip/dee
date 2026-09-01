@@ -154,7 +154,7 @@ pub async fn start(
 /// merged object rather than patching a struct is what keeps `deny_unknown_fields`
 /// doing its job -- a misspelled `omp_topp` is rejected here instead of being
 /// dropped and quietly running under the wrong settings.
-fn resolve_config(
+pub(crate) fn resolve_config(
     stored: Option<OptimizerConfig>,
     overrides: Option<serde_json::Value>,
 ) -> Result<OptimizerConfig, ServerError> {

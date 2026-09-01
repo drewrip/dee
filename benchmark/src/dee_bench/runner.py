@@ -67,6 +67,9 @@ class CellResult:
     error: str | None = None
     measured_runs: int = 0
     rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Things worth saying about a cell that did not fail -- a continuous
+    # optimization that ran out of runs before converging, say.
+    notes: list[str] = field(default_factory=list)
 
 
 def build_optimizer_config(cell: Cell) -> dict[str, Any]:
@@ -177,16 +180,108 @@ class CellRunner:
             self._record_graph(cell, dag_name, version, "unopt", result)
 
             dag_variant = "unopt"
-            if not cell.is_baseline:
+            if cell.is_continuous:
+                # Nothing is optimized up front. The optimization is attached
+                # to the DAG and steps around the measured runs below, so the
+                # version measured is whatever it has converged to by then --
+                # read back after the fact rather than decided here.
+                self._register(cell, dag_name, artifacts, result)
+                dag_variant = "converging"
+            elif not cell.is_baseline:
                 version = self._optimize(cell, dag_name, artifacts, result)
                 dag_variant = "optimized"
                 self._record_graph(cell, dag_name, version, "optimized", result)
 
             self._measure(cell, dag_name, version, ctx, artifacts, dag_variant, result)
+
+            if cell.is_continuous:
+                self._collect_continuous(cell, dag_name, artifacts, result)
         except Exception as e:  # noqa: BLE001 - a cell failure must not end the sweep
             result.status = "failed"
             result.error = f"{type(e).__name__}: {e}"
         return result
+
+    # -- continuous --------------------------------------------------------
+
+    def _register(self, cell: Cell, dag_name: str, artifacts: Path,
+                  result: CellResult) -> None:
+        """Attach this cell's optimizations to the DAG.
+
+        The settings were submitted with the DAG, so registration sends none of
+        its own -- the same indirection `_optimize` relies on, and checked the
+        same way against what the server echoes back.
+        """
+        registrations = []
+        for optimization in cell.passes:
+            accepted = self.client.register_optimization(
+                dag_name, optimization, cell.variant.step_phase, None
+            )
+            _verify_settings(cell, accepted.get("config") or {})
+            registrations.append(accepted)
+        (artifacts / "registrations.json").write_text(json.dumps(registrations, indent=2))
+
+        # A `once` optimization is not stepped around runs, so registering one
+        # and then measuring would measure the unoptimized DAG while the result
+        # claimed the optimization was applied.
+        stepping = [r["name"] for r in registrations
+                    if r.get("optimization_type") == "continuous"]
+        if not stepping:
+            raise WorkloadError(
+                f"none of {list(cell.passes)} is a continuous optimization, so "
+                "there is nothing for continuous mode to drive; run this variant "
+                "under optimization_mode: batch"
+            )
+
+    def _collect_continuous(self, cell: Cell, dag_name: str, artifacts: Path,
+                            result: CellResult) -> None:
+        """Record what the registered optimizations converged to, if anything.
+
+        The counterpart to `_optimize`'s rows. There is no `OptimizeReport` to
+        read here -- nothing ran an optimization as a job -- so the same
+        questions are answered from the registrations themselves: did it
+        converge, on which version, and how many of the cell's runs did it
+        spend getting there.
+        """
+        registrations = self.client.optimizations(dag_name)
+        (artifacts / "registrations_final.json").write_text(
+            json.dumps(registrations, indent=2)
+        )
+
+        for row in registrations:
+            converged = not row.get("active", True)
+            result.rows.setdefault("optimizations", []).append({
+                "cell_id": cell.cell_id,
+                "started_at": None,
+                "finished_at": None,
+                # A continuous optimization runs no jobs of its own: its cost
+                # is the overhead its steps added to runs that were happening
+                # anyway, which shows up in those runs' timings rather than as
+                # a separate wall time. Recording zero here rather than null
+                # says "measured, and it was none", which is the finding.
+                "opt_wall_ms": 0,
+                "opt_cpu_seconds": None,
+                "opt_peak_rss_bytes": None,
+                "dag_runs_used": 0,
+                "baseline_runtime_ms": None,
+                "final_runtime_ms": None,
+                "total_changes_applied": None,
+                "nodes_before": None,
+                "nodes_after": None,
+                "status": "converged" if converged else "converging",
+                "error": None,
+                "optimization_type": row.get("optimization_type"),
+                "step_phase": row.get("step_phase"),
+                "result_version": row.get("result_version"),
+            })
+
+        if any(r.get("active", True) for r in registrations):
+            # Not a failure -- the search is real, it simply had fewer runs
+            # than it needed. Recorded so a cell that did not converge is not
+            # read as one that converged on the DAG as authored.
+            result.notes.append(
+                f"{cell.cell_id}: an optimization had not converged after "
+                f"{cell.repetitions} run(s)"
+            )
 
     # -- optimize ----------------------------------------------------------
 
@@ -310,6 +405,7 @@ class CellRunner:
                 "run_id": run_id,
                 "run_group_id": group_id,
                 "dag_variant": dag_variant,
+                "dag_version": (server_run or {}).get("dag_version"),
                 "phase": phase,
                 "rep_index": rep_index,
                 "started_at": _ts(r.get("run_started_at")),

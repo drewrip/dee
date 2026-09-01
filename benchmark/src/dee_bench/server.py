@@ -98,6 +98,9 @@ class DeeClient:
     def put(self, path: str, body: Any) -> Any:
         return self._request("PUT", path, body)
 
+    def delete(self, path: str) -> Any:
+        return self._request("DELETE", path)
+
     # -- operations --------------------------------------------------------
 
     def info(self) -> dict[str, Any]:
@@ -189,6 +192,32 @@ class DeeClient:
 
     def optimization_explain(self, optimization_id: str) -> str:
         return self.get_text(f"/v1/optimizations/{optimization_id}/explain.html")
+
+    # -- registered (continuous) optimizations -----------------------------
+    #
+    # The other shape an optimization takes. `optimize` above means "optimize
+    # this DAG now, to convergence, buying the DAG runs it needs". Registering
+    # attaches an optimization to a DAG so it steps around the runs the DAG
+    # performs anyway. Which applies is a property of the optimization --
+    # `available_optimizations` says which are continuous.
+
+    def available_optimizations(self) -> list[dict[str, Any]]:
+        return self.get("/v1/optimizations/available")
+
+    def register_optimization(
+        self, name: str, optimization: str, step_phase: str | None,
+        config: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return self.post(
+            f"/v1/dags/{name}/optimizations",
+            {"name": optimization, "step_phase": step_phase, "config": config},
+        )
+
+    def optimizations(self, name: str) -> list[dict[str, Any]]:
+        return self.get(f"/v1/dags/{name}/optimizations")
+
+    def deregister_optimization(self, name: str, optimization: str) -> dict[str, Any]:
+        return self.delete(f"/v1/dags/{name}/optimizations/{optimization}")
 
 
 class DeeServer:

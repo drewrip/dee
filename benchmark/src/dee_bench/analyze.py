@@ -83,15 +83,34 @@ def compute_payback(run_dir: str | Path) -> list[dict[str, Any]]:
     measurements = con.sql("""
         SELECT c.cell_id, c.run_name, c.project, c.backend, c.sf, c.variant,
                r.engine_wall_ms / 1000.0 AS wall_s,
-               r.cpu_seconds
+               r.cpu_seconds,
+               r.dag_version
         FROM runs r JOIN cells c USING (cell_id)
         WHERE r.phase = 'measure' AND r.status = 'ok' AND r.engine_wall_ms IS NOT NULL
     """).fetchall()
     if not measurements:
         return []
 
+    # A continuous optimization converges partway through its cell's runs, so
+    # the cell's measurements are not all of the same DAG: the ones before it
+    # promoted include its baseline and every candidate it tried. Comparing
+    # those against an unoptimized baseline would answer a question nobody
+    # asked -- "how fast is a DAG while being experimented on". The promoted
+    # version is what separates them, and only runs at it are runs of the
+    # optimized DAG.
+    converged_version: dict[str, int] = {}
+    if "optimizations" in tables:
+        for cell_id, version in con.sql(
+            "SELECT cell_id, result_version FROM optimizations "
+            "WHERE status = 'converged' AND result_version IS NOT NULL"
+        ).fetchall():
+            converged_version[cell_id] = int(version)
+
     by_cell: dict[str, dict[str, Any]] = {}
-    for cell_id, run_name, project, backend, sf, variant, wall_s, cpu_s in measurements:
+    for cell_id, run_name, project, backend, sf, variant, wall_s, cpu_s, version in measurements:
+        wanted = converged_version.get(cell_id)
+        if wanted is not None and version is not None and int(version) != wanted:
+            continue
         entry = by_cell.setdefault(cell_id, {
             "cell_id": cell_id, "run_name": run_name, "project": project,
             "backend": backend, "sf": float(sf), "variant": variant,
@@ -103,25 +122,40 @@ def compute_payback(run_dir: str | Path) -> list[dict[str, Any]]:
 
     costs: dict[str, dict[str, Any]] = {}
     if "optimizations" in tables:
+        # 'ok' is a finished batch optimization; 'converged' is a continuous
+        # one that reached an answer. A 'converging' cell ran out of runs
+        # before deciding, and has no result to attribute a cost to.
         for cell_id, wall_ms, cpu_s in con.sql(
-            "SELECT cell_id, opt_wall_ms, opt_cpu_seconds FROM optimizations WHERE status = 'ok'"
+            "SELECT cell_id, opt_wall_ms, opt_cpu_seconds FROM optimizations "
+            "WHERE status IN ('ok', 'converged')"
         ).fetchall():
             costs[cell_id] = {
                 "wall_s": (wall_ms or 0) / 1000.0,
                 "cpu_s": cpu_s,
             }
 
-    # Baselines are the cells that ran no optimizer passes.
+    # Baselines are the cells that ran no optimizer passes. Read from `cells`
+    # rather than inferred from the absence of a cost row: a cell whose
+    # optimization did not converge also has no cost, and treating it as a
+    # baseline would make every other variant look faster than it should.
+    baseline_ids: set[str] = set()
+    for (cell_id,) in con.sql(
+        "SELECT cell_id FROM cells WHERE passes IS NULL OR len(passes) = 0"
+    ).fetchall():
+        baseline_ids.add(cell_id)
+
     baselines: dict[tuple, dict[str, Any]] = {}
     for entry in by_cell.values():
-        if entry["cell_id"] not in costs:
+        if entry["cell_id"] in baseline_ids:
             baselines[tuple(entry[k] for k in GROUP_KEYS)] = entry
 
     rows: list[dict[str, Any]] = []
     for entry in by_cell.values():
+        if entry["cell_id"] in baseline_ids:
+            continue  # this cell *is* a baseline
         cost = costs.get(entry["cell_id"])
         if cost is None:
-            continue  # this cell *is* a baseline
+            continue  # optimized, but it never reached a result to price
         base = baselines.get(tuple(entry[k] for k in GROUP_KEYS))
         if base is None:
             continue  # nothing to compare against, e.g. baseline cell failed

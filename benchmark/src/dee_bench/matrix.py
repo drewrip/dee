@@ -24,7 +24,7 @@ from typing import Any
 from .config import DEE_OPT_BY_NAME, BenchConfig, Variant
 
 # Keys the runner needs but which are not part of the swept matrix.
-_RESERVED = {"project", "backend", "sf", "variant", "repeat_mode"}
+_RESERVED = {"project", "backend", "sf", "variant", "repeat_mode", "optimization_mode"}
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,12 @@ class Cell:
     # changes what is being measured, so two cells differing only in this are
     # two experiments, not a duplicate.
     repeat_mode: str = "group"
+    # "batch" or "continuous": whether the cell's optimization is run to
+    # convergence up front, buying its own DAG runs, or registered on the DAG
+    # and stepped around the measured runs. Part of the identity for the same
+    # reason `repeat_mode` is -- it changes what the cell measures, and what
+    # the optimization cost means.
+    optimization_mode: str = "batch"
     # Any extra matrix keys, carried through for provenance.
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -58,6 +64,17 @@ class Cell:
     @property
     def is_baseline(self) -> bool:
         return self.variant.is_baseline
+
+    @property
+    def is_continuous(self) -> bool:
+        """Whether this cell's optimization steps around its measured runs.
+
+        A baseline has no optimization at all, so it is never continuous
+        regardless of the mode it was configured under -- otherwise sweeping
+        `optimization_mode` would double every baseline cell with a second one
+        that does exactly the same thing.
+        """
+        return self.optimization_mode == "continuous" and not self.is_baseline
 
     def describe(self) -> str:
         return f"{self.project}/{self.backend}/sf{self.sf:g}/{self.variant.name}"
@@ -75,6 +92,7 @@ class Cell:
             "repetitions": self.repetitions,
             "warmups": self.warmups,
             "repeat_mode": self.repeat_mode,
+            "optimization_mode": self.optimization_mode,
             "extra": self.extra,
         }
 
@@ -137,6 +155,16 @@ def expand(cfg: BenchConfig) -> list[Cell]:
             # Swept like any other axis when the matrix names it; otherwise
             # the whole run uses one mode.
             repeat_mode=str(values.get("repeat_mode", cfg.execution.repeat_mode)),
+            # A baseline runs no optimization, so there is nothing for a mode
+            # to describe. Pinning it here -- rather than letting the swept
+            # value through -- is what stops sweeping the mode from producing
+            # two identical baseline cells and double-counting them in every
+            # aggregate, the same reason `dee_opt` is pruned above.
+            optimization_mode=(
+                "batch"
+                if variant.is_baseline
+                else str(values.get("optimization_mode", cfg.execution.optimization_mode))
+            ),
             extra={k: values[k] for k in matrix_keys if k not in _RESERVED},
         )
         cell_id = compute_cell_id(cell.identity())
@@ -189,6 +217,7 @@ def cells_to_rows(cells: list[Cell], provenance: dict[str, Any]) -> list[dict[st
             "repetitions": c.repetitions,
             "warmups": c.warmups,
             "repeat_mode": c.repeat_mode,
+            "optimization_mode": c.optimization_mode,
             "dee_git_sha": provenance.get("dee_git_sha"),
             "dag_bench_git_sha": provenance.get("dag_bench_git_sha"),
             "harness_version": provenance.get("harness_version"),

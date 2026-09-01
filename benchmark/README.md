@@ -92,6 +92,33 @@ Every `dee_opt` key mirrors a field of `OptimizerConfig` in
 `dee/src/opt.rs`; `src/dee_bench/config.py` holds the mapping, including which
 passes read each option.
 
+### Batch and continuous optimization
+
+`execution.optimization_mode` chooses how a cell's optimization is driven, and
+the two answer different questions:
+
+| | `batch` (default) | `continuous` |
+|---|---|---|
+| how | `dee optimize` runs the search to convergence up front | the optimization is registered on the DAG and steps around the measured runs |
+| cost | the DAG runs its search buys, in `opt_wall_ms` and `dag_runs_used` | none of its own — it spends runs the DAG was performing anyway |
+| measured runs | all execute the result | those before it converges include its baseline and candidates; only runs at the promoted version are runs of the optimized DAG |
+| asks | how good a plan can be found, and what did finding it cost | how quickly does a DAG converge while doing its normal work |
+
+`batch` is the default and is what every existing result in `results/` was
+produced under, so those numbers stay comparable. `configs/continuous.yaml`
+sweeps `optimization_mode` to put the two side by side on the same DAGs.
+
+In continuous mode `runs.dag_version` is what separates the two halves of a
+cell: it rises once, when the search promotes its result, and `analyze` computes
+payback from the runs at that version only. A cell whose search had not
+converged by its last run is recorded `converging` rather than `converged`, and
+contributes no payback row — a search that did not finish has no result to
+price. Give continuous cells generous `repetitions` for that reason.
+
+Only a `continuous` optimization can be driven this way. Pushdown runs `once`,
+so a variant naming it alone is refused up front rather than measured as though
+it had been applied; `dee-bench doctor` lists which is which.
+
 A cell's variant and `dee_opt` are submitted **with its DAG**, as the DAG's
 optimizer settings, so `dee dag optimizer c<cell_id>` answers what any DAG in
 the sweep's registry is for. The optimize request itself then carries no

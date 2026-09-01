@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from . import queue as q
-from .config import ConfigError, load
+from .config import VALID_PASSES, ConfigError, load
 from .schema import Verbosity, render_markdown
 
 
@@ -333,7 +333,7 @@ def _check_server(args: argparse.Namespace) -> bool:
     import tempfile
 
     from .config import DEE_OPT_SPECS
-    from .server import DeeServer, ServerError
+    from .server import ApiError, DeeServer, ServerError
 
     dee_bin = Path(getattr(args, "dee_bin", None) or "../../target/release/dee").resolve()
     print(f"\ndee binary: {dee_bin if dee_bin.exists() else f'{dee_bin} NOT FOUND'}")
@@ -354,6 +354,15 @@ def _check_server(args: argparse.Namespace) -> bool:
                     has_queue = None
                 except (ServerError, OSError) as e:
                     has_queue = str(e)
+                # Likewise for the registration endpoint, which is what
+                # `optimization_mode: continuous` needs.
+                try:
+                    available = {
+                        o["name"]: o for o in client.available_optimizations()
+                    }
+                    no_registration = None
+                except (ApiError, ServerError, OSError) as e:
+                    available, no_registration = {}, str(e)
     except (ServerError, OSError) as e:
         print(f"  could not start a server to check options: {e}")
         return False
@@ -395,7 +404,32 @@ def _check_server(args: argparse.Namespace) -> bool:
 
     if not missing and not mismatched:
         print("  in sync")
-    return not missing and not mismatched and has_queue is None
+
+    # Which optimizations the server has, and how each is driven. `continuous`
+    # mode only means anything for an optimization that steps around runs, so a
+    # config asking for it on a `once` one is a mistake worth catching here
+    # rather than mid-sweep.
+    unknown_passes: list[str] = []
+    if no_registration is not None:
+        print(f"\noptimizations: this dee server cannot list them ({no_registration});")
+        print("  execution.optimization_mode must be 'batch' with this dee")
+    else:
+        print(f"\noptimizations: {len(available)} available")
+        for name, o in sorted(available.items()):
+            print(
+                f"  {name}: {o['optimization_type']}, "
+                f"steps {o['default_step_phase']} by default"
+            )
+        unknown_passes = [p for p in VALID_PASSES if p not in available]
+        for name in unknown_passes:
+            print(f"  {name}: dee-bench knows it but the server does not")
+
+    return (
+        not missing
+        and not mismatched
+        and not unknown_passes
+        and has_queue is None
+    )
 
 
 def _finalize(run_dir: Path, skip_viz: bool = False) -> None:

@@ -9,6 +9,7 @@ dee = { path = "../dee" }
 
 axum = "0.8"
 tower = "0.5"
+async-trait = "0.1.89"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tokio = { version = "1.50.0", features = ["full"] }
 

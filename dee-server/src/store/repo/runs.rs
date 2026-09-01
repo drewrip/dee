@@ -706,6 +706,29 @@ pub async fn mark_run_running(store: &Store, run_id: String) -> Result<(), Store
         .await
 }
 
+/// Point a run at the version it actually executed.
+///
+/// A run group is dispatched against whatever version was current at the time,
+/// but a continuous optimization that converges on a `Before` step promotes its
+/// result and that run executes the promotion. Leaving the run pointing at the
+/// version it was dispatched for would mean `dee runs list` disagreed with what
+/// the run did.
+pub async fn set_run_version(
+    store: &Store,
+    run_id: String,
+    dag_version: i32,
+) -> Result<(), StoreError> {
+    store
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE runs SET dag_version = ? WHERE run_id = ?",
+                duckdb::params![dag_version, run_id],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
 pub async fn mark_run_terminal(
     store: &Store,
     run_id: String,

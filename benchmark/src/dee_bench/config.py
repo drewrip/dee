@@ -102,6 +102,26 @@ REPEAT_MODES = ("group", "queue")
 
 
 VALID_PASSES = ("hmp", "omp", "pushdown")
+
+# How a cell's optimizations are driven.
+#
+# ``batch`` is `dee optimize`: the optimization is run to convergence in one
+# shot, buying the DAG runs its search needs, and the measured runs that follow
+# execute the result. That is what every existing result in `results/` was
+# produced under, and it stays the default so those numbers remain comparable.
+#
+# ``continuous`` registers the optimization on the DAG instead. It then steps
+# around the measured runs themselves, spending no runs of its own -- the shape
+# dee's server model actually makes possible, where a pipeline that runs
+# nightly optimizes itself nightly. The two answer different questions: batch
+# asks "how good a plan can be found, and what did finding it cost"; continuous
+# asks "how quickly does a DAG converge while doing its normal work".
+VALID_OPTIMIZATION_MODES = ("batch", "continuous")
+
+# Which side of each run a registered optimization steps on. ``None`` leaves it
+# to the optimization's own default, which is what a benchmark wants unless it
+# is specifically studying the setting.
+VALID_STEP_PHASES = ("before", "after", "both")
 VALID_BACKENDS = ("duckdb", "postgres")
 
 
@@ -117,6 +137,10 @@ class Variant:
     passes: tuple[str, ...]
     # Per-variant dee_opt overrides, applied on top of the global dee_opt.
     overrides: dict[str, Any] = field(default_factory=dict)
+    # When a registered optimization steps, in `continuous` mode. `None` means
+    # the optimization's own default. Ignored in `batch` mode, where nothing is
+    # registered and the driver supplies both sides itself.
+    step_phase: str | None = None
 
     @property
     def is_baseline(self) -> bool:
@@ -162,6 +186,20 @@ class ExecutionConfig:
     # ``matrix.repeat_mode`` overrides this per cell, and sweeping it there is
     # how the two modes get compared within one run.
     repeat_mode: str = "group"
+
+    # ``batch`` or ``continuous`` -- see VALID_OPTIMIZATION_MODES. Sweepable
+    # per cell through ``matrix.optimization_mode``, which is how one run
+    # compares a batch optimization against the same one driven continuously.
+    optimization_mode: str = "batch"
+
+    # Measured runs to give a continuous optimization to converge in.
+    #
+    # A continuous optimization needs runs to learn from, and a cell that ran
+    # fewer than its search needs would be recorded as "did not converge"
+    # rather than as a result. This is the ceiling on how many extra runs a
+    # cell will perform waiting for one; the runs still count as measurements,
+    # so nothing is wasted if it converges early.
+    converge_runs: int = 12
 
 
 @dataclass
@@ -305,7 +343,13 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
                     f"variants.{vname}.passes: unknown pass {p!r}; "
                     f"expected one of {', '.join(VALID_PASSES)}"
                 )
-        overrides = {k: v for k, v in vcfg.items() if k != "passes"}
+        step_phase = vcfg.get("step_phase")
+        if step_phase is not None and step_phase not in VALID_STEP_PHASES:
+            raise ConfigError(
+                f"variants.{vname}.step_phase: unknown phase {step_phase!r}; "
+                f"expected one of {', '.join(VALID_STEP_PHASES)}"
+            )
+        overrides = {k: v for k, v in vcfg.items() if k not in ("passes", "step_phase")}
         for k in overrides:
             if k not in DEE_OPT_BY_NAME:
                 raise ConfigError(
@@ -316,6 +360,7 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
             name=str(vname),
             passes=tuple(passes),
             overrides={k: _coerce(DEE_OPT_BY_NAME[k], v) for k, v in overrides.items()},
+            step_phase=step_phase,
         )
 
     # --- matrix -----------------------------------------------------------
@@ -351,6 +396,15 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
         if mode not in REPEAT_MODES:
             raise ConfigError(
                 f"matrix.repeat_mode must be one of {', '.join(REPEAT_MODES)}, got {mode!r}"
+            )
+
+    # Likewise `optimization_mode`: sweeping it is how one run answers whether
+    # optimizing continuously reaches the same plan a batch optimization found.
+    for mode in matrix.get("optimization_mode", ()):
+        if mode not in VALID_OPTIMIZATION_MODES:
+            raise ConfigError(
+                f"matrix.optimization_mode must be one of "
+                f"{', '.join(VALID_OPTIMIZATION_MODES)}, got {mode!r}"
             )
 
     for project in matrix["project"]:
@@ -390,6 +444,7 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
         raise ConfigError("`execution` must be a mapping")
     unknown = set(exec_raw) - {
         "repetitions", "warmups", "sample_interval_ms", "timeout_s", "repeat_mode",
+        "optimization_mode", "converge_runs",
     }
     if unknown:
         raise ConfigError(f"execution: unknown key(s): {', '.join(sorted(unknown))}")
@@ -403,6 +458,13 @@ def _resolve(raw: dict[str, Any], source_path: Path | None = None) -> BenchConfi
             f"execution.repeat_mode must be one of {', '.join(REPEAT_MODES)}, "
             f"got {execution.repeat_mode!r}"
         )
+    if execution.optimization_mode not in VALID_OPTIMIZATION_MODES:
+        raise ConfigError(
+            f"execution.optimization_mode must be one of "
+            f"{', '.join(VALID_OPTIMIZATION_MODES)}, got {execution.optimization_mode!r}"
+        )
+    if execution.converge_runs < 1:
+        raise ConfigError("execution.converge_runs must be at least 1")
 
     # --- server -----------------------------------------------------------
     server_raw = raw.get("server") or {}

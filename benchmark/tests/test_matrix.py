@@ -94,9 +94,15 @@ def _config(**matrix):
         matrix={"project": ["p01_iot"], "backend": ["duckdb"], "sf": [0.1],
                 "variant": ["unopt"], **matrix},
         dee_opt={},
-        variants={"unopt": Variant(name="unopt", passes=())},
+        variants={
+            "unopt": Variant(name="unopt", passes=()),
+            "hmp": Variant(name="hmp", passes=("hmp",)),
+        },
         backends={"duckdb": {}},
-        execution=SimpleNamespace(repetitions=3, warmups=1, repeat_mode="group"),
+        execution=SimpleNamespace(
+            repetitions=3, warmups=1, repeat_mode="group",
+            optimization_mode="batch", converge_runs=12,
+        ),
     )
 
 
@@ -118,3 +124,47 @@ class TestRepeatMode:
         # `extra` holds matrix keys the runner does not understand. This one it
         # does, and duplicating it there would put it in the identity twice.
         assert expand(_config(repeat_mode=["queue"]))[0].extra == {}
+
+
+# --- optimization_mode ----------------------------------------------------
+
+
+def test_sweeping_optimization_mode_does_not_duplicate_the_baseline():
+    """A baseline runs no optimization, so a mode says nothing about it.
+
+    Without pinning, sweeping the mode would produce two `unopt` cells doing
+    identical work, and every aggregate keyed on the baseline would count it
+    twice.
+    """
+    cfg = _config(
+        variant=["unopt", "hmp"],
+        optimization_mode=["batch", "continuous"],
+    )
+    cells = expand(cfg)
+
+    baselines = [c for c in cells if c.variant.name == "unopt"]
+    assert len(baselines) == 1
+    assert baselines[0].optimization_mode == "batch"
+    assert not baselines[0].is_continuous
+
+    # The real variant still gets both.
+    hmp = sorted(c.optimization_mode for c in cells if c.variant.name == "hmp")
+    assert hmp == ["batch", "continuous"]
+
+
+def test_the_mode_is_part_of_a_cells_identity():
+    """The same variant under the two modes is two experiments.
+
+    They measure different things -- one buys its own runs, the other spends
+    the DAG's -- so collapsing them would average two answers into one.
+    """
+    cfg = _config(variant=["hmp"], optimization_mode=["batch", "continuous"])
+    cells = expand(cfg)
+    assert len({c.cell_id for c in cells}) == 2
+
+
+def test_only_a_real_variant_is_continuous():
+    cfg = _config(variant=["unopt", "hmp"], optimization_mode=["continuous"])
+    by_variant = {c.variant.name: c for c in expand(cfg)}
+    assert by_variant["hmp"].is_continuous
+    assert not by_variant["unopt"].is_continuous

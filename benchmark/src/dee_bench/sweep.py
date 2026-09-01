@@ -171,15 +171,42 @@ class Sweep:
         -- and a sweep that dies eight cells in has already wasted the
         expensive part.
         """
-        if not any(cell.repeat_mode == "queue" for cell in pending):
+        if any(cell.repeat_mode == "queue" for cell in pending):
+            try:
+                client.queue()
+            except (ApiError, ServerError) as e:
+                raise ServerError(
+                    "execution.repeat_mode is 'queue' but this dee server has no run "
+                    f"queue ({e}); use a newer dee, or set repeat_mode: group"
+                ) from None
+
+        continuous = [c for c in pending if c.is_continuous]
+        if not continuous:
             return
         try:
-            client.queue()
+            available = {o["name"]: o for o in client.available_optimizations()}
         except (ApiError, ServerError) as e:
             raise ServerError(
-                "execution.repeat_mode is 'queue' but this dee server has no run "
-                f"queue ({e}); use a newer dee, or set repeat_mode: group"
+                "optimization_mode is 'continuous' but this dee server cannot "
+                f"register optimizations ({e}); use a newer dee, or set "
+                "optimization_mode: batch"
             ) from None
+
+        # A `once` optimization is not stepped around runs. Registering one and
+        # measuring anyway would quietly measure the unoptimized DAG under a
+        # variant name that says otherwise, so refuse the whole sweep here
+        # rather than produce cells that look fine.
+        for cell in continuous:
+            steppable = [
+                p for p in cell.passes
+                if available.get(p, {}).get("optimization_type") == "continuous"
+            ]
+            if not steppable:
+                raise ServerError(
+                    f"variant '{cell.variant.name}' runs {list(cell.passes)}, none of "
+                    "which is a continuous optimization, so continuous mode has "
+                    "nothing to drive; run that variant under optimization_mode: batch"
+                )
 
     def _execute_cells(self, pending: list[Cell], client, server_pid) -> None:
         prepared_key: tuple[str, str, float] | None = None

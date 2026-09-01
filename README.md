@@ -103,7 +103,9 @@ dee queue clear --dag pipeline
 
 This is not the same thing as `--repeat`. A run group pins one version and
 executes under one driver, so nothing that happens between its repetitions can
-change what it runs. Queue entries are separate groups, so an entry that did
+change what it runs — with one exception, a continuous optimization registered
+on the DAG, which is *meant* to change what it runs and records the version
+each repetition actually executed. Queue entries are separate groups, so an entry that did
 not name a `--version` resolves to whatever version is current *when its turn
 comes*. Submit a new version halfway through a queue of twenty and the
 remaining runs execute it, so one `dee runs list` shows the DAG before and
@@ -141,8 +143,10 @@ window that produced nothing and why, so "the schedule did nothing" is never
 indistinguishable from "the server was down".
 
 At most one job runs per DAG at a time. A window that collides with a job still
-in flight is recorded as an `overlap` skip naming what blocked it. Optimizations
-count as jobs, because they execute the DAG too.
+in flight is recorded as an `overlap` skip naming what blocked it. A
+`dee optimize` counts as a job, because it executes the DAG too. A registered
+continuous optimization does not: it spends no runs of its own, so there is
+nothing for it to collide with.
 
 **Optimization** rewrites a DAG and, with `--save`, stores the result as a new
 version attributed to the one it came from. With no flags it runs under the
@@ -166,3 +170,47 @@ optimized pipeline v1 in 1669ms using 2 dag run(s)
 runtime 634ms -> 378ms (40.4% faster)
   pays for itself after 7 run(s)
 ```
+
+**Continuous optimization** is the other way to reach the same thing. `dee
+optimize` above is a job: it decides now, and it buys the DAG runs its search
+needs to decide. But dee is already running this DAG — on a schedule, from a
+trigger, out of the queue — and those runs are measurements too. Registering an
+optimization attaches it to the DAG so it steps around each of those runs
+instead, proposing a candidate before one and learning from it after.
+
+```bash
+dee optimization available                    # what dee can register, and how each behaves
+dee optimization register pipeline hmp        # attach it
+dee optimization list pipeline
+dee optimization deregister pipeline hmp      # detach it, dropping its state
+```
+
+It costs no runs of its own. The DAG is a little slower while the search is
+exploring, and faster once it has converged; when it does, it stores its result
+as a new version exactly as `dee optimize --save` would, and everything after
+runs that. `dee optimization list` says whether it is still `stepping` or has
+`converged`, and which version it promoted.
+
+```
+NAME       TYPE        PHASE   STATE     TABLES
+hmp        continuous  both    converged opt_hmp_state, opt_hmp_trials
+```
+
+Which of the two applies is a property of the optimization, not a preference.
+HMP and OMP decide by measuring the DAG run, so they are `continuous` and step
+around runs. Pushdown decides from the DAG in front of it, so it is `once`:
+there is no measurement to wait for and nothing a later run could teach it.
+`dee optimize` drives either — for a continuous optimization it supplies the
+runs itself rather than waiting for the schedule to provide them, which is why
+it is still the right command when you want an answer today.
+
+A continuous optimization keeps its state in the metadata database, in tables it
+creates itself and that `deregister` drops. That is what lets a search survive a
+restart: what to try on this run is decided by reading what previous runs
+measured, so nothing is lost when the process goes away. Those tables are the
+optimization's own — it can reach nothing else in that database, which also
+holds every run dee has recorded and every connection's credentials.
+
+Because it spends no runs of its own, a continuous optimization does not take
+the exclusive per-DAG claim that `dee optimize` does, and does not block the
+schedule it is improving.
