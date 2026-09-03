@@ -384,7 +384,12 @@ def _check_server(args: argparse.Namespace) -> bool:
     for name in extra:
         # Not every server option needs to be sweepable; the pass toggles are
         # set from a variant's pass list rather than from dee_opt.
-        if name in ("run_hmp_pass", "run_omp_pass", "run_pushdown_pass"):
+        if name in (
+            "run_hmp_pass",
+            "run_omp_pass",
+            "run_pushdown_pass",
+            "run_parallelism_pass",
+        ):
             continue
         print(f"  {name}: on the server but not in dee-bench -- consider adding it")
 

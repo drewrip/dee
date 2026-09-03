@@ -15,6 +15,7 @@ use crate::{
         Optimization, OptimizerConfig,
         hmp::HMPPass,
         omp::OMPPass,
+        parallelism::ParallelismTuning,
         pushdown::PushdownPass,
         step::{OptimizationType, StepPhase},
     },
@@ -45,6 +46,14 @@ pub const OPTIMIZATIONS: &[OptimizationInfo] = &[
         doc: "Optimal materialization plan. Enumerates every materialization \
               of the most central nodes and measures each, one plan per DAG \
               run.",
+    },
+    OptimizationInfo {
+        name: "parallelism",
+        optimization_type: OptimizationType::Continuous,
+        default_step_phase: StepPhase::Both,
+        doc: "Tunes how many nodes the DAG runs at once. Ladders over \
+              node-concurrency caps, one per DAG run, accepting a rung only \
+              when every sample of it beats every sample of the incumbent.",
     },
     OptimizationInfo {
         name: "pushdown",
@@ -79,6 +88,7 @@ where
     match name {
         "hmp" => Some(Box::new(HMPPass::from_config(conn, engine, config))),
         "omp" => Some(Box::new(OMPPass::from_config(conn, engine, config))),
+        "parallelism" => Some(Box::new(ParallelismTuning::from_config(config))),
         "pushdown" => Some(Box::new(PushdownPass::new(conn, engine))),
         _ => None,
     }
@@ -110,6 +120,10 @@ mod tests {
         );
         assert_eq!(
             info("omp").unwrap().optimization_type,
+            OptimizationType::Continuous
+        );
+        assert_eq!(
+            info("parallelism").unwrap().optimization_type,
             OptimizationType::Continuous
         );
         assert_eq!(

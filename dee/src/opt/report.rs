@@ -103,6 +103,42 @@ pub struct OmpDetail {
     pub use_pushdown: bool,
 }
 
+/// ParallelismTuning-specific fields of a [`PassReport`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ParallelismDetail {
+    /// The setting the DAG arrived with. `None` is unlimited.
+    pub baseline_parallelism: Option<usize>,
+    /// The setting the search settled on. Equal to `baseline_parallelism`
+    /// when nothing beat it.
+    pub chosen_parallelism: Option<usize>,
+    /// Worst baseline sample -- the runtime the DAG was known to be capable of
+    /// before the search, rather than its luckiest draw.
+    pub baseline_runtime_ms: f64,
+    /// Worst sample of the chosen setting, on the same principle.
+    pub best_runtime_ms: f64,
+    /// Fractional change from baseline to best; negative is an improvement.
+    pub opt_change: f64,
+    pub seed_repeats: usize,
+    pub confirm_runs: usize,
+    /// The configured ladder, before pruning against the DAG.
+    pub ladder: Vec<usize>,
+    /// Every setting the search resolved, baseline first, in the order tried.
+    pub rungs: Vec<RungResult>,
+}
+
+/// One setting the parallelism ladder measured, and what was decided about it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RungResult {
+    /// `None` is unlimited.
+    pub parallelism: Option<usize>,
+    /// Every runtime measured at this setting, in the order measured. Empty
+    /// when the trial produced no usable time.
+    pub samples: Vec<f64>,
+    /// `"baseline"`, `"accepted"`, `"rejected (screen)"`,
+    /// `"rejected (rank test)"`, or `"rejected (censored)"`.
+    pub verdict: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CandidateScore {
     pub node_id: String,
@@ -130,6 +166,7 @@ pub enum PassDetail {
     Hmp(HmpDetail),
     Omp(OmpDetail),
     Pushdown(PushdownDetail),
+    Parallelism(ParallelismDetail),
     /// A step that advanced an optimization's state without reaching a
     /// conclusion worth describing -- a continuous pass recording a
     /// measurement, say. Pass-specific detail is reported when the search

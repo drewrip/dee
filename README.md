@@ -162,14 +162,39 @@ dee dag versions pipeline
 Every optimization begins by printing the configuration it resolved to, since
 with two places settings can come from, "what did this actually run" should not
 be something you have to reconstruct. A DAG with no settings of its own falls
-back to dee's defaults — HMP and OMP on, pushdown off — so `--enable`/`--disable`
-is still how you pin the pass set explicitly.
+back to dee's defaults — HMP and OMP on, pushdown and parallelism off — so
+`--enable`/`--disable` is still how you pin the pass set explicitly.
 
 ```
 optimized pipeline v1 in 1669ms using 2 dag run(s)
 runtime 634ms -> 378ms (40.4% faster)
   pays for itself after 7 run(s)
 ```
+
+**ParallelismTuning** tunes one thing: how many of the DAG's nodes run at once.
+dee's default is no limit, which assumes more concurrency is never worse. On a
+warehouse that already parallelizes inside a single query that assumption is
+backwards — one heavy node can saturate the machine on its own, and three of
+them at once make each slower rather than the set faster. On one that cannot
+fill the box with a single query, the opposite holds. Neither answer is safe to
+hardcode, so it ladders over caps and measures.
+
+```bash
+dee optimize pipeline --enable parallelism --parallelism-ladder 1,2,4,8
+```
+
+It measures the DAG's current setting a couple of times, then tries each cap
+that could actually mean something on this DAG — one at or above the node count
+can never bind, and is not paid for. A cap is accepted only when *every*
+measurement of it beats *every* measurement of the incumbent, which costs one
+extra run per promising rung and is what stops a setting that is merely
+sometimes fast from being adopted. What it settles on rides along with the DAG
+as `metadata.max_parallelism`, so every later run inherits it.
+
+Run it **before** the materialization passes, which is where
+`--enable parallelism,hmp` already puts it: a materialization speedup measured
+against an untuned concurrency setting is crediting HMP with a win that belongs
+to the ladder.
 
 **Continuous optimization** is the other way to reach the same thing. `dee
 optimize` above is a job: it decides now, and it buys the DAG runs its search
@@ -197,9 +222,10 @@ hmp        continuous  both    converged opt_hmp_state, opt_hmp_trials
 ```
 
 Which of the two applies is a property of the optimization, not a preference.
-HMP and OMP decide by measuring the DAG run, so they are `continuous` and step
-around runs. Pushdown decides from the DAG in front of it, so it is `once`:
-there is no measurement to wait for and nothing a later run could teach it.
+HMP, OMP and ParallelismTuning decide by measuring the DAG run, so they are
+`continuous` and step around runs. Pushdown decides from the DAG in front of
+it, so it is `once`: there is no measurement to wait for and nothing a later
+run could teach it.
 `dee optimize` drives either — for a continuous optimization it supplies the
 runs itself rather than waiting for the schedule to provide them, which is why
 it is still the right command when you want an answer today.

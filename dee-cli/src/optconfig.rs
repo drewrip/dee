@@ -34,7 +34,7 @@ pub enum CliHMPStrategy {
 #[derive(Args, Clone, Debug)]
 pub struct OptimizerArgs {
     /// Passes to run, starting from everything off. Comma separated:
-    /// hmp, omp, pushdown.
+    /// parallelism, hmp, omp, pushdown.
     #[arg(long, value_delimiter = ',', conflicts_with = "disable")]
     pub enable: Option<Vec<String>>,
     /// Passes to skip, starting from everything on.
@@ -85,6 +85,16 @@ pub struct OptimizerArgs {
     /// HMP: log the node ranking table after the baseline run.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
     pub hmp_show_nodes: Option<bool>,
+
+    /// ParallelismTuning: node-concurrency caps to measure. Comma separated.
+    #[arg(long, value_delimiter = ',')]
+    pub parallelism_ladder: Option<Vec<usize>>,
+    /// ParallelismTuning: runs spent measuring the DAG's current setting.
+    #[arg(long)]
+    pub parallelism_seed_repeats: Option<usize>,
+    /// ParallelismTuning: re-measurements a rung must survive to be accepted.
+    #[arg(long)]
+    pub parallelism_confirm_runs: Option<usize>,
 
     /// Capture a resource timeseries for every candidate run.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
@@ -157,6 +167,15 @@ impl OptimizerArgs {
             }),
         );
         set("hmp_beam_width", self.hmp_beam_width.map(|v| json!(v)));
+        set("parallelism_ladder", self.parallelism_ladder.as_ref().map(|v| json!(v)));
+        set(
+            "parallelism_seed_repeats",
+            self.parallelism_seed_repeats.map(|v| json!(v)),
+        );
+        set(
+            "parallelism_confirm_runs",
+            self.parallelism_confirm_runs.map(|v| json!(v)),
+        );
         set("profile_iterations", self.profile_iterations.map(|v| json!(v)));
 
         // The server refuses a path here, so only the log-the-table form is
@@ -178,7 +197,8 @@ impl OptimizerArgs {
     }
 }
 
-const PASSES: [(&str, &str); 3] = [
+const PASSES: [(&str, &str); 4] = [
+    ("run_parallelism_pass", "parallelism"),
     ("run_hmp_pass", "hmp"),
     ("run_omp_pass", "omp"),
     ("run_pushdown_pass", "pushdown"),
@@ -186,7 +206,7 @@ const PASSES: [(&str, &str); 3] = [
 
 /// Print a resolved config, showing only what bears on the passes that will run.
 ///
-/// A full `OptimizerConfig` is fifteen fields, most of which belong to a pass
+/// A full `OptimizerConfig` is twenty-odd fields, most of which belong to a pass
 /// that is switched off. Printing all of them before every optimization buries
 /// the two or three settings that actually determine the result, so the `omp_`
 /// and `hmp_` prefixes -- which the field names already follow -- are used to
@@ -213,7 +233,7 @@ pub fn print_config(config: &Value) {
     keys.sort();
     for key in keys {
         let relevant = match key.split_once('_') {
-            Some((prefix, _)) if prefix == "omp" || prefix == "hmp" => {
+            Some((prefix, _)) if prefix == "omp" || prefix == "hmp" || prefix == "parallelism" => {
                 enabled.contains(&prefix)
             }
             // `run_*_pass` is already reported as the pass list, and `explain`
@@ -223,5 +243,65 @@ pub fn print_config(config: &Value) {
         if relevant {
             println!("  {key}: {}", config[key]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Harness {
+        #[command(flatten)]
+        optimizer: OptimizerArgs,
+    }
+
+    fn config_from(args: &[&str]) -> Value {
+        let mut argv = vec!["dee"];
+        argv.extend_from_slice(args);
+        Harness::parse_from(argv)
+            .optimizer
+            .to_json()
+            .expect("to_json")
+            .expect("some config")
+    }
+
+    #[test]
+    fn test_the_ladder_reaches_the_server_as_a_list_of_numbers() {
+        // Comma-separated on the command line, a JSON array on the wire.
+        // `OptimizerConfig::parallelism_ladder` is `Vec<usize>`, and a string
+        // here would be rejected by `deny_unknown_fields`'s stricter cousin,
+        // type checking, at the far end.
+        let config = config_from(&["--parallelism-ladder", "1,2,4"]);
+        assert_eq!(config["parallelism_ladder"], json!([1, 2, 4]));
+    }
+
+    #[test]
+    fn test_enable_names_the_new_pass_and_turns_the_others_off() {
+        // `--enable` starts from everything off, so a pass missing from
+        // `PASSES` would be left at whatever the DAG had stored -- silently
+        // running something that was not asked for.
+        let config = config_from(&["--enable", "parallelism"]);
+        assert_eq!(config["run_parallelism_pass"], json!(true));
+        assert_eq!(config["run_hmp_pass"], json!(false));
+        assert_eq!(config["run_omp_pass"], json!(false));
+        assert_eq!(config["run_pushdown_pass"], json!(false));
+    }
+
+    #[test]
+    fn test_disable_leaves_the_new_pass_on() {
+        let config = config_from(&["--disable", "hmp"]);
+        assert_eq!(config["run_parallelism_pass"], json!(true));
+        assert_eq!(config["run_hmp_pass"], json!(false));
+    }
+
+    #[test]
+    fn test_no_flags_still_defers_to_the_dags_own_settings() {
+        // The tri-state property the whole module rests on.
+        assert!(
+            Harness::parse_from(["dee"]).optimizer.to_json().unwrap().is_none(),
+            "an empty invocation sent a config"
+        );
     }
 }

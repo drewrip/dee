@@ -26,7 +26,7 @@ use crate::store::repo::registrations;
 
 #[derive(Deserialize, Default)]
 pub struct RegisterBody {
-    /// Which optimization: `hmp`, `omp`, `pushdown`.
+    /// Which optimization: `parallelism`, `hmp`, `omp`, `pushdown`.
     pub name: String,
     /// `before`, `after` or `both`. Defaults to the optimization author's
     /// choice, which is what the caller wants unless they have a reason.
@@ -95,10 +95,12 @@ pub async fn register(
     crate::api::reject_server_side_paths(&config)?;
     // Pass selection is decided by which optimizations are registered, so the
     // flags that mean "also run this one" would be a second, contradictory
-    // answer to the same question.
-    config.run_hmp_pass = body.name == "hmp";
-    config.run_omp_pass = body.name == "omp";
-    config.run_pushdown_pass = body.name == "pushdown";
+    // answer to the same question. Driven off the registry rather than a list
+    // of flags, so an optimization added there cannot be left switched on here
+    // by a stored config that happened to mention it.
+    for pass in registry::names() {
+        config.set_pass(pass, pass == body.name);
+    }
 
     // Let the optimization build whatever it keeps state in. Doing this before
     // recording the registration means a registration never names tables that

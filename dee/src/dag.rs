@@ -109,14 +109,28 @@ pub struct Dag {
     pub db: String,
     pub nodes: Graph,
     pub sources: Vec<SourceNode>,
+    /// Most nodes the executor may have in flight at once; `None` is
+    /// unlimited.
+    ///
+    /// A scheduling knob, not a capacity one: it bounds how many node queries
+    /// are issued concurrently, and says nothing about how wide the engine
+    /// runs any one of them (that is the connection's own `threads` setting).
+    /// It lives on the DAG rather than on the engine because it is a property
+    /// of this pipeline -- what [`ParallelismTuning`](crate::opt::parallelism)
+    /// measured to be best for its shape -- and has to travel with the
+    /// definition into every future run.
+    pub max_parallelism: Option<usize>,
 }
 
 impl TryFrom<DagFile> for Dag {
     type Error = FormatError;
     fn try_from(value: DagFile) -> Result<Self, Self::Error> {
-        let dialect = match value.metadata {
-            Some(meta) => meta.sql_dialect.unwrap_or("Unknown".into()),
-            None => "Unknown".into(),
+        let (dialect, max_parallelism) = match value.metadata {
+            Some(meta) => (
+                meta.sql_dialect.unwrap_or("Unknown".into()),
+                meta.max_parallelism,
+            ),
+            None => ("Unknown".into(), None),
         };
         let sources: Vec<SourceNode> = value
             .sources
@@ -148,6 +162,7 @@ impl TryFrom<DagFile> for Dag {
             db: dialect,
             nodes: graph,
             sources,
+            max_parallelism,
         })
     }
 }
@@ -188,6 +203,7 @@ impl From<Dag> for DagFile {
         DagFile {
             metadata: Some(crate::file::DagFileMetadata {
                 sql_dialect: Some(value.db.clone()),
+                max_parallelism: value.max_parallelism,
             }),
             sources,
             nodes,
@@ -222,6 +238,56 @@ mod tests {
             MaterializeMode::from("unknown".to_string()),
             MaterializeMode::View
         );
+    }
+
+    #[test]
+    fn test_parallelism_round_trips_through_the_file_format() {
+        // ParallelismTuning's whole output is this one number, and it reaches
+        // future runs only by surviving the trip to a stored definition.
+        let file: DagFile = serde_json::from_str(
+            r#"{"metadata":{"sql_dialect":"duckdb","max_parallelism":2},
+                "nodes":[{"id":"a","query_text":"select 1","depends_on":[],"materialize":"view"}],
+                "sources":[]}"#,
+        )
+        .unwrap();
+        let dag = Dag::try_from(file).unwrap();
+        assert_eq!(dag.max_parallelism, Some(2));
+
+        let back = DagFile::from(dag);
+        assert_eq!(back.metadata.unwrap().max_parallelism, Some(2));
+    }
+
+    #[test]
+    fn test_a_dag_without_the_field_is_unlimited_and_stays_absent() {
+        // Every DAG stored before this field existed. It must read as "no cap"
+        // -- the behaviour those DAGs were written under -- and must not
+        // reappear in the serialized form, or their content hashes move and
+        // every one of them looks like a new version.
+        let file: DagFile = serde_json::from_str(
+            r#"{"metadata":{"sql_dialect":"duckdb"},
+                "nodes":[{"id":"a","query_text":"select 1","depends_on":[],"materialize":"view"}],
+                "sources":[]}"#,
+        )
+        .unwrap();
+        let dag = Dag::try_from(file).unwrap();
+        assert_eq!(dag.max_parallelism, None);
+
+        let json = serde_json::to_string(&DagFile::from(dag)).unwrap();
+        assert!(
+            !json.contains("max_parallelism"),
+            "an untuned DAG serialized the field: {json}"
+        );
+    }
+
+    #[test]
+    fn test_a_dag_with_no_metadata_at_all_is_unlimited() {
+        let file: DagFile = serde_json::from_str(
+            r#"{"metadata":null,
+                "nodes":[{"id":"a","query_text":"select 1","depends_on":[],"materialize":"view"}],
+                "sources":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(Dag::try_from(file).unwrap().max_parallelism, None);
     }
 
     #[test]

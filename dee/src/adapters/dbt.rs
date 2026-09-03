@@ -152,6 +152,9 @@ impl From<DbtManifest> for DagFile {
         DagFile {
             metadata: Some(DagFileMetadata {
                 sql_dialect: Some(manifest.metadata.adapter_type),
+                // A converted project has never been measured, so it arrives
+                // uncapped and ParallelismTuning treats that as its baseline.
+                max_parallelism: None,
             }),
             nodes,
             sources,

@@ -35,7 +35,7 @@ class DeeOptSpec:
     # optimizer settings go over HTTP as an OptimizerConfig object -- but kept
     # because it is what a person types, and what `doctor` reports against.
     flag: str
-    kind: str  # "bool" | "int" | "float" | "str"
+    kind: str  # "bool" | "int" | "float" | "str" | "int_list"
     # Which passes actually read this option. An option whose passes are all
     # disabled for a variant is pruned from that cell, so it cannot silently
     # multiply the matrix with duplicate experiments.
@@ -92,7 +92,13 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
                doc="Beam width for the greedy HMP strategy. Ignored by breadth."),
     DeeOptSpec("hmp_use_pushdown", "--hmp-no-pushdown", "bool", frozenset({"hmp"}), negated=True,
                doc="Run the pushdown pass on each HMP candidate before measuring it."),
-    DeeOptSpec("profile_iterations", "--profile-iterations", "bool", frozenset({"hmp", "omp"}),
+    DeeOptSpec("parallelism_ladder", "--parallelism-ladder", "int_list", frozenset({"parallelism"}),
+               doc="Node-concurrency caps the parallelism ladder measures."),
+    DeeOptSpec("parallelism_seed_repeats", "--parallelism-seed-repeats", "int", frozenset({"parallelism"}),
+               doc="Runs spent measuring the DAG's current setting before the ladder starts."),
+    DeeOptSpec("parallelism_confirm_runs", "--parallelism-confirm-runs", "int", frozenset({"parallelism"}),
+               doc="Re-measurements a rung must survive after beating the incumbent's best sample."),
+    DeeOptSpec("profile_iterations", "--profile-iterations", "bool", frozenset({"hmp", "omp", "parallelism"}),
                doc="Capture a resource timeseries for every candidate DAG the optimizer runs."),
 )
 
@@ -102,7 +108,7 @@ DEE_OPT_BY_NAME: dict[str, DeeOptSpec] = {s.name: s for s in DEE_OPT_SPECS}
 REPEAT_MODES = ("group", "queue")
 
 
-VALID_PASSES = ("hmp", "omp", "pushdown")
+VALID_PASSES = ("parallelism", "hmp", "omp", "pushdown")
 
 # How a cell's optimizations are driven.
 #
@@ -371,6 +377,26 @@ def _coerce(spec: DeeOptSpec, value: Any) -> Any:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConfigError(f"dee_opt.{spec.name} must be a number, got {value!r}")
         return float(value)
+    if spec.kind == "int_list":
+        # A list value is a cell's setting, not a sweep. The matrix expands a
+        # list into one cell per element, so a genuinely list-valued option has
+        # to arrive already wrapped -- `[[1, 2], [1, 2, 4]]` sweeps two ladders,
+        # `[1, 2]` is the single ladder 1,2. Rejecting a bare int here is what
+        # keeps that distinction visible rather than silently sweeping.
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ConfigError(
+                f"dee_opt.{spec.name} must be a non-empty list of integers, got {value!r}; "
+                f"write it wrapped -- `{spec.name}: [[1, 2, 4, 8]]` is the single ladder "
+                f"1,2,4,8, while `[[1, 2], [1, 2, 4]]` sweeps two of them"
+            )
+        out = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ConfigError(
+                    f"dee_opt.{spec.name} must contain integers, got {item!r}"
+                )
+            out.append(item)
+        return out
     value = str(value)
     if spec.choices and value not in spec.choices:
         raise ConfigError(

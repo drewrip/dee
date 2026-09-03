@@ -1779,6 +1779,7 @@ mod tests {
             db: "DuckDB".to_string(),
             nodes: graph,
             sources: vec![],
+            max_parallelism: None,
         }
     }
 

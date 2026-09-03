@@ -272,10 +272,28 @@ where
                 return Err(ExecutorError::Cancelled);
             }
 
-            let next_nodes: Vec<_> = work_graph
+            // Every node whose dependencies are met, capped by the DAG's
+            // parallelism setting. The cap is what makes the loop below a
+            // scheduler rather than a fan-out: with `None` every runnable node
+            // starts the moment it becomes runnable, which is what dee has
+            // always done and remains the default.
+            //
+            // Sorted before the cap is applied, because `sources()` walks a
+            // HashMap and its order is not stable across runs. Unbounded that
+            // is harmless -- everything runnable is started either way -- but
+            // under a cap it decides *which* nodes are deferred, and a
+            // ParallelismTuning trial that scheduled a different subset each
+            // time would be measuring the ordering rather than the setting.
+            let available = match dag.max_parallelism {
+                Some(limit) => limit.max(1).saturating_sub(in_progress.len()),
+                None => usize::MAX,
+            };
+            let mut runnable: Vec<_> = work_graph
                 .sources()
                 .filter(|n| !in_progress.contains(n))
                 .collect();
+            runnable.sort();
+            let next_nodes: Vec<_> = runnable.into_iter().take(available).collect();
 
             debug!("next_nodes = {}", next_nodes.len());
 
@@ -627,7 +645,113 @@ pub struct NodeStats {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::split_qualified_identifier;
+    use crate::connectors::duckdb::{DuckDBConfig, DuckDBConnection};
+    use crate::dag::TransformNode;
+
+    /// `n` independent nodes, each a query slow enough that two running
+    /// concurrently overlap observably.
+    fn wide_dag(n: usize, max_parallelism: Option<usize>) -> Dag {
+        let mut map = HashMap::new();
+        for i in 0..n {
+            let id = format!("n{i}");
+            map.insert(
+                id.clone(),
+                TransformNode {
+                    id,
+                    // A range big enough to take real time, aggregated so the
+                    // result stays tiny.
+                    query_text: "SELECT sum(i) AS s FROM range(4000000) t(i)".to_string(),
+                    materialize: MaterializeMode::Table,
+                    depends_on: HashSet::new(),
+                    schema: None,
+                },
+            );
+        }
+        Dag {
+            db: "duckdb".to_string(),
+            nodes: Graph::new(map),
+            sources: Vec::new(),
+            max_parallelism,
+        }
+    }
+
+    /// The most node intervals that were ever open at the same instant.
+    fn peak_overlap(stats: &ExecStats) -> usize {
+        let mut edges: Vec<(i64, i64)> = Vec::new();
+        for node in stats.node_stats.values() {
+            edges.push((node.start.timestamp_micros(), 1));
+            edges.push((node.finish.timestamp_micros(), -1));
+        }
+        // A node that finishes exactly as another starts is not an overlap, so
+        // ends sort before starts at equal timestamps.
+        edges.sort_by_key(|(at, delta)| (*at, *delta));
+        let mut open = 0i64;
+        let mut peak = 0i64;
+        for (_, delta) in edges {
+            open += delta;
+            peak = peak.max(open);
+        }
+        peak as usize
+    }
+
+    async fn run_wide(n: usize, cap: Option<usize>) -> ExecStats {
+        // More pool connections than nodes: with a single-connection pool the
+        // queries would serialize on the pool rather than on the scheduler,
+        // and the cap would look like it worked when nothing had been capped.
+        let conn = DuckDBConnection::new(
+            DuckDBConfig::new_from_path(":memory:".to_string())
+                .with_num_connections(n as u32 + 1),
+        )
+        .await
+        .expect("in-memory duckdb");
+        let engine = SimpleEngine::new(conn).expect("engine");
+        let dag = wide_dag(n, cap);
+        let stats = engine.run(&dag).await.expect("run");
+        assert_eq!(stats.node_stats.len(), n, "every node ran");
+        stats
+    }
+
+    // The connector's duckdb calls are synchronous inside an async fn, so on
+    // tokio's default current-thread test runtime every spawned node would run
+    // to completion before the next one started -- and the cap assertions
+    // would hold whether or not the cap did anything. These need real threads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_a_cap_of_one_serializes_the_dag() {
+        // The strongest statement the knob makes: with a cap of one, no two
+        // nodes are ever in flight together. If this does not hold,
+        // ParallelismTuning is measuring a setting that does nothing.
+        let stats = run_wide(4, Some(1)).await;
+        assert_eq!(peak_overlap(&stats), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_a_cap_bounds_how_many_nodes_are_in_flight() {
+        let stats = run_wide(6, Some(2)).await;
+        assert!(
+            peak_overlap(&stats) <= 2,
+            "cap of 2 allowed {} nodes at once",
+            peak_overlap(&stats)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_an_uncapped_dag_still_fans_out() {
+        // The default has to stay what it was. A cap accidentally applied to
+        // `None` would slow every DAG dee has ever run.
+        let stats = run_wide(4, None).await;
+        assert!(
+            peak_overlap(&stats) > 1,
+            "an uncapped DAG ran its nodes one at a time"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_a_cap_wider_than_the_dag_does_not_hold_anything_back() {
+        let stats = run_wide(3, Some(16)).await;
+        assert!(peak_overlap(&stats) > 1);
+    }
 
     #[test]
     fn splits_bare_identifier() {

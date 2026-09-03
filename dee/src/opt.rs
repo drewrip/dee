@@ -2,6 +2,7 @@ pub mod common;
 pub mod explain;
 pub mod hmp;
 pub mod omp;
+pub mod parallelism;
 pub mod pushdown;
 pub mod registry;
 pub mod report;
@@ -26,8 +27,8 @@ use crate::{
 
 pub use crate::opt::explain::render_explain_html;
 pub use crate::opt::report::{
-    CandidateScore, HmpDetail, IterationStat, OmpDetail, OptimizeReport, PassDetail, PassOutcome,
-    PassReport, PushdownDetail, PushdownOutcome,
+    CandidateScore, HmpDetail, IterationStat, OmpDetail, OptimizeReport, ParallelismDetail,
+    PassDetail, PassOutcome, PassReport, PushdownDetail, PushdownOutcome, RungResult,
 };
 pub use crate::opt::step::{
     OptimizationType, RegisterContext, RunContext, StepContext, StepOutcome, StepPhase, run_phase,
@@ -315,6 +316,10 @@ where
                     baseline_runtime_ms.get_or_insert(d.baseline_value.round() as i64);
                     final_runtime_ms = Some(d.best_value.round() as i64);
                 }
+                PassDetail::Parallelism(d) => {
+                    baseline_runtime_ms.get_or_insert(d.baseline_runtime_ms.round() as i64);
+                    final_runtime_ms = Some(d.best_runtime_ms.round() as i64);
+                }
                 PassDetail::Pushdown(_) | PassDetail::None => {}
             }
         }
@@ -491,6 +496,7 @@ fn pass_label(name: &str) -> &'static str {
         "hmp" => "HMPPass",
         "omp" => "OMPPass",
         "pushdown" => "PushdownPass",
+        "parallelism" => "ParallelismTuning",
         _ => "UnknownPass",
     }
 }
@@ -522,6 +528,18 @@ pub struct OptimizerConfig {
     /// and attach it to that iteration's stats.
     pub profile_iterations: bool,
     pub run_pushdown_pass: bool,
+    pub run_parallelism_pass: bool,
+    /// ParallelismTuning: the node-concurrency caps to measure. Rungs that
+    /// cannot bind on the DAG in front of them -- at or above its node count,
+    /// or equal to its current setting -- are dropped rather than tried.
+    pub parallelism_ladder: Vec<usize>,
+    /// ParallelismTuning: runs spent measuring the DAG's current setting
+    /// before the ladder starts. More than one because the acceptance test
+    /// compares sample sets, and a set of one is a point.
+    pub parallelism_seed_repeats: usize,
+    /// ParallelismTuning: re-measurements a rung must survive after it beats
+    /// the incumbent's best sample once.
+    pub parallelism_confirm_runs: usize,
     /// Collect an `Explain` HTML section from each pass during `run()`.
     pub explain: bool,
 }
@@ -546,6 +564,13 @@ impl Default for OptimizerConfig {
             hmp_beam_width: 2,
             profile_iterations: false,
             run_pushdown_pass: false,
+            // Off by default like Pushdown: it spends DAG runs, and the
+            // ladder is only worth its cost where node-level concurrency is
+            // actually contended.
+            run_parallelism_pass: false,
+            parallelism_ladder: vec![1, 2, 4, 8],
+            parallelism_seed_repeats: 2,
+            parallelism_confirm_runs: 1,
             explain: false,
         }
     }
@@ -559,6 +584,7 @@ impl OptimizerConfig {
         self.run_omp_pass = false;
         self.run_hmp_pass = false;
         self.run_pushdown_pass = false;
+        self.run_parallelism_pass = false;
         self
     }
 
@@ -566,16 +592,27 @@ impl OptimizerConfig {
         self.run_omp_pass = true;
         self.run_hmp_pass = true;
         self.run_pushdown_pass = true;
+        self.run_parallelism_pass = true;
         self
     }
 
     /// The optimizations this config enables, in the order they are applied.
     ///
-    /// Order is HMP -> OMP -> Pushdown, as it has always been: the
+    /// Order is ParallelismTuning -> HMP -> OMP -> Pushdown. The
     /// materialization searches decide what to materialize, and Pushdown then
     /// narrows what those materializations have to read.
+    ///
+    /// ParallelismTuning goes first, and that ordering is load-bearing rather
+    /// than incidental: a materialization speedup measured against an untuned
+    /// concurrency setting credits HMP or OMP with a win that belongs to the
+    /// ladder. Running it afterwards would also find less to win, because a
+    /// DAG whose duplicated work has already been built once has much less
+    /// left for concurrent nodes to contend over.
     pub fn enabled_passes(&self) -> Vec<&'static str> {
         let mut passes = Vec::new();
+        if self.run_parallelism_pass {
+            passes.push("parallelism");
+        }
         if self.run_hmp_pass {
             passes.push("hmp");
         }
@@ -593,6 +630,7 @@ impl OptimizerConfig {
             "omp" => self.run_omp_pass = enabled,
             "hmp" => self.run_hmp_pass = enabled,
             "pushdown" => self.run_pushdown_pass = enabled,
+            "parallelism" => self.run_parallelism_pass = enabled,
             _ => warn!("Unknown optimizer pass: {}", name),
         }
     }
@@ -694,6 +732,34 @@ impl OptimizerConfig {
 
     pub fn with_pushdown_pass(mut self) -> Self {
         self.run_pushdown_pass = true;
+        self
+    }
+
+    pub fn with_parallelism_pass(mut self) -> Self {
+        self.run_parallelism_pass = true;
+        self
+    }
+
+    /// The node-concurrency caps ParallelismTuning should measure.
+    ///
+    /// An empty ladder leaves the default in place rather than disabling the
+    /// search silently -- to turn it off, turn the pass off.
+    pub fn with_parallelism_ladder(mut self, ladder: Vec<usize>) -> Self {
+        if ladder.is_empty() {
+            warn!("parallelism_ladder cannot be empty; keeping {:?}", self.parallelism_ladder);
+        } else {
+            self.parallelism_ladder = ladder;
+        }
+        self
+    }
+
+    pub fn with_parallelism_seed_repeats(mut self, repeats: usize) -> Self {
+        self.parallelism_seed_repeats = repeats.max(1);
+        self
+    }
+
+    pub fn with_parallelism_confirm_runs(mut self, runs: usize) -> Self {
+        self.parallelism_confirm_runs = runs.max(1);
         self
     }
 

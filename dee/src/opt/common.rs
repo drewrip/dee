@@ -220,6 +220,7 @@ mod tests {
             db: "test".into(),
             nodes: Graph::new(map),
             sources: vec![],
+            max_parallelism: None,
         }
     }
 
