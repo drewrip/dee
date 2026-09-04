@@ -122,6 +122,18 @@ pub struct ParallelismDetail {
     pub confirm_runs: usize,
     /// The configured ladder, before pruning against the DAG.
     pub ladder: Vec<usize>,
+    /// Whether each rung was judged against a control measured beside it.
+    #[serde(default)]
+    pub paired: bool,
+    /// Cores one node occupied on its own, from the probe rung: CPU-seconds
+    /// divided by wall seconds. `None` when the engine reported no CPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_cores: Option<f64>,
+    /// What the probe concluded: `"saturated"` (one node already fills the
+    /// machine, search upward from the narrowest rung) or `"idle capacity"`
+    /// (one node leaves cores unused, try the widest rungs first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_direction: Option<String>,
     /// Every setting the search resolved, baseline first, in the order tried.
     pub rungs: Vec<RungResult>,
 }
@@ -131,6 +143,19 @@ pub struct ParallelismDetail {
 pub struct RungResult {
     /// `None` is unlimited.
     pub parallelism: Option<usize>,
+    /// The incumbent measurements taken next to this rung, one per pair.
+    /// Empty when the search ran unpaired.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_samples: Vec<f64>,
+    /// Per-pair `rung / control` wall-time ratios. Below 1 is an improvement,
+    /// and being a ratio it is unaffected by drift the pair shared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pair_ratios: Vec<f64>,
+    /// `rung / control` CPU-seconds for the same work. Below 1 means the rung
+    /// relieved contention; around 1 means it changed only how the work was
+    /// scheduled. `None` when the engine reported no CPU samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ratio: Option<f64>,
     /// Every runtime measured at this setting, in the order measured. Empty
     /// when the trial produced no usable time.
     pub samples: Vec<f64>,

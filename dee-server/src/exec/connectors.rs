@@ -152,7 +152,7 @@ mod tests {
 
     fn row(name: &str, path: &std::path::Path) -> ConnectionRow {
         let config = json!({
-            "type": "duckdb", "database": path, "num_connections": 1
+            "type": "duckdb", "database": path
         });
         ConnectionRow {
             name: name.to_string(),

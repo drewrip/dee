@@ -74,6 +74,8 @@ pub struct AddArgs {
     pub password: Option<String>,
 
     /// Size of the connection pool the server keeps open for this target.
+    /// Postgres only: DuckDB's pool size is the DAG's degree of parallelism,
+    /// which is a property of the DAG rather than of the connection.
     #[arg(long)]
     pub num_connections: Option<u32>,
 }
@@ -223,8 +225,14 @@ fn build_config(
                 .database
                 .clone()
                 .ok_or("--database is required for a duckdb connection")?;
+            if args.num_connections.is_some() {
+                return Err("--num-connections does not apply to duckdb: pooled DuckDB \
+                            connections share one database, so the pool would only be a \
+                            second cap on node concurrency. Set the DAG's max_parallelism \
+                            instead, or let ParallelismTuning measure it"
+                    .into());
+            }
             let mut config = DuckDBConfig::new_from_path(database);
-            config.num_connections = args.num_connections.unwrap_or(16);
             config.threads = args.threads;
             config.max_memory = args.max_memory.clone();
             Ok(Connection::DuckDB(config))

@@ -86,10 +86,25 @@ fn collect_scan_pushdowns(node: &ExplainNode, out: &mut HashMap<String, Vec<Push
     }
 }
 
+/// How many pooled connections the DuckDB connector may hand out at once.
+///
+/// Not a tuning knob: it is a ceiling high enough never to bind, because the
+/// number of connections in use has to be the DAG's degree of parallelism and
+/// nothing else. Pooled DuckDB connections are `try_clone()`s of one
+/// `Connection`, so they share a database, a buffer pool and a `threads`
+/// setting -- a pool is not extra engine capacity, it is purely a second cap
+/// on how many node queries can be in flight. Setting that cap independently
+/// of [`Dag::max_parallelism`](crate::dag::Dag::max_parallelism) makes the
+/// effective concurrency `min(cap, pool)`, which silently bounds an uncapped
+/// DAG at the pool size and makes any ladder rung at or above it identical to
+/// the baseline. That is a measurement bug, not a slow default:
+/// `ParallelismTuning` compares rungs against a baseline it believes is
+/// unbounded.
+const POOL_CEILING: u32 = 1024;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DuckDBConfig {
     pub database: PathBuf,
-    pub num_connections: u32,
     pub threads: Option<i64>,
     pub max_memory: Option<String>,
 }
@@ -98,15 +113,9 @@ impl DuckDBConfig {
     pub fn new_from_path(path: String) -> Self {
         Self {
             database: PathBuf::from(path),
-            num_connections: 1,
             threads: None,
             max_memory: None,
         }
-    }
-
-    pub fn with_num_connections(mut self, num_connections: u32) -> Self {
-        self.num_connections = num_connections;
-        self
     }
 
     pub fn with_threads(mut self, num_threads: i64) -> Self {
@@ -242,7 +251,11 @@ impl Connector for DuckDBConnection {
             .map_err(|e| ConnectorError::Create(format!("connection manager - {}", e)))?;
         let pool = Pool::builder()
             .connection_timeout(Duration::from_hours(2))
-            .max_size(config.num_connections)
+            // `min_idle(0)` so connections are cloned on demand rather than
+            // pre-built to `max_size`: what is live is what the executor
+            // actually has in flight, which is the DAG's parallelism.
+            .min_idle(Some(0))
+            .max_size(POOL_CEILING)
             .build(manager)
             .map_err(|_| ConnectorError::Create("r2d2 pool".to_string()))?;
 

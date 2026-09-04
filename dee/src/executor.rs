@@ -697,15 +697,14 @@ mod tests {
     }
 
     async fn run_wide(n: usize, cap: Option<usize>) -> ExecStats {
-        // More pool connections than nodes: with a single-connection pool the
-        // queries would serialize on the pool rather than on the scheduler,
-        // and the cap would look like it worked when nothing had been capped.
-        let conn = DuckDBConnection::new(
-            DuckDBConfig::new_from_path(":memory:".to_string())
-                .with_num_connections(n as u32 + 1),
-        )
-        .await
-        .expect("in-memory duckdb");
+        // The pool no longer caps anything: its ceiling is high enough never
+        // to bind, so the scheduler's cap is the only thing limiting how many
+        // nodes are in flight. A pool that could run out would serialize the
+        // queries on checkout and make the cap look like it worked when
+        // nothing had been capped.
+        let conn = DuckDBConnection::new(DuckDBConfig::new_from_path(":memory:".to_string()))
+            .await
+            .expect("in-memory duckdb");
         let engine = SimpleEngine::new(conn).expect("engine");
         let dag = wide_dag(n, cap);
         let stats = engine.run(&dag).await.expect("run");

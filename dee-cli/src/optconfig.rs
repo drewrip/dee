@@ -95,6 +95,21 @@ pub struct OptimizerArgs {
     /// ParallelismTuning: re-measurements a rung must survive to be accepted.
     #[arg(long)]
     pub parallelism_confirm_runs: Option<usize>,
+    /// ParallelismTuning: run the ladder after HMP/OMP instead of before them.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    pub parallelism_after_materialization: Option<bool>,
+    /// ParallelismTuning: measure the incumbent beside each rung and judge on
+    /// the ratio, so a drifting warehouse cannot manufacture a winner.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    pub parallelism_paired: Option<bool>,
+    /// ParallelismTuning: refuse a rung consuming this fraction more CPU than
+    /// its control for the same work (0.10 = 10% more).
+    #[arg(long)]
+    pub parallelism_cpu_guard: Option<f64>,
+    /// ParallelismTuning: probe the narrowest rung first and let its CPU
+    /// choose which way to search.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    pub parallelism_adaptive_order: Option<bool>,
 
     /// Capture a resource timeseries for every candidate run.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
@@ -175,6 +190,16 @@ impl OptimizerArgs {
         set(
             "parallelism_confirm_runs",
             self.parallelism_confirm_runs.map(|v| json!(v)),
+        );
+        set(
+            "parallelism_after_materialization",
+            self.parallelism_after_materialization.map(|v| json!(v)),
+        );
+        set("parallelism_paired", self.parallelism_paired.map(|v| json!(v)));
+        set("parallelism_cpu_guard", self.parallelism_cpu_guard.map(|v| json!(v)));
+        set(
+            "parallelism_adaptive_order",
+            self.parallelism_adaptive_order.map(|v| json!(v)),
         );
         set("profile_iterations", self.profile_iterations.map(|v| json!(v)));
 

@@ -540,6 +540,36 @@ pub struct OptimizerConfig {
     /// ParallelismTuning: re-measurements a rung must survive after it beats
     /// the incumbent's best sample once.
     pub parallelism_confirm_runs: usize,
+    /// ParallelismTuning: run the ladder *after* the materialization searches
+    /// rather than before them. See [`Self::enabled_passes`] for why the
+    /// default is before, and when it is the wrong answer.
+    pub parallelism_after_materialization: bool,
+    /// ParallelismTuning: measure the incumbent again immediately before each
+    /// rung and judge the rung against that adjacent control rather than
+    /// against a baseline fixed when the search opened.
+    ///
+    /// Unpaired, the search compares samples drawn minutes apart. A warehouse
+    /// whose throughput drifts over that window -- autovacuum after a bulk
+    /// load, a checkpoint, a noisy neighbour -- makes whichever arm ran last
+    /// look better, and the baseline always runs first. Pairing costs one run
+    /// per rung and removes any drift the two halves of a pair share.
+    pub parallelism_paired: bool,
+    /// ParallelismTuning: reject a rung that consumes materially more CPU than
+    /// its control for the same work, as a fraction (0.10 = 10% more).
+    ///
+    /// Wall time alone cannot tell "recruited an idle core" from "spilled and
+    /// did the work twice". Both can shorten a run; only the first is worth
+    /// keeping. Ignored when the engine reports no CPU samples.
+    pub parallelism_cpu_guard: f64,
+    /// ParallelismTuning: measure the narrowest rung first and use how much of
+    /// the machine one node occupies to decide which way to search.
+    ///
+    /// An engine that already parallelizes inside a query leaves nothing for
+    /// node concurrency to recruit, so the ladder should work upward from the
+    /// bottom; an engine that cannot fill the box on one query wants the
+    /// opposite. The probe measures which of those is true here instead of
+    /// assuming either.
+    pub parallelism_adaptive_order: bool,
     /// Collect an `Explain` HTML section from each pass during `run()`.
     pub explain: bool,
 }
@@ -571,6 +601,10 @@ impl Default for OptimizerConfig {
             parallelism_ladder: vec![1, 2, 4, 8],
             parallelism_seed_repeats: 2,
             parallelism_confirm_runs: 1,
+            parallelism_after_materialization: false,
+            parallelism_paired: true,
+            parallelism_cpu_guard: 0.10,
+            parallelism_adaptive_order: true,
             explain: false,
         }
     }
@@ -602,15 +636,26 @@ impl OptimizerConfig {
     /// materialization searches decide what to materialize, and Pushdown then
     /// narrows what those materializations have to read.
     ///
-    /// ParallelismTuning goes first, and that ordering is load-bearing rather
-    /// than incidental: a materialization speedup measured against an untuned
-    /// concurrency setting credits HMP or OMP with a win that belongs to the
-    /// ladder. Running it afterwards would also find less to win, because a
-    /// DAG whose duplicated work has already been built once has much less
-    /// left for concurrent nodes to contend over.
+    /// ParallelismTuning goes first by default, and that ordering is
+    /// load-bearing rather than incidental: a materialization speedup measured
+    /// against an untuned concurrency setting credits HMP or OMP with a win
+    /// that belongs to the ladder. Running it afterwards also finds less to
+    /// win where a DAG's duplicated work has already been built once, leaving
+    /// less for concurrent nodes to contend over.
+    ///
+    /// That reasoning assumes the DAG arrives with node-level concurrency to
+    /// tune, and a DAG of views does not. Where the authored DAG is one
+    /// dominant query surrounded by views that cost nothing to create -- the
+    /// common shape in dbt projects, and in every dag-bench project measured
+    /// so far -- there is nothing for the ladder to schedule until
+    /// materialization has split that query into tables that can run at once.
+    /// Going first there means choosing a cap for a DAG that ceases to exist a
+    /// pass later. [`Self::parallelism_after_materialization`] moves the
+    /// ladder behind HMP and OMP for that case; it stays ahead of Pushdown
+    /// either way, which measures nothing and only rewrites.
     pub fn enabled_passes(&self) -> Vec<&'static str> {
         let mut passes = Vec::new();
-        if self.run_parallelism_pass {
+        if self.run_parallelism_pass && !self.parallelism_after_materialization {
             passes.push("parallelism");
         }
         if self.run_hmp_pass {
@@ -618,6 +663,9 @@ impl OptimizerConfig {
         }
         if self.run_omp_pass {
             passes.push("omp");
+        }
+        if self.run_parallelism_pass && self.parallelism_after_materialization {
+            passes.push("parallelism");
         }
         if self.run_pushdown_pass {
             passes.push("pushdown");
@@ -758,6 +806,31 @@ impl OptimizerConfig {
         self
     }
 
+    /// Run the ladder after HMP and OMP rather than before them.
+    pub fn with_parallelism_after_materialization(mut self, after: bool) -> Self {
+        self.parallelism_after_materialization = after;
+        self
+    }
+
+    /// Judge each rung against a control measured next to it.
+    pub fn with_parallelism_paired(mut self, paired: bool) -> Self {
+        self.parallelism_paired = paired;
+        self
+    }
+
+    /// Fractional CPU increase past which a rung is refused whatever it did
+    /// to wall time. Negative values are clamped to zero.
+    pub fn with_parallelism_cpu_guard(mut self, guard: f64) -> Self {
+        self.parallelism_cpu_guard = guard.max(0.0);
+        self
+    }
+
+    /// Probe the narrowest rung first and let it choose the search direction.
+    pub fn with_parallelism_adaptive_order(mut self, adaptive: bool) -> Self {
+        self.parallelism_adaptive_order = adaptive;
+        self
+    }
+
     pub fn with_parallelism_confirm_runs(mut self, runs: usize) -> Self {
         self.parallelism_confirm_runs = runs.max(1);
         self
@@ -772,6 +845,44 @@ impl OptimizerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parallelism_runs_after_the_materialization_passes_when_asked() {
+        // Pushdown stays last either way: it measures nothing, so it has no
+        // opinion about a concurrency setting and rewriting before the ladder
+        // would only change what the ladder measures.
+        let mut config = OptimizerConfig::default()
+            .with_all_disabled()
+            .with_parallelism_pass()
+            .with_hmp_pass()
+            .with_omp_pass()
+            .with_pushdown_pass();
+
+        assert_eq!(
+            config.enabled_passes(),
+            vec!["parallelism", "hmp", "omp", "pushdown"],
+            "the default order puts the ladder first"
+        );
+
+        config = config.with_parallelism_after_materialization(true);
+        assert_eq!(
+            config.enabled_passes(),
+            vec!["hmp", "omp", "parallelism", "pushdown"],
+            "the ladder moves behind the materialization searches, not behind pushdown"
+        );
+    }
+
+    #[test]
+    fn test_the_pass_order_option_does_nothing_without_the_pass() {
+        // The option is read whether or not the ladder is enabled, so a config
+        // that sets it while the pass is off must not gain a pass.
+        let config = OptimizerConfig::default()
+            .with_all_disabled()
+            .with_hmp_pass()
+            .with_parallelism_after_materialization(true);
+
+        assert_eq!(config.enabled_passes(), vec!["hmp"]);
+    }
 
     #[test]
     fn test_optimizer_config_round_trips_through_json() {

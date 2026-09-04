@@ -227,7 +227,7 @@ mod tests {
 
     fn duckdb_connection(path: &str) -> Connection {
         serde_json::from_value(json!({
-            "type": "duckdb", "database": path, "num_connections": 2
+            "type": "duckdb", "database": path
         }))
         .unwrap()
     }

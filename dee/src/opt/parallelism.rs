@@ -21,11 +21,41 @@
 //! assumes runtimes are unimodal, and they are not. A bimodal arm that reaches
 //! a fast path a fifth of the time will produce a single measurement far
 //! outside any noise floor while being no faster in the median. So a rung is
-//! screened against the incumbent's best sample, then re-measured, and accepted
-//! only if *every* sample it produced beats *every* sample the incumbent has.
-//! That assumes nothing about the shape of the distribution: a bimodal arm
-//! fails as soon as it draws from its slow mode. It costs one extra run per
-//! promising rung, and the screen is what stops it costing one per rung.
+//! screened, then re-measured, and accepted only if *every* comparison went
+//! its way. That assumes nothing about the shape of the distribution: a
+//! bimodal arm fails as soon as it draws from its slow mode.
+//!
+//! **The comparison is paired and counterbalanced.** A rank test over samples
+//! drawn minutes apart measures the warehouse as much as the setting. On a
+//! Postgres recovering from the autovacuum that followed a bulk load, three
+//! rungs measured 131ms, 133ms and 133ms -- identical, because the cap was
+//! doing nothing -- against a baseline of 160ms and 176ms recorded before the
+//! recovery. The ladder promoted a setting that had changed nothing, on the
+//! strength of a trend. So the incumbent is re-measured *beside* each rung and
+//! the test reads the ratio within each pair, which cancels whatever both
+//! halves shared. Pairing alone is not enough: with the control always first,
+//! a machine that is steadily speeding up hands the rung a free win for
+//! running second. The order alternates for that reason, so a linear drift
+//! helps the rung in one pair and hurts it in the next.
+//!
+//! **Wall time is the objective; CPU is the guard.** Shortening a run by
+//! recruiting an idle core and shortening it by no longer spilling look
+//! identical in wall time, and they are not the same finding -- the first is
+//! available to any DAG with idle capacity, the second only where concurrency
+//! was destroying efficiency. CPU-seconds for identical work separates them:
+//! across ten dag-bench projects on DuckDB every rung worth keeping consumed
+//! 16-50% *less* CPU than its control, and every rung that changed nothing
+//! consumed within 6% of it. A rung that buys wall time with materially more
+//! CPU is refused. Where the engine reports no CPU at all -- a warehouse dee
+//! only holds a client connection to -- the guard goes quiet rather than
+//! guessing, and the ladder decides on wall time as before.
+//!
+//! **The direction is measured, not assumed.** The narrowest rung runs one
+//! node at a time, so the cores it occupies are the cores a single node can
+//! use. An engine that already fills the machine on one query leaves nothing
+//! for a second node to recruit and wants the narrow end of the ladder; an
+//! engine that cannot fill it wants the wide end. The probe is one run, and it
+//! is a rung that would have been measured anyway.
 
 use std::{marker::PhantomData, sync::Arc};
 
@@ -55,6 +85,15 @@ const TRIALS_TABLE: &str = "opt_parallelism_trials";
 /// finish -- only a censored observation ("at least this bad"), which is all
 /// the acceptance test consumes.
 const BUDGET_EPS: f64 = 0.25;
+
+/// Share of the machine one node must occupy for the engine to count as
+/// self-parallelizing. Above it, node concurrency has no idle resource to
+/// recruit and the ladder searches from the narrow end; below it, the cores
+/// sit idle unless several nodes run at once and it searches from the wide
+/// end. Deliberately far from both extremes: the two regimes measured so far
+/// sat at roughly 0.8 and 0.2 of the machine, so the boundary does not need to
+/// be precise to separate them.
+const SATURATION_FRACTION: f64 = 0.5;
 
 /// Where the ladder is, as persisted between steps.
 ///
@@ -88,6 +127,30 @@ struct ParallelismState {
     /// Samples collected so far for the rung under test: the screening run,
     /// then each confirmation.
     trial_samples: Vec<f64>,
+    /// CPU-seconds for each of those runs, where the engine reported them.
+    #[serde(default)]
+    trial_cpu: Vec<f64>,
+    /// Incumbent measurements taken adjacent to the rung under test, one per
+    /// pair. The control for the ratio the acceptance test actually reads.
+    #[serde(default)]
+    control_samples: Vec<f64>,
+    #[serde(default)]
+    control_cpu: Vec<f64>,
+    /// `rung / control` wall ratios, one per completed pair.
+    #[serde(default)]
+    pair_ratios: Vec<f64>,
+    /// The half of the current pair that has already run. A pair is scored
+    /// only once both halves are in, because which of them ran first
+    /// alternates.
+    #[serde(default)]
+    pair_control: Option<f64>,
+    #[serde(default)]
+    pair_trial: Option<f64>,
+    /// Cores one node occupied during the probe rung, and what that implied.
+    #[serde(default)]
+    probe_cores: Option<f64>,
+    #[serde(default)]
+    search_direction: Option<String>,
     /// The rung being measured, and how far through its runs it is.
     in_flight: Option<InFlight>,
     /// Baseline repetitions still owed before the ladder starts.
@@ -101,7 +164,8 @@ struct ParallelismState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InFlight {
     rung: usize,
-    /// `"screen"` for the first run at a rung, `"confirm"` for the rest.
+    /// `"control"` measures the incumbent as this pair's control; `"screen"`
+    /// is the rung's first run and `"confirm"` each re-measurement.
     stage: String,
 }
 
@@ -114,6 +178,14 @@ impl ParallelismState {
             incumbent: None,
             incumbent_samples: Vec::new(),
             trial_samples: Vec::new(),
+            trial_cpu: Vec::new(),
+            control_samples: Vec::new(),
+            control_cpu: Vec::new(),
+            pair_ratios: Vec::new(),
+            pair_control: None,
+            pair_trial: None,
+            probe_cores: None,
+            search_direction: None,
             in_flight: None,
             seed_remaining: 0,
             runs_used: 0,
@@ -141,6 +213,40 @@ impl ParallelismState {
     }
 }
 
+/// CPU-seconds consumed over a run, integrated from the sampler's series.
+///
+/// `None` when the engine reported no CPU at all, which is not a failure: a
+/// remote warehouse dee only holds a client connection to has no CPU figure to
+/// give, and every test that reads this degrades to wall time alone.
+fn cpu_seconds(samples: &[crate::profile::SystemUsageSample]) -> Option<f64> {
+    let mut total = 0.0;
+    let mut seen = false;
+    for pair in samples.windows(2) {
+        let (prev, cur) = (&pair[0], &pair[1]);
+        let Some(pct) = cur.cpu_percent else { continue };
+        let dt_ms = (cur.elapsed_ms - prev.elapsed_ms).max(0) as f64;
+        total += (pct / 100.0) * (dt_ms / 1000.0);
+        seen = true;
+    }
+    seen.then_some(total)
+}
+
+/// Mean of a sample set, or `None` when it is empty.
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+/// Whether the rung, rather than its control, runs first in pair `index`.
+///
+/// Alternating is what makes the pair cancel a trend. With the control always
+/// first, a machine that is steadily speeding up hands every rung a free win:
+/// the rung runs second, so it runs later, so it runs faster. Counterbalancing
+/// the order means a linear drift helps the rung in one pair and hurts it in
+/// the next, and only a real difference survives both.
+fn rung_leads(index: usize) -> bool {
+    index % 2 == 1
+}
+
 /// Human-readable name for a setting. `None` is the DAG's untuned state.
 fn describe(rung: Option<usize>) -> String {
     match rung {
@@ -161,6 +267,12 @@ where
     seed_repeats: usize,
     /// Re-measurements a rung must survive after it passes the screen.
     confirm_runs: usize,
+    /// Measure the incumbent beside each rung and judge on the ratio.
+    paired: bool,
+    /// Fractional CPU increase past which a rung is refused.
+    cpu_guard: f64,
+    /// Let the narrowest rung's CPU decide which way to search.
+    adaptive_order: bool,
     /// Capture each iteration's CPU/memory/disk timeseries into its
     /// `IterationStat`.
     profile_iterations: bool,
@@ -189,6 +301,9 @@ where
             seed_repeats: seed_repeats.max(1),
             confirm_runs: confirm_runs.max(1),
             profile_iterations,
+            paired: true,
+            cpu_guard: 0.10,
+            adaptive_order: true,
             step_phase: StepPhase::Both,
             explain_data: None,
             _conn: PhantomData,
@@ -197,12 +312,16 @@ where
     }
 
     pub fn from_config(config: &OptimizerConfig) -> Self {
-        Self::new(
+        let mut pass = Self::new(
             config.parallelism_ladder.clone(),
             config.parallelism_seed_repeats,
             config.parallelism_confirm_runs,
             config.profile_iterations,
-        )
+        );
+        pass.paired = config.parallelism_paired;
+        pass.cpu_guard = config.parallelism_cpu_guard.max(0.0);
+        pass.adaptive_order = config.parallelism_adaptive_order;
+        pass
     }
 
     /// The ladder with rungs that cannot mean anything on this DAG removed.
@@ -350,14 +469,24 @@ where
             // The baseline is the DAG's own setting, so nothing is installed.
             "baseline" | "converged" => Ok(StepOutcome::Idle),
             "searching" => {
-                // A rung proposed but never reported on -- a failed or
+                // A run proposed but never reported on -- a failed or
                 // cancelled run. Re-install it rather than moving on, or the
                 // ladder would skip a rung it never actually measured.
                 if let Some(in_flight) = state.in_flight.clone() {
-                    ctx.dag.max_parallelism = Some(in_flight.rung);
+                    let (setting, label) = if in_flight.stage == "control" {
+                        (state.incumbent, format!("control for {}", describe(Some(in_flight.rung))))
+                    } else {
+                        (Some(in_flight.rung), describe(Some(in_flight.rung)))
+                    };
+                    ctx.dag.max_parallelism = setting;
                     return Ok(StepOutcome::Trial {
-                        label: describe(Some(in_flight.rung)),
-                        budget_ms: self.budget(&state),
+                        label,
+                        // A control is the incumbent and cannot overrun it in
+                        // any meaningful sense, so it runs unbudgeted; cutting
+                        // it short would discard the pair's denominator.
+                        budget_ms: (in_flight.stage != "control")
+                            .then(|| self.budget(&state))
+                            .flatten(),
                         record: Box::new(self.outcome_from(&state)),
                     });
                 }
@@ -365,16 +494,39 @@ where
                 let Some(rung) = state.pending.first().copied() else {
                     return self.converge(ctx, state).await;
                 };
-                ctx.dag.max_parallelism = Some(rung);
+                state.trial_samples.clear();
+                state.trial_cpu.clear();
+                state.control_samples.clear();
+                state.control_cpu.clear();
+                state.pair_ratios.clear();
+                state.pair_control = None;
+                state.pair_trial = None;
+
+                // Paired: the rung is judged against a control measured beside
+                // it rather than against a baseline recorded before the ladder
+                // opened. Which half opens the pair alternates, so a drift
+                // cannot favour the same half every time.
+                let stage = if !self.paired || rung_leads(state.pair_ratios.len()) {
+                    "screen"
+                } else {
+                    "control"
+                };
+                let (setting, label) = if stage == "control" {
+                    (state.incumbent, format!("control for {}", describe(Some(rung))))
+                } else {
+                    (Some(rung), describe(Some(rung)))
+                };
+                ctx.dag.max_parallelism = setting;
                 state.in_flight = Some(InFlight {
                     rung,
-                    stage: "screen".to_string(),
+                    stage: stage.to_string(),
                 });
-                state.trial_samples.clear();
                 self.save_state(ctx.store, ctx.dag_id, &state).await?;
                 Ok(StepOutcome::Trial {
-                    label: describe(Some(rung)),
-                    budget_ms: self.budget(&state),
+                    label,
+                    budget_ms: (stage != "control")
+                        .then(|| self.budget(&state))
+                        .flatten(),
                     record: Box::new(self.outcome_from(&state)),
                 })
             }
@@ -415,6 +567,7 @@ where
             return self.reject_censored(ctx, state).await;
         };
         let cost = stats.duration.num_milliseconds() as f64;
+        let cpu = cpu_seconds(&stats.system_samples);
         let samples = if self.profile_iterations {
             stats.system_samples.clone()
         } else {
@@ -423,7 +576,7 @@ where
 
         if state.phase == "baseline" {
             return self
-                .observe_baseline(ctx, state, &run.run_id, cost, samples)
+                .observe_baseline(ctx, state, &run.run_id, cost, cpu, samples)
                 .await;
         }
 
@@ -434,7 +587,6 @@ where
         };
 
         state.runs_used += 1;
-        state.trial_samples.push(cost);
         state.iterations.push(IterationStat {
             iteration: state.iterations.len() + 1,
             runtime_ms: cost as i64,
@@ -442,69 +594,224 @@ where
             system_samples: samples,
             ..Default::default()
         });
+
+        let is_control = in_flight.stage == "control";
+        if is_control {
+            state.control_samples.push(cost);
+            if let Some(c) = cpu {
+                state.control_cpu.push(c);
+            }
+            // Also the incumbent's own estimate, which keeps the abandonment
+            // budget tracking the machine as it is now.
+            state.incumbent_samples.push(cost);
+            state.pair_control = Some(cost);
+        } else {
+            state.trial_samples.push(cost);
+            if let Some(c) = cpu {
+                state.trial_cpu.push(c);
+            }
+            state.pair_trial = Some(cost);
+        }
         self.record_trial(
             ctx.store,
             ctx.dag_id,
             &run.run_id,
-            Some(in_flight.rung),
+            if is_control { state.incumbent } else { Some(in_flight.rung) },
             &in_flight.stage,
             cost,
         )
         .await?;
 
-        // Screening. A rung that cannot beat even the incumbent's luckiest
-        // draw is rejected for the price of one run; only what survives this
-        // is worth a confirmation. Without it, confirmation would double the
-        // cost of the whole ladder rather than of its promising rungs.
-        let best = state.incumbent_best().unwrap_or(f64::MAX);
-        if in_flight.stage == "screen" && cost >= best {
-            debug!(
-                "ParallelismTuning: {} screened out at {cost:.2}ms (incumbent best {best:.2}ms)",
-                describe(Some(in_flight.rung))
-            );
-            return self
-                .resolve_rung(ctx, state, in_flight.rung, "rejected (screen)")
-                .await;
+        // The probe. The narrowest rung runs one node at a time, so its CPU
+        // over its wall time is how much of the machine a single node occupies
+        // -- the one thing that decides whether concurrency has anything to
+        // recruit here. Measured, then used to order what remains.
+        if self.adaptive_order
+            && state.probe_cores.is_none()
+            && in_flight.stage == "screen"
+        {
+            self.record_probe(&mut state, in_flight.rung, cost, cpu);
         }
 
-        // Confirmation. `trial_samples` holds the screen plus every
-        // confirmation so far.
-        if state.trial_samples.len() <= self.confirm_runs {
-            state.in_flight = Some(InFlight {
-                rung: in_flight.rung,
-                stage: "confirm".to_string(),
-            });
-            self.save_state(ctx.store, ctx.dag_id, &state).await?;
-            return Ok(StepOutcome::Idle);
+        // Unpaired, a rung is scored against the incumbent's best sample the
+        // moment it reports.
+        if !self.paired {
+            let reference = state.incumbent_best().unwrap_or(f64::MAX);
+            if in_flight.stage == "screen" && cost >= reference {
+                debug!(
+                    "ParallelismTuning: {} screened out at {cost:.2}ms (best {reference:.2}ms)",
+                    describe(Some(in_flight.rung))
+                );
+                return self
+                    .resolve_rung(ctx, state, in_flight.rung, "rejected (screen)")
+                    .await;
+            }
+            if state.trial_samples.len() <= self.confirm_runs {
+                state.in_flight = Some(InFlight {
+                    rung: in_flight.rung,
+                    stage: "confirm".to_string(),
+                });
+                self.save_state(ctx.store, ctx.dag_id, &state).await?;
+                return Ok(StepOutcome::Idle);
+            }
+        } else {
+            // Paired: half a pair decides nothing. Run the other half, at
+            // whichever setting has not gone yet.
+            let (Some(control), Some(trial)) = (state.pair_control, state.pair_trial) else {
+                let stage = if is_control {
+                    if state.trial_samples.is_empty() { "screen" } else { "confirm" }
+                } else {
+                    "control"
+                };
+                state.in_flight = Some(InFlight {
+                    rung: in_flight.rung,
+                    stage: stage.to_string(),
+                });
+                self.save_state(ctx.store, ctx.dag_id, &state).await?;
+                return Ok(StepOutcome::Idle);
+            };
+
+            if control > 0.0 {
+                state.pair_ratios.push(trial / control);
+            }
+            state.pair_control = None;
+            state.pair_trial = None;
+
+            // Screening on the first completed pair. A rung that cannot beat
+            // the control beside it is rejected for the price of one pair;
+            // only what survives is worth counterbalancing.
+            if state.pair_ratios.len() == 1 && trial >= control {
+                debug!(
+                    "ParallelismTuning: {} screened out at {trial:.2}ms \
+                     (control {control:.2}ms)",
+                    describe(Some(in_flight.rung))
+                );
+                return self
+                    .resolve_rung(ctx, state, in_flight.rung, "rejected (screen)")
+                    .await;
+            }
+
+            // One pair proves nothing about a drifting machine: it takes the
+            // counterbalanced pair to tell a real difference from a trend.
+            if state.pair_ratios.len() <= self.confirm_runs {
+                let stage = if rung_leads(state.pair_ratios.len()) { "screen" } else { "control" };
+                state.in_flight = Some(InFlight {
+                    rung: in_flight.rung,
+                    stage: stage.to_string(),
+                });
+                self.save_state(ctx.store, ctx.dag_id, &state).await?;
+                return Ok(StepOutcome::Idle);
+            }
         }
 
-        // The rank test. Every sample this rung produced must beat every
-        // sample the incumbent has -- an ordering claim, which assumes nothing
-        // about the shape of either distribution. A bimodal rung that reached
-        // its fast path during the screen fails here as soon as it draws from
-        // its slow mode.
-        let trial_worst = state
-            .trial_samples
-            .iter()
-            .copied()
-            .reduce(f64::max)
-            .unwrap_or(f64::MAX);
-        let accepted = trial_worst < best;
+        // The rank test. Paired, every pair must have gone the rung's way --
+        // an ordering claim on ratios, which is immune to a trend both halves
+        // of a pair experienced. Unpaired, every sample of the rung must beat
+        // every sample the incumbent has. Either way it assumes nothing about
+        // the shape of the distributions: a bimodal rung that reached its fast
+        // path during the screen fails as soon as it draws from its slow mode.
+        let wall_wins = if self.paired {
+            !state.pair_ratios.is_empty() && state.pair_ratios.iter().all(|r| *r < 1.0)
+        } else {
+            let trial_worst = state
+                .trial_samples
+                .iter()
+                .copied()
+                .reduce(f64::max)
+                .unwrap_or(f64::MAX);
+            trial_worst < state.incumbent_best().unwrap_or(f64::MAX)
+        };
+
+        // The CPU guard. Wall time cannot tell an idle core recruited from
+        // work done twice after a spill -- both shorten a run. CPU-seconds for
+        // identical work can: a rung that relieves contention consumes less,
+        // and a rung that buys its wall time with materially more resource is
+        // refused however good it looked.
+        let cpu_ratio = self.cpu_ratio(&state);
+        let cpu_ok = match cpu_ratio {
+            Some(ratio) => ratio <= 1.0 + self.cpu_guard,
+            None => true,
+        };
+        let accepted = wall_wins && cpu_ok;
 
         if accepted {
             debug!(
-                "ParallelismTuning: {} accepted; incumbent {:.2}ms -> {trial_worst:.2}ms",
+                "ParallelismTuning: {} accepted; ratios {:?} cpu_ratio {:?}",
                 describe(Some(in_flight.rung)),
-                state.incumbent_worst().unwrap_or(0.0),
+                state.pair_ratios,
+                cpu_ratio,
             );
             state.incumbent = Some(in_flight.rung);
             // The pessimistic end of the rung's own samples, so the incumbent
             // is a time observed on every run of it rather than its best draw.
             state.incumbent_samples = state.trial_samples.clone();
         }
-        let verdict = if accepted { "accepted" } else { "rejected (rank test)" };
+        let verdict = if accepted {
+            "accepted"
+        } else if wall_wins {
+            // Distinguished from a wall-time loss because they mean different
+            // things: this rung was faster and refused anyway.
+            "rejected (cpu guard)"
+        } else {
+            "rejected (rank test)"
+        };
         self.resolve_rung(ctx, state, in_flight.rung, verdict)
             .await
+    }
+
+    /// `rung / control` CPU-seconds for the pairs collected so far.
+    fn cpu_ratio(&self, state: &ParallelismState) -> Option<f64> {
+        let trial = mean(&state.trial_cpu)?;
+        let control = if self.paired {
+            mean(&state.control_cpu)?
+        } else {
+            // Unpaired there is no control to divide by, so the guard has
+            // nothing to say and stays silent rather than guessing.
+            return None;
+        };
+        (control > 0.0).then(|| trial / control)
+    }
+
+    /// Read the probe rung's CPU against its wall time and order what is left
+    /// of the ladder by what that implies.
+    fn record_probe(
+        &self,
+        state: &mut ParallelismState,
+        rung: usize,
+        cost_ms: f64,
+        cpu: Option<f64>,
+    ) {
+        let Some(cpu) = cpu else { return };
+        let wall_s = cost_ms / 1000.0;
+        if wall_s <= 0.0 {
+            return;
+        }
+        let cores = cpu / wall_s;
+        state.probe_cores = Some(cores);
+
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get() as f64)
+            .unwrap_or(1.0);
+        // A node that already occupies most of the machine leaves nothing for
+        // a second node to recruit, so the narrow end of the ladder is where
+        // the answer is; a node that occupies little leaves the cores idle
+        // unless something else runs, so the wide end is.
+        let saturated = cores >= available * SATURATION_FRACTION;
+        state.search_direction = Some(
+            if saturated { "saturated" } else { "idle capacity" }.to_string(),
+        );
+        if saturated {
+            state.pending.sort_unstable();
+        } else {
+            state.pending.sort_unstable_by(|a, b| b.cmp(a));
+        }
+        debug!(
+            "ParallelismTuning: probe at {} used {cores:.1} of {available:.0} cores ({}); \
+             remaining ladder {:?}",
+            describe(Some(rung)),
+            state.search_direction.as_deref().unwrap_or(""),
+            state.pending,
+        );
     }
 
     /// Record the first `seed_repeats` measurements as the incumbent's sample
@@ -515,8 +822,10 @@ where
         mut state: ParallelismState,
         run_id: &str,
         cost: f64,
+        cpu: Option<f64>,
         samples: Vec<crate::profile::SystemUsageSample>,
     ) -> Result<StepOutcome, OptimizerError> {
+        let _ = cpu;
         if state.incumbent_samples.is_empty() {
             state.baseline = ctx.dag.max_parallelism;
             state.incumbent = ctx.dag.max_parallelism;
@@ -552,8 +861,17 @@ where
         state.results.push(RungResult {
             parallelism: state.baseline,
             samples: state.incumbent_samples.clone(),
+            control_samples: Vec::new(),
+            pair_ratios: Vec::new(),
+            cpu_ratio: None,
             verdict: "baseline".to_string(),
         });
+
+        // The probe goes first when it can choose the direction, so the rung
+        // that measures one node alone is the narrowest one on the ladder.
+        if self.adaptive_order {
+            state.pending.sort_unstable();
+        }
 
         // Nothing left to compare against: every rung on the ladder does the
         // same thing to this DAG as the setting it already has.
@@ -610,10 +928,17 @@ where
         state.results.push(RungResult {
             parallelism: Some(rung),
             samples: state.trial_samples.clone(),
+            control_samples: state.control_samples.clone(),
+            pair_ratios: state.pair_ratios.clone(),
+            cpu_ratio: self.cpu_ratio(&state),
             verdict: verdict.to_string(),
         });
         state.pending.retain(|r| *r != rung);
         state.trial_samples.clear();
+        state.trial_cpu.clear();
+        state.control_samples.clear();
+        state.control_cpu.clear();
+        state.pair_ratios.clear();
         state.in_flight = None;
 
         if state.pending.is_empty() {
@@ -683,6 +1008,9 @@ where
             seed_repeats: self.seed_repeats,
             confirm_runs: self.confirm_runs,
             ladder: self.ladder.clone(),
+            paired: self.paired,
+            probe_cores: state.probe_cores,
+            search_direction: state.search_direction.clone(),
             rungs: state.results.clone(),
         }
     }
@@ -1047,13 +1375,31 @@ mod tests {
     }
 
     impl Harness {
+        /// The unpaired protocol: rungs judged against the baseline recorded
+        /// when the search opened. Still reachable through
+        /// `parallelism_paired: false`, and the sequence these tests drive.
         async fn new(ladder: Vec<usize>, seed_repeats: usize, confirm_runs: usize) -> Self {
+            Self::build(ladder, seed_repeats, confirm_runs, false).await
+        }
+
+        /// The default protocol: a control run beside every rung.
+        async fn paired(ladder: Vec<usize>, seed_repeats: usize, confirm_runs: usize) -> Self {
+            Self::build(ladder, seed_repeats, confirm_runs, true).await
+        }
+
+        async fn build(
+            ladder: Vec<usize>,
+            seed_repeats: usize,
+            confirm_runs: usize,
+            paired: bool,
+        ) -> Self {
             let conn = DuckDBConnection::new(DuckDBConfig::new_from_path(":memory:".to_string()))
                 .await
                 .expect("in-memory duckdb");
             let engine = Arc::new(SimpleEngine::new(Arc::clone(&conn)).expect("engine"));
             let store = MemoryStore::open("parallelism").expect("store");
-            let pass = ParallelismTuning::new(ladder, seed_repeats, confirm_runs, false);
+            let mut pass = ParallelismTuning::new(ladder, seed_repeats, confirm_runs, false);
+            pass.paired = paired;
 
             let harness = Self {
                 pass,
@@ -1131,6 +1477,35 @@ mod tests {
             outcome
         }
 
+        /// One `After` step reporting prepared stats, for the CPU-bearing tests.
+        async fn after_with(&mut self, installed: Option<usize>, stats: ExecStats) -> StepOutcome {
+            self.run_seq += 1;
+            let mut dag = self.dag.clone();
+            dag.max_parallelism = installed;
+            let mut ctx = StepContext {
+                store: &self.store,
+                conn: Arc::clone(&self.conn),
+                engine: Arc::clone(&self.engine),
+                dag: &mut dag,
+                dag_id: "d1",
+                dag_name: "pipeline",
+                dag_version: 1,
+                side: StepPhase::After,
+                run: Some(RunContext {
+                    run_id: format!("r{}", self.run_seq),
+                    run_group_id: "g".into(),
+                    run_phase: run_phase::MEASURE.to_string(),
+                    rep_index: self.run_seq as i32,
+                    stats: Some(stats),
+                }),
+            };
+            let outcome = self.pass.step(&mut ctx).await.expect("after step");
+            if outcome.persists() {
+                self.dag = dag;
+            }
+            outcome
+        }
+
         /// A full run: install whatever the pass asks for, report `ms`.
         async fn run(&mut self, ms: i64) -> StepOutcome {
             let (before, installed) = self.before().await;
@@ -1139,6 +1514,25 @@ mod tests {
             }
             self.after(installed, Some(ms)).await
         }
+    }
+
+    /// Stats carrying a flat CPU series, so the guard and the probe have
+    /// something to read. `cores` is how many cores were busy throughout.
+    fn stats_with_cpu(ms: i64, cores: f64) -> ExecStats {
+        let mut stats = stats_of(ms);
+        let start = stats.start;
+        stats.system_samples = (0..=10)
+            .map(|i| crate::profile::SystemUsageSample {
+                timestamp: start + TimeDelta::milliseconds(ms * i / 10),
+                elapsed_ms: ms * i / 10,
+                cpu_percent: Some(cores * 100.0),
+                memory_bytes: None,
+                disk_bytes: None,
+                read_bytes: None,
+                written_bytes: None,
+            })
+            .collect();
+        stats
     }
 
     fn stats_of(ms: i64) -> ExecStats {
@@ -1151,6 +1545,204 @@ mod tests {
             node_stats: std::collections::HashMap::<String, NodeStats>::new(),
             system_samples: Vec::new(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Paired measurement, the CPU guard, and the probe
+    // -----------------------------------------------------------------------
+
+    /// Feed one step of a pair, choosing the stats by which half the pass
+    /// asked for. The order alternates, so a test cannot assume it.
+    async fn pair_half(
+        h: &mut Harness,
+        incumbent: Option<usize>,
+        control: ExecStats,
+        trial: ExecStats,
+    ) -> StepOutcome {
+        let (_, installed) = h.before().await;
+        let stats = if installed == incumbent { control } else { trial };
+        h.after_with(installed, stats).await
+    }
+
+    #[tokio::test]
+    async fn test_a_rung_is_preceded_by_a_control_at_the_incumbent() {
+        // The pair is the whole mechanism: the denominator has to be measured
+        // next to the numerator, at the incumbent's setting, not recalled from
+        // whenever the ladder opened.
+        let mut h = Harness::paired(vec![1], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        let (_, control) = h.before().await;
+        assert_eq!(control, None, "the control runs at the incumbent, not the rung");
+        h.after(control, Some(100)).await;
+        let (_, rung) = h.before().await;
+        assert_eq!(rung, Some(1), "the rung follows its own control");
+    }
+
+    #[tokio::test]
+    async fn test_a_drifting_machine_does_not_manufacture_a_winner() {
+        // The regression this protocol exists for. Every setting takes exactly
+        // as long as every other -- the cap does nothing -- but the machine is
+        // recovering throughout, so each run is quicker than the last. Judged
+        // against a baseline fixed at the start, the last rung measured always
+        // looks like an improvement. Judged against a control measured beside
+        // it, none of them do.
+        let mut h = Harness::paired(vec![1, 2], 2, 1).await;
+        let mut clock = 200i64;
+        let mut tick = |h: &mut Harness| {
+            // Each run is 5ms faster than the one before it, whatever ran.
+            clock -= 5;
+            clock
+        };
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            let ms = tick(&mut h);
+            h.after(installed, Some(ms)).await;
+        }
+        let mut outcome = StepOutcome::Idle;
+        for _ in 0..12 {
+            let (before, installed) = h.before().await;
+            if before.is_terminal() {
+                outcome = before;
+                break;
+            }
+            let ms = tick(&mut h);
+            outcome = h.after(installed, Some(ms)).await;
+            if outcome.is_terminal() {
+                break;
+            }
+        }
+        assert!(
+            matches!(outcome, StepOutcome::Done { .. }),
+            "a uniform drift must not promote anything, got {outcome:?}"
+        );
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, None, "the DAG keeps its own setting");
+        assert!(detail.paired);
+    }
+
+    #[tokio::test]
+    async fn test_a_rung_that_is_faster_but_burns_more_cpu_is_refused() {
+        // Wall time cannot separate "recruited an idle core" from "did the
+        // work twice after spilling". CPU for identical work can, and a rung
+        // that buys 10% of wall time with 60% more CPU is the second one.
+        let mut h = Harness::paired(vec![1], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        // Two counterbalanced pairs. The rung is faster every time, but at a
+        // CPU cost the guard is set to refuse.
+        for _ in 0..4 {
+            pair_half(&mut h, None, stats_with_cpu(100, 1.0), stats_with_cpu(90, 1.6)).await;
+        }
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, None, "refused despite the faster wall time");
+        let rung = detail.rungs.iter().find(|r| r.parallelism == Some(1)).expect("rung filed");
+        assert_eq!(rung.verdict, "rejected (cpu guard)");
+        let ratio = rung.cpu_ratio.expect("cpu ratio recorded");
+        assert!(ratio > 1.3, "the ratio the guard read is reported, got {ratio}");
+    }
+
+    #[tokio::test]
+    async fn test_a_rung_that_is_faster_on_less_cpu_is_accepted() {
+        // The other side of the same guard: relieving contention shows up as
+        // the same work costing less CPU, and that is exactly what should be
+        // kept.
+        let mut h = Harness::paired(vec![1], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        for _ in 0..4 {
+            pair_half(&mut h, None, stats_with_cpu(100, 4.0), stats_with_cpu(60, 2.4)).await;
+        }
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, Some(1));
+        let rung = detail.rungs.iter().find(|r| r.parallelism == Some(1)).expect("rung filed");
+        assert_eq!(rung.verdict, "accepted");
+        assert!(rung.pair_ratios.iter().all(|r| *r < 1.0), "every pair went the rung's way");
+    }
+
+    #[tokio::test]
+    async fn test_an_engine_that_leaves_cores_idle_is_searched_from_the_wide_end() {
+        // One node using a tenth of a core cannot be filling the machine, so
+        // the rungs worth trying are the wide ones and they should come first.
+        let mut h = Harness::paired(vec![1, 2, 8], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        let (_, control) = h.before().await;
+        h.after_with(control, stats_with_cpu(100, 0.1)).await;
+        let (_, probe) = h.before().await;
+        assert_eq!(probe, Some(1), "the narrowest rung is the probe");
+        // Slower than its control, so it is screened out -- but its CPU has
+        // already told the search which way to go.
+        h.after_with(probe, stats_with_cpu(150, 0.1)).await;
+
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.search_direction.as_deref(), Some("idle capacity"));
+        let (_, next_control) = h.before().await;
+        h.after_with(next_control, stats_with_cpu(100, 0.1)).await;
+        let (_, next) = h.before().await;
+        assert_eq!(next, Some(8), "the widest rung is tried before the narrower one");
+    }
+
+    #[tokio::test]
+    async fn test_an_engine_that_fills_the_machine_is_searched_from_the_narrow_end() {
+        // A node using far more than the machine has cannot leave anything for
+        // a second node, so the ladder stays in ascending order.
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+        let mut h = Harness::paired(vec![1, 2, 8], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        let (_, control) = h.before().await;
+        h.after_with(control, stats_with_cpu(100, cores)).await;
+        let (_, probe) = h.before().await;
+        h.after_with(probe, stats_with_cpu(150, cores)).await;
+
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.search_direction.as_deref(), Some("saturated"));
+        let (_, next_control) = h.before().await;
+        h.after_with(next_control, stats_with_cpu(100, cores)).await;
+        let (_, next) = h.before().await;
+        assert_eq!(next, Some(2), "ascending: the next narrowest rung");
+    }
+
+    #[tokio::test]
+    async fn test_an_engine_reporting_no_cpu_still_searches_on_wall_time() {
+        // A warehouse dee only holds a client connection to reports nothing to
+        // integrate. The guard and the probe go quiet; the ladder does not.
+        let mut h = Harness::paired(vec![1], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        for _ in 0..4 {
+            let (_, installed) = h.before().await;
+            let ms = if installed.is_none() { 100 } else { 60 };
+            h.after(installed, Some(ms)).await;
+        }
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, Some(1), "wall time alone still decides");
+        assert!(detail.probe_cores.is_none());
+        let rung = detail.rungs.iter().find(|r| r.parallelism == Some(1)).expect("rung");
+        assert!(rung.cpu_ratio.is_none(), "no CPU means no ratio, not a fabricated one");
+    }
+
+    #[test]
+    fn test_pairing_and_the_probe_are_on_by_default() {
+        // The unpaired protocol is reachable, but it is not what a DAG gets
+        // without asking: it is the one that read a drifting machine as a win.
+        let config = OptimizerConfig::default();
+        assert!(config.parallelism_paired);
+        assert!(config.parallelism_adaptive_order);
+        assert!(config.parallelism_cpu_guard > 0.0);
     }
 
     #[tokio::test]
