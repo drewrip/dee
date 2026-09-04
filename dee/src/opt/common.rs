@@ -16,6 +16,17 @@ use crate::{
 /// Matches common dialect names case-insensitively. Defaults to
 /// [`DialectType::DuckDB`] when the dialect is unknown or empty, because
 /// DuckDB is the primary target engine and its dialect is the safest default.
+/// Fraction by which a trial may overrun the best configuration known before it
+/// is worth abandoning.
+///
+/// A candidate already slower than the best known setting needs no exact
+/// runtime to be rejected, so there is nothing to learn from letting it
+/// finish -- only a censored observation ("at least this bad"), which is all
+/// the acceptance tests consume. Shared by every search that budgets a trial,
+/// so that "how much worse a run may get" is one number rather than one per
+/// pass.
+pub const DEFAULT_BUDGET_EPS: f64 = 0.25;
+
 pub fn dialect_for_db(db: &str) -> DialectType {
     match db.to_lowercase().as_str() {
         "duckdb" => DialectType::DuckDB,

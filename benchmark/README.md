@@ -72,7 +72,7 @@ dee_opt:                         # every dee optimizer option; lists sweep
   hmp_strategy: [breadth, greedy]
 
 backends:                        # backend tuning; lists sweep here too
-  duckdb:   {threads: 16, max_memory: [4GB, 16GB], num_connections: 16}
+  duckdb:   {threads: 16, max_memory: [4GB, 16GB]}
   postgres:
     provider: container          # or `external` to use a server you run
     image: postgres:18
@@ -121,8 +121,18 @@ in tuning share one preparation and one engine, and cost nothing beyond a
 rewritten `connections.json`. A setting describing a Postgres *instance* — its
 container memory, its server settings — means bringing the backend up again, so
 those cells are scheduled together and the backend changes over once per
-configuration. `num_connections` is the exception there: it only describes the
-connection, so sweeping it restarts nothing.
+configuration. Postgres's `num_connections` is the exception there: it only
+describes the connection, so sweeping it restarts nothing.
+
+DuckDB has no `num_connections`, deliberately. Its pooled connections are
+clones of one `Connection` sharing a database, a buffer pool and a `threads`
+setting, so a pool is not extra engine capacity — it is a second cap on how
+many node queries run at once. Set alongside a DAG's `max_parallelism` it made
+the effective concurrency `min(cap, pool)`, which bounded an "uncapped"
+baseline at the pool size and made every `ParallelismTuning` rung at or above
+it a re-measurement of the baseline. dee now sizes the pool from the DAG's
+degree of parallelism, so that is the only knob and the ladder measures what
+it names.
 
 Settings are validated against what each backend understands, because a typo in
 a swept key would otherwise expand into several cells that differ only in a

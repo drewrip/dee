@@ -1,5 +1,5 @@
 use crate::dag::{MaterializeMode, TransformNode};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
 fn svg_escape(s: &str) -> String {
@@ -15,6 +15,33 @@ fn node_colors(mode: MaterializeMode) -> (&'static str, &'static str) {
         MaterializeMode::Table => ("#f0fdf4", "#22c55e"),
         MaterializeMode::TempTable => ("#fffbeb", "#f59e0b"),
     }
+}
+
+/// Whether `query` reads the relation `name`.
+///
+/// A plain `contains` would let a source named `orders` match `orders_summary`,
+/// which inflates a view's leaf set and makes every containment test above it
+/// fail. The name has to sit on an identifier boundary.
+fn query_references(query: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // `.` is not part of the boundary: a query that writes `main.orders`
+    // still reads the source declared as `orders`.
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let bytes = query.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = query[from..].find(name) {
+        let start = from + offset;
+        let end = start + name.len();
+        let before_ok = start == 0 || !is_ident(bytes[start - 1] as char);
+        let after_ok = end == query.len() || !is_ident(bytes[end] as char);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 fn build_children_map(g: &GraphType) -> HashMap<String, Vec<String>> {
@@ -167,6 +194,66 @@ impl Graph {
 
     pub fn num_nodes(&self) -> usize {
         self.g.len()
+    }
+
+    /// The most nodes that can ever be in flight at once.
+    ///
+    /// A scheduler can only run nodes that do not depend on one another, so
+    /// the ceiling on concurrency is the largest set of mutually unreachable
+    /// nodes -- the widest antichain. By Dilworth's theorem that equals the
+    /// fewest chains needed to cover the DAG, and a minimum chain cover of a
+    /// transitively closed DAG is `n` minus a maximum bipartite matching over
+    /// its reachability relation.
+    ///
+    /// Worth the trouble because the obvious stand-in, the node count, is far
+    /// too loose: a 22-node pipeline that fans into six branches can never run
+    /// more than six at once, so anything measuring a cap of 8 against it is
+    /// measuring the uncapped DAG twice.
+    pub fn max_concurrency(&self) -> usize {
+        let ids: Vec<String> = self.g.keys().cloned().collect();
+        let n = ids.len();
+        if n <= 1 {
+            return n;
+        }
+        let index: HashMap<&str, usize> =
+            ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+
+        // Reachability, by depth-first walk from each node over `depends_on`
+        // reversed: `reach[i][j]` is "j runs strictly after i".
+        let mut succ = vec![Vec::new(); n];
+        for (id, node) in self.g.iter() {
+            let Some(&child) = index.get(id.as_str()) else { continue };
+            for dep in node.depends_on.iter() {
+                if let Some(&parent) = index.get(dep.as_str()) {
+                    succ[parent].push(child);
+                }
+            }
+        }
+        let mut reach = vec![vec![false; n]; n];
+        for start in 0..n {
+            let mut stack = succ[start].clone();
+            while let Some(cur) = stack.pop() {
+                if reach[start][cur] {
+                    continue;
+                }
+                reach[start][cur] = true;
+                stack.extend_from_slice(&succ[cur]);
+            }
+        }
+
+        // Maximum matching over the closure, by augmenting paths. `n` here is
+        // a DAG's node count -- tens, not thousands -- so the simple algorithm
+        // is not worth replacing with Hopcroft-Karp.
+        let mut matched_to: Vec<Option<usize>> = vec![None; n];
+        let mut matching = 0;
+        for left in 0..n {
+            let mut seen = vec![false; n];
+            if augment(left, &reach, &mut seen, &mut matched_to) {
+                matching += 1;
+            }
+        }
+        // Dilworth: widest antichain == fewest chains == n - matching.
+        n - matching
     }
 
     pub fn num_edges(&self) -> usize {
@@ -620,6 +707,127 @@ impl Graph {
         })
     }
 
+    /// The mirror image of [`frontier`](Self::frontier): the nearest *upstream*
+    /// nodes satisfying `predicate`, walking `depends_on` and stopping down a
+    /// path as soon as it matches.
+    pub fn upstream_frontier(
+        &self,
+        start: &str,
+        predicate: impl Fn(&TransformNode) -> bool,
+    ) -> HashSet<String> {
+        let mut result: HashSet<String> = HashSet::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = vec![start.to_string()];
+
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            if current != start
+                && let Some(node) = self.g.get(&current)
+                && predicate(node)
+            {
+                result.insert(current);
+                // Do not explore further up this path.
+                continue;
+            }
+            let Some(node) = self.g.get(&current) else {
+                continue;
+            };
+            for parent in &node.depends_on {
+                if !visited.contains(parent) {
+                    queue.push(parent.clone());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// The base relations the query the engine actually runs for `node` will
+    /// read, once the views above it are inlined: declared sources plus
+    /// persisted models beneath it.
+    ///
+    /// This is what lets a view be lined up against a subtree of a consumer's
+    /// physical plan -- see [`crate::opt::leafset`]. `sources` is the DAG's
+    /// declared source list: a source is not a graph node and is referenced
+    /// only by name inside a query, so it is found the same way
+    /// [`draw_svg`](Self::draw_svg) finds it -- by looking for the name in the
+    /// text of every query that gets inlined into this one.
+    ///
+    /// Names are normalized by [`crate::plan::normalize_relation`] so they
+    /// compare equal to the relation names read off a plan, which arrive
+    /// catalog- and schema-qualified.
+    pub fn leaf_sources(&self, node: &str, sources: &[String]) -> BTreeSet<String> {
+        let persisted = |n: &TransformNode| {
+            matches!(
+                n.materialize,
+                MaterializeMode::Table | MaterializeMode::TempTable
+            )
+        };
+
+        let mut leaves: BTreeSet<String> = BTreeSet::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = vec![node.to_string()];
+
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            let Some(n) = self.g.get(&current) else {
+                continue;
+            };
+            // A persisted ancestor is a relation by the time this node runs, so
+            // it is a leaf and nothing above it is inlined here.
+            if current != node && persisted(n) {
+                leaves.insert(crate::plan::normalize_relation(&current));
+                continue;
+            }
+            // This node's body is part of the query, so the sources it names
+            // are scanned by it.
+            for src in sources {
+                if query_references(&n.query_text, src) {
+                    leaves.insert(crate::plan::normalize_relation(src));
+                }
+            }
+            for parent in &n.depends_on {
+                queue.push(parent.clone());
+            }
+        }
+
+        leaves
+    }
+
+    /// Longest chain of nodes above each node -- how far it is from the DAG's
+    /// output.
+    ///
+    /// [`crate::opt::leafset`] assigns plan regions consumer-most first, and
+    /// this is that order: a view can only be placed inside the region of a
+    /// view that depends on it.
+    pub fn heights(&self) -> HashMap<String, usize> {
+        let children = build_children_map(&self.g);
+        let mut height: HashMap<String, usize> = HashMap::new();
+        // Reverse topological order: every child is resolved before its parent.
+        // A node the sort could not place (a cycle) is left at 0 rather than
+        // missing, so callers can index the map for any node of the graph.
+        for id in self.g.keys() {
+            height.insert(id.clone(), 0);
+        }
+        for id in self.topological_sort().into_iter().rev() {
+            let h = children
+                .get(&id)
+                .map(|kids| {
+                    kids.iter()
+                        .filter_map(|k| height.get(k).map(|h| h + 1))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            height.insert(id, h);
+        }
+        height
+    }
+
     pub fn paths_to_sinks(&self, node: &String) -> usize {
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
         for n in self.g.values() {
@@ -687,6 +895,114 @@ mod tests {
             g.add_node_unchecked(n);
         }
         g
+    }
+
+    // raw_a, raw_b are declared sources: not graph nodes, named only in the
+    // query text of the nodes that read them.
+    //
+    //   raw_a   raw_b
+    //     |       |
+    //    v1(V)  base(T)
+    //      \    /
+    //       v2(V)
+    //         |
+    //       out(T)
+    fn leafset_graph() -> Graph {
+        let with_sql = |id: &str, mode: MaterializeMode, deps: &[&str], sql: &str| {
+            let mut n = node(id, mode, deps);
+            n.query_text = sql.to_string();
+            n
+        };
+        make_graph(vec![
+            with_sql("v1", MaterializeMode::View, &[], "SELECT * FROM raw_a"),
+            with_sql("base", MaterializeMode::Table, &[], "SELECT * FROM raw_b"),
+            with_sql(
+                "v2",
+                MaterializeMode::View,
+                &["v1", "base"],
+                "SELECT * FROM v1 JOIN base USING (k)",
+            ),
+            with_sql("out", MaterializeMode::Table, &["v2"], "SELECT * FROM v2"),
+        ])
+    }
+
+    const SOURCES: [&str; 2] = ["raw_a", "raw_b"];
+
+    fn sources() -> Vec<String> {
+        SOURCES.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_leaf_sources_descends_views_and_stops_at_persisted() {
+        let g = leafset_graph();
+        // v2 reads through v1 to the source, and stops at `base` rather than
+        // descending to raw_b -- `base` is a relation by the time v2 runs.
+        assert_eq!(
+            g.leaf_sources("v2", &sources()),
+            BTreeSet::from(["raw_a".to_string(), "base".to_string()])
+        );
+        assert_eq!(
+            g.leaf_sources("v1", &sources()),
+            BTreeSet::from(["raw_a".to_string()])
+        );
+        assert_eq!(
+            g.leaf_sources("base", &sources()),
+            BTreeSet::from(["raw_b".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_leaf_sources_normalizes_the_way_a_plan_spells_a_relation() {
+        // A plan prints `warehouse.main.orders`; both sides go through the same
+        // normalizer or the coverage test compares nothing.
+        let mut n = node("v", MaterializeMode::View, &[]);
+        n.query_text = "SELECT * FROM warehouse.main.Orders".to_string();
+        let g = make_graph(vec![n]);
+        assert_eq!(
+            g.leaf_sources("v", &["warehouse.main.Orders".to_string()]),
+            BTreeSet::from(["orders".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_leaf_sources_does_not_match_a_source_inside_a_longer_name() {
+        // `orders` must not be picked up out of `orders_summary`: an inflated
+        // leaf set makes every containment test above this view fail.
+        let mut n = node("v", MaterializeMode::View, &[]);
+        n.query_text = "SELECT * FROM orders_summary".to_string();
+        let g = make_graph(vec![n]);
+        assert!(
+            g.leaf_sources("v", &["orders".to_string()]).is_empty(),
+            "a substring of a longer identifier was read as a source"
+        );
+    }
+
+    #[test]
+    fn test_heights_order_a_chain_consumer_most_first() {
+        let g = leafset_graph();
+        let h = g.heights();
+        assert_eq!(h["out"], 0);
+        assert_eq!(h["v2"], 1);
+        assert_eq!(h["v1"], 2);
+        assert_eq!(h["base"], 2);
+    }
+
+    #[test]
+    fn test_upstream_frontier_stops_at_the_first_match_on_each_path() {
+        //   a(T) -> b(T) -> c(V)
+        // From c the nearest persisted ancestor is b alone; a is behind it.
+        let g = make_graph(vec![
+            node("a", MaterializeMode::Table, &[]),
+            node("b", MaterializeMode::Table, &["a"]),
+            node("c", MaterializeMode::View, &["b"]),
+        ]);
+        let found = g.upstream_frontier("c", |n| {
+            matches!(
+                n.materialize,
+                MaterializeMode::Table | MaterializeMode::TempTable
+            )
+        });
+        assert_eq!(found, HashSet::from(["b".to_string()]));
     }
 
     // DAG layout:
@@ -764,4 +1080,30 @@ mod tests {
             "frontier must stop at branch_a (not continue to sink_a) and include branch_b"
         );
     }
+}
+
+/// One augmenting step of the bipartite matching behind
+/// [`Graph::max_concurrency`]: try to give `left` a partner, displacing an
+/// existing pairing only when that pairing can be re-homed.
+fn augment(
+    left: usize,
+    reach: &[Vec<bool>],
+    seen: &mut [bool],
+    matched_to: &mut [Option<usize>],
+) -> bool {
+    for right in 0..reach.len() {
+        if !reach[left][right] || seen[right] {
+            continue;
+        }
+        seen[right] = true;
+        let free = match matched_to[right] {
+            None => true,
+            Some(other) => augment(other, reach, seen, matched_to),
+        };
+        if free {
+            matched_to[right] = Some(left);
+            return true;
+        }
+    }
+    false
 }

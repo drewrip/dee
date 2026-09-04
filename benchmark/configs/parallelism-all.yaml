@@ -1,0 +1,36 @@
+# ParallelismTuning across every dag-bench project, at the two scale factors
+# that bracket the effect: sf=1, where each DAG is one dominant query and the
+# ladder has nothing to schedule, and sf=4, where concurrent nodes are big
+# enough to contend for the engine's memory ceiling.
+name: parallelism-all
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/parallelism-all
+verbosity: detailed
+
+matrix:
+  project: [p01_iot, p02_adtech, p03_ecommerce, p04_fraud, p05_hr,
+            p06_logistics, p07_saas, p08_healthcare, p09_gaming, p10_energy]
+  backend: [duckdb]
+  sf: [1, 4]
+  variant: [unopt, parallelism]
+
+variants:
+  unopt:       {passes: []}
+  parallelism: {passes: [parallelism]}
+
+dee_opt:
+  parallelism_ladder: [[1, 2, 4, 8]]
+  parallelism_seed_repeats: 2
+  parallelism_confirm_runs: 1
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 7200

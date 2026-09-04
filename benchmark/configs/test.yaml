@@ -36,7 +36,6 @@ backends:
   duckdb:
     threads: 8
     max_memory: 16GB
-    num_connections: 8
   postgres:
     provider: docker
     image: postgres:18

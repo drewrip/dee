@@ -31,6 +31,27 @@ pub enum CliHMPStrategy {
     Greedy,
 }
 
+// A doc comment on a variant is what `--help` prints for that value, so these
+// are written for whoever is reading the help rather than for whoever is
+// reading the source.
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum CliHmpCostMethod {
+    /// Charge a view the region of its consumer's plan that reads the same
+    /// base relations it does.
+    Leafset,
+    /// Match operators between plans by name and estimated cardinality.
+    Signature,
+    /// Rank views by their own measured node time. No plans required.
+    //
+    // Named explicitly rather than left to clap's kebab-casing, so the CLI
+    // advertises the same spelling as the stored config, the API and the
+    // benchmark: one setting should not have two names depending on how it was
+    // supplied. The kebab form stays accepted so anyone who guessed clap's
+    // usual convention is not turned away.
+    #[value(name = "node_time", alias = "node-time")]
+    NodeTime,
+}
+
 #[derive(Args, Clone, Debug)]
 pub struct OptimizerArgs {
     /// Passes to run, starting from everything off. Comma separated:
@@ -73,6 +94,9 @@ pub struct OptimizerArgs {
     /// HMP: how to search the node ranking.
     #[arg(long)]
     pub hmp_strategy: Option<CliHMPStrategy>,
+    /// HMP: how to read a View's cost off a run's plans.
+    #[arg(long)]
+    pub hmp_cost_method: Option<CliHmpCostMethod>,
     /// HMP: hypotheses the greedy strategy's beam search keeps alive.
     #[arg(long)]
     pub hmp_beam_width: Option<usize>,
@@ -110,10 +134,24 @@ pub struct OptimizerArgs {
     /// choose which way to search.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
     pub parallelism_adaptive_order: Option<bool>,
+    /// ParallelismTuning: rungs that may fail in a row before the ladder stops
+    /// and leaves the rest unmeasured. 0 measures every rung.
+    #[arg(long)]
+    pub parallelism_stop_after_failures: Option<usize>,
 
     /// Capture a resource timeseries for every candidate run.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
     pub profile_iterations: Option<bool>,
+
+    /// Cancel a candidate that overruns the best configuration found so far and
+    /// finish the run under that configuration instead. On by default; pass
+    /// `--trial-resume=false` to measure every candidate to completion.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    pub trial_resume: Option<bool>,
+    /// Fraction by which a candidate may overrun the best configuration before
+    /// it is cut short.
+    #[arg(long)]
+    pub trial_budget_eps: Option<f64>,
 }
 
 impl OptimizerArgs {
@@ -181,6 +219,14 @@ impl OptimizerArgs {
                 CliHMPStrategy::Greedy => json!("greedy"),
             }),
         );
+        set(
+            "hmp_cost_method",
+            self.hmp_cost_method.as_ref().map(|m| match m {
+                CliHmpCostMethod::Leafset => json!("leafset"),
+                CliHmpCostMethod::Signature => json!("signature"),
+                CliHmpCostMethod::NodeTime => json!("node_time"),
+            }),
+        );
         set("hmp_beam_width", self.hmp_beam_width.map(|v| json!(v)));
         set("parallelism_ladder", self.parallelism_ladder.as_ref().map(|v| json!(v)));
         set(
@@ -201,7 +247,13 @@ impl OptimizerArgs {
             "parallelism_adaptive_order",
             self.parallelism_adaptive_order.map(|v| json!(v)),
         );
+        set(
+            "parallelism_stop_after_failures",
+            self.parallelism_stop_after_failures.map(|v| json!(v)),
+        );
         set("profile_iterations", self.profile_iterations.map(|v| json!(v)));
+        set("trial_resume", self.trial_resume.map(|v| json!(v)));
+        set("trial_budget_eps", self.trial_budget_eps.map(|v| json!(v)));
 
         // The server refuses a path here, so only the log-the-table form is
         // reachable remotely: the flag chooses between `""` and off.

@@ -79,12 +79,8 @@ use crate::{
 const STATE_TABLE: &str = "opt_parallelism_state";
 const TRIALS_TABLE: &str = "opt_parallelism_trials";
 
-/// Fraction by which a trial may overrun the incumbent before it is worth
-/// abandoning. A candidate already slower than the best known setting needs no
-/// exact runtime to be rejected, so there is nothing to learn from letting it
-/// finish -- only a censored observation ("at least this bad"), which is all
-/// the acceptance test consumes.
-const BUDGET_EPS: f64 = 0.25;
+/// See [`DEFAULT_BUDGET_EPS`].
+use crate::opt::common::DEFAULT_BUDGET_EPS as BUDGET_EPS;
 
 /// Share of the machine one node must occupy for the engine to count as
 /// self-parallelizing. Above it, node concurrency has no idle resource to
@@ -146,6 +142,13 @@ struct ParallelismState {
     pair_control: Option<f64>,
     #[serde(default)]
     pair_trial: Option<f64>,
+    /// Rungs rejected in a row, reset by any acceptance. The ladder stops
+    /// once this reaches the configured limit.
+    #[serde(default)]
+    consecutive_failures: usize,
+    /// The most nodes any baseline run had in flight at once.
+    #[serde(default)]
+    observed_in_flight: usize,
     /// Cores one node occupied during the probe rung, and what that implied.
     #[serde(default)]
     probe_cores: Option<f64>,
@@ -184,6 +187,8 @@ impl ParallelismState {
             pair_ratios: Vec::new(),
             pair_control: None,
             pair_trial: None,
+            consecutive_failures: 0,
+            observed_in_flight: 0,
             probe_cores: None,
             search_direction: None,
             in_flight: None,
@@ -236,6 +241,32 @@ fn mean(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
+/// The most nodes this run actually had in flight at once.
+///
+/// The structural bound says what the DAG *could* run concurrently; this says
+/// what it did. The two differ when a node finishes before its siblings start,
+/// which on a DAG of cheap views and one expensive table is most of them --
+/// and a cap above what the schedule reached cannot change that schedule.
+fn peak_in_flight(node_stats: &std::collections::HashMap<String, crate::executor::NodeStats>) -> usize {
+    let mut events: Vec<(i64, i32)> = Vec::with_capacity(node_stats.len() * 2);
+    for stats in node_stats.values() {
+        events.push((stats.start.timestamp_millis(), 1));
+        events.push((stats.finish.timestamp_millis(), -1));
+    }
+    // Ends before starts at equal timestamps: a node that finished as another
+    // began was never really in flight alongside it. Ordering these the other
+    // way counts every hand-off as an overlap, which on a DAG of views that
+    // each take no measurable time inflates the peak to near the node count --
+    // exactly the loose bound this prune exists to replace.
+    events.sort_unstable_by_key(|(t, d)| (*t, *d));
+    let (mut cur, mut peak) = (0i32, 0i32);
+    for (_, delta) in events {
+        cur += delta;
+        peak = peak.max(cur);
+    }
+    peak.max(0) as usize
+}
+
 /// Whether the rung, rather than its control, runs first in pair `index`.
 ///
 /// Alternating is what makes the pair cancel a trend. With the control always
@@ -273,6 +304,9 @@ where
     cpu_guard: f64,
     /// Let the narrowest rung's CPU decide which way to search.
     adaptive_order: bool,
+    /// Rungs that may fail in a row before the ladder gives up. Zero measures
+    /// every rung.
+    stop_after_failures: usize,
     /// Capture each iteration's CPU/memory/disk timeseries into its
     /// `IterationStat`.
     profile_iterations: bool,
@@ -304,6 +338,7 @@ where
             paired: true,
             cpu_guard: 0.10,
             adaptive_order: true,
+            stop_after_failures: 2,
             step_phase: StepPhase::Both,
             explain_data: None,
             _conn: PhantomData,
@@ -321,6 +356,7 @@ where
         pass.paired = config.parallelism_paired;
         pass.cpu_guard = config.parallelism_cpu_guard.max(0.0);
         pass.adaptive_order = config.parallelism_adaptive_order;
+        pass.stop_after_failures = config.parallelism_stop_after_failures;
         pass
     }
 
@@ -334,10 +370,16 @@ where
     /// measured already. Trying either costs a full DAG run to re-measure
     /// something known.
     fn rungs_for(&self, dag: &Dag) -> Vec<usize> {
-        let nodes = dag.nodes.num_nodes().max(1);
-        // What a setting actually does on a DAG this size. `None` is a cap of
-        // `nodes`, since nothing more than that can ever be runnable.
-        let effective = |rung: Option<usize>| rung.map(|n| n.clamp(1, nodes)).unwrap_or(nodes);
+        // The widest antichain, not the node count: a cap at or above the most
+        // nodes that can ever be runnable together schedules exactly what no
+        // cap schedules, so measuring it buys a second copy of the baseline.
+        // Across dag-bench that gap is large -- 10 to 25 nodes, but never more
+        // than 5 to 11 of them in flight -- and every rung above it was a pair
+        // of runs spent on a setting that could not bind.
+        let width = dag.nodes.max_concurrency().max(1);
+        // What a setting actually does on a DAG this shape. `None` is a cap of
+        // `width`, since nothing more than that can ever be runnable.
+        let effective = |rung: Option<usize>| rung.map(|n| n.clamp(1, width)).unwrap_or(width);
 
         let baseline = effective(dag.max_parallelism);
         let mut seen = vec![baseline];
@@ -447,6 +489,17 @@ where
     /// Honoured only where the run exists solely to measure the candidate.
     /// Under the server the run is the DAG's real work and is measured to
     /// completion.
+    /// This search's incumbent as a DAG: the definition in front of it at the
+    /// best concurrency cap measured so far.
+    ///
+    /// Structurally identical to the trial -- the ladder only turns one dial --
+    /// so a resume under it reuses everything the trial finished.
+    fn incumbent_dag(dag: &Dag, incumbent: Option<usize>) -> Option<Box<Dag>> {
+        let mut fallback = dag.clone();
+        fallback.max_parallelism = incumbent;
+        Some(Box::new(fallback))
+    }
+
     fn budget(&self, state: &ParallelismState) -> Option<i64> {
         state
             .incumbent_worst()
@@ -478,9 +531,11 @@ where
                     } else {
                         (Some(in_flight.rung), describe(Some(in_flight.rung)))
                     };
+                    let fallback = Self::incumbent_dag(ctx.dag, state.incumbent);
                     ctx.dag.max_parallelism = setting;
                     return Ok(StepOutcome::Trial {
                         label,
+                        fallback,
                         // A control is the incumbent and cannot overrun it in
                         // any meaningful sense, so it runs unbudgeted; cutting
                         // it short would discard the pair's denominator.
@@ -516,6 +571,7 @@ where
                 } else {
                     (Some(rung), describe(Some(rung)))
                 };
+                let fallback = Self::incumbent_dag(ctx.dag, state.incumbent);
                 ctx.dag.max_parallelism = setting;
                 state.in_flight = Some(InFlight {
                     rung,
@@ -524,6 +580,7 @@ where
                 self.save_state(ctx.store, ctx.dag_id, &state).await?;
                 Ok(StepOutcome::Trial {
                     label,
+                    fallback,
                     budget_ms: (stage != "control")
                         .then(|| self.budget(&state))
                         .flatten(),
@@ -575,8 +632,9 @@ where
         };
 
         if state.phase == "baseline" {
+            let observed = peak_in_flight(&stats.node_stats);
             return self
-                .observe_baseline(ctx, state, &run.run_id, cost, cpu, samples)
+                .observe_baseline(ctx, state, &run.run_id, cost, cpu, observed, samples)
                 .await;
         }
 
@@ -630,7 +688,8 @@ where
             && state.probe_cores.is_none()
             && in_flight.stage == "screen"
         {
-            self.record_probe(&mut state, in_flight.rung, cost, cpu);
+            let budget = ctx.conn.parallelism_budget().await.unwrap_or(None);
+            self.record_probe(&mut state, in_flight.rung, cost, cpu, budget);
         }
 
         // Unpaired, a rung is scored against the incumbent's best sample the
@@ -780,6 +839,7 @@ where
         rung: usize,
         cost_ms: f64,
         cpu: Option<f64>,
+        budget: Option<usize>,
     ) {
         let Some(cpu) = cpu else { return };
         let wall_s = cost_ms / 1000.0;
@@ -789,8 +849,14 @@ where
         let cores = cpu / wall_s;
         state.probe_cores = Some(cores);
 
-        let available = std::thread::available_parallelism()
-            .map(|n| n.get() as f64)
+        // The engine's own budget, falling back to the machine only when the
+        // engine will not say. The difference decides cases: a node using 6.1
+        // cores is 44% of a 14-core machine and reads as idle capacity, but
+        // 77% of the 8 threads DuckDB was actually given, which is the number
+        // a second node would have to share.
+        let available = budget
+            .map(|b| b as f64)
+            .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get() as f64))
             .unwrap_or(1.0);
         // A node that already occupies most of the machine leaves nothing for
         // a second node to recruit, so the narrow end of the ladder is where
@@ -823,6 +889,7 @@ where
         run_id: &str,
         cost: f64,
         cpu: Option<f64>,
+        observed_in_flight: usize,
         samples: Vec<crate::profile::SystemUsageSample>,
     ) -> Result<StepOutcome, OptimizerError> {
         let _ = cpu;
@@ -833,6 +900,7 @@ where
             state.pending = self.rungs_for(ctx.dag);
         }
         state.incumbent_samples.push(cost);
+        state.observed_in_flight = state.observed_in_flight.max(observed_in_flight);
         state.seed_remaining = state.seed_remaining.saturating_sub(1);
         state.runs_used += 1;
         state.iterations.push(IterationStat {
@@ -866,6 +934,23 @@ where
             cpu_ratio: None,
             verdict: "baseline".to_string(),
         });
+
+        // What the baseline actually reached, pruned against. Only meaningful
+        // when the baseline ran uncapped: under a cap the peak is the cap, and
+        // pruning to it would discard every rung between the cap and what the
+        // DAG can really do.
+        if state.baseline.is_none() && state.observed_in_flight > 0 {
+            let observed = state.observed_in_flight;
+            let before = state.pending.len();
+            state.pending.retain(|rung| *rung < observed);
+            if state.pending.len() < before {
+                debug!(
+                    "ParallelismTuning: the baseline never had more than {observed} node(s) \
+                     in flight; dropped {} rung(s) that cannot bind",
+                    before - state.pending.len(),
+                );
+            }
+        }
 
         // The probe goes first when it can choose the direction, so the rung
         // that measures one node alone is the narrowest one on the ladder.
@@ -940,6 +1025,41 @@ where
         state.control_cpu.clear();
         state.pair_ratios.clear();
         state.in_flight = None;
+
+        if verdict == "accepted" {
+            state.consecutive_failures = 0;
+        } else {
+            state.consecutive_failures += 1;
+        }
+
+        // Walking the ladder in the direction the probe chose, a run of
+        // failures means the search has gone past the useful setting and the
+        // rungs beyond are further past it. Stopping there costs a third of
+        // the ladder on dag-bench and, replayed over every curve measured, its
+        // worst regret was 2.6%. It is only sound in the right direction: the
+        // same replay searching the wrong way gave up as much as 105%, which
+        // is why this is tied to the probe rather than offered on its own.
+        if self.stop_after_failures > 0
+            && state.consecutive_failures >= self.stop_after_failures
+            && !state.pending.is_empty()
+        {
+            debug!(
+                "ParallelismTuning: {} rung(s) failed in a row; stopping with {} unmeasured",
+                state.consecutive_failures,
+                state.pending.len(),
+            );
+            for rung in std::mem::take(&mut state.pending) {
+                state.results.push(RungResult {
+                    parallelism: Some(rung),
+                    samples: Vec::new(),
+                    control_samples: Vec::new(),
+                    pair_ratios: Vec::new(),
+                    cpu_ratio: None,
+                    verdict: "not measured (search stopped)".to_string(),
+                });
+            }
+            return self.converge(ctx, state).await;
+        }
 
         if state.pending.is_empty() {
             return self.converge(ctx, state).await;
@@ -1535,6 +1655,26 @@ mod tests {
         stats
     }
 
+    /// Stats whose node timings all overlap, so the run's peak concurrency is
+    /// exactly `n`.
+    fn stats_overlapping(n: usize) -> ExecStats {
+        let mut stats = stats_of(100);
+        let start = stats.start;
+        for i in 0..n {
+            stats.node_stats.insert(
+                format!("n{i}"),
+                NodeStats {
+                    start,
+                    finish: start + TimeDelta::milliseconds(100),
+                    duration: TimeDelta::milliseconds(100),
+                    plan: None,
+                    rows_produced: Some(0),
+                },
+            );
+        }
+        stats
+    }
+
     fn stats_of(ms: i64) -> ExecStats {
         let start = Utc::now();
         let finish = start + TimeDelta::milliseconds(ms);
@@ -1733,6 +1873,216 @@ mod tests {
         assert!(detail.probe_cores.is_none());
         let rung = detail.rungs.iter().find(|r| r.parallelism == Some(1)).expect("rung");
         assert!(rung.cpu_ratio.is_none(), "no CPU means no ratio, not a fabricated one");
+    }
+
+    #[test]
+    fn test_nodes_that_hand_off_are_not_counted_as_overlapping() {
+        // Two nodes where the second starts exactly as the first ends never
+        // ran together. Counting the hand-off as an overlap is how a chain of
+        // instant views reads as wide parallelism.
+        let start = Utc::now();
+        let mut stats = std::collections::HashMap::new();
+        for (i, offset) in [0i64, 10, 20].iter().enumerate() {
+            stats.insert(
+                format!("n{i}"),
+                NodeStats {
+                    start: start + TimeDelta::milliseconds(*offset),
+                    finish: start + TimeDelta::milliseconds(offset + 10),
+                    duration: TimeDelta::milliseconds(10),
+                    plan: None,
+                    rows_produced: Some(0),
+                },
+            );
+        }
+        assert_eq!(peak_in_flight(&stats), 1, "a hand-off is not an overlap");
+
+        // And genuine overlap is still counted.
+        let mut overlapping = std::collections::HashMap::new();
+        for i in 0..3 {
+            overlapping.insert(
+                format!("n{i}"),
+                NodeStats {
+                    start,
+                    finish: start + TimeDelta::milliseconds(10),
+                    duration: TimeDelta::milliseconds(10),
+                    plan: None,
+                    rows_produced: Some(0),
+                },
+            );
+        }
+        assert_eq!(peak_in_flight(&overlapping), 3);
+    }
+
+    #[test]
+    fn test_rungs_are_pruned_against_what_can_actually_run_at_once() {
+        // A chain of 20 nodes has 20 nodes and a concurrency of one: nothing
+        // can overlap with anything, so no cap on the ladder changes a single
+        // execution. Pruning on the node count would have measured all four.
+        let mut map = HashMap::new();
+        for i in 0..20 {
+            let id = format!("n{i}");
+            let mut deps = HashSet::new();
+            if i > 0 {
+                deps.insert(format!("n{}", i - 1));
+            }
+            map.insert(
+                id.clone(),
+                TransformNode {
+                    id,
+                    query_text: "SELECT 1".to_string(),
+                    materialize: crate::dag::MaterializeMode::View,
+                    depends_on: deps,
+                    schema: None,
+                },
+            );
+        }
+        let chain = Dag {
+            db: "duckdb".to_string(),
+            nodes: Graph::new(map),
+            sources: Vec::new(),
+            max_parallelism: None,
+        };
+        assert_eq!(chain.nodes.max_concurrency(), 1);
+        assert!(pass(vec![1, 2, 4, 8]).rungs_for(&chain).is_empty());
+    }
+
+    #[test]
+    fn test_a_fan_out_prunes_the_rungs_above_its_width() {
+        // One source feeding five leaves: five can run at once and no more, so
+        // caps of 8 and of "no cap" are the same execution.
+        let mut map = HashMap::new();
+        map.insert(
+            "root".to_string(),
+            TransformNode {
+                id: "root".to_string(),
+                query_text: "SELECT 1".to_string(),
+                materialize: crate::dag::MaterializeMode::View,
+                depends_on: HashSet::new(),
+                schema: None,
+            },
+        );
+        for i in 0..5 {
+            let id = format!("leaf{i}");
+            map.insert(
+                id.clone(),
+                TransformNode {
+                    id,
+                    query_text: "SELECT 1".to_string(),
+                    materialize: crate::dag::MaterializeMode::View,
+                    depends_on: HashSet::from(["root".to_string()]),
+                    schema: None,
+                },
+            );
+        }
+        let fan = Dag {
+            db: "duckdb".to_string(),
+            nodes: Graph::new(map),
+            sources: Vec::new(),
+            max_parallelism: None,
+        };
+        assert_eq!(fan.nodes.max_concurrency(), 5);
+        // 8 collapses onto the baseline of 5; 1, 2 and 4 remain distinct.
+        assert_eq!(pass(vec![1, 2, 4, 8]).rungs_for(&fan), vec![1, 2, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_rungs_the_baseline_never_reached_are_dropped_before_measuring() {
+        // The DAG could in principle run more nodes at once than it did, but a
+        // cap above what the schedule actually reached cannot change that
+        // schedule -- so it is not worth a pair of runs.
+        let mut h = Harness::paired(vec![1, 2, 4, 8], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            // Three nodes overlapping, and never a fourth.
+            h.after_with(installed, stats_overlapping(3)).await;
+        }
+        let (_, first) = h.before().await;
+        assert_eq!(first, None, "a control opens the pair");
+        h.after(first, Some(100)).await;
+        let (_, rung) = h.before().await;
+        assert!(
+            matches!(rung, Some(1) | Some(2)),
+            "only rungs below the observed peak of 3 are worth measuring, got {rung:?}"
+        );
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert!(
+            !detail.rungs.iter().any(|r| r.parallelism == Some(8)),
+            "a cap of 8 on a schedule that peaked at 3 is the baseline again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_ladder_stops_once_enough_rungs_have_failed_in_a_row() {
+        // Walking away from the useful setting, every further rung is further
+        // away. Two failures end the search rather than measuring the rest.
+        let mut h = Harness::paired(vec![1, 2, 4, 8], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        let mut outcome = StepOutcome::Idle;
+        for _ in 0..20 {
+            let (before, installed) = h.before().await;
+            if before.is_terminal() {
+                outcome = before;
+                break;
+            }
+            // Every rung slower than its control, so nothing is ever accepted.
+            let ms = if installed.is_none() { 100 } else { 200 };
+            outcome = h.after(installed, Some(ms)).await;
+            if outcome.is_terminal() {
+                break;
+            }
+        }
+        assert!(matches!(outcome, StepOutcome::Done { .. }), "got {outcome:?}");
+        let detail = h.pass.explain_data.clone().expect("detail");
+        let unmeasured = detail
+            .rungs
+            .iter()
+            .filter(|r| r.verdict == "not measured (search stopped)")
+            .count();
+        assert!(unmeasured > 0, "the search stopped short and said so");
+        assert_eq!(detail.chosen_parallelism, None, "nothing beat the baseline");
+    }
+
+    #[tokio::test]
+    async fn test_an_accepted_rung_buys_the_search_more_room() {
+        // The counter is consecutive failures, not total ones: a rung that
+        // wins means the search has not passed the useful setting yet.
+        let mut h = Harness::paired(vec![1, 2, 4, 8], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        // Rung 1 fails, rung 2 wins, then 4 and 8 fail: the win in the middle
+        // resets the count, so all four are measured.
+        let mut measured: Vec<usize> = Vec::new();
+        for _ in 0..24 {
+            let (before, installed) = h.before().await;
+            if before.is_terminal() {
+                break;
+            }
+            let ms = match installed {
+                None => 100,
+                Some(2) => 60,
+                Some(n) => {
+                    if !measured.contains(&n) {
+                        measured.push(n);
+                    }
+                    200
+                }
+            };
+            if let Some(2) = installed {
+                if !measured.contains(&2) {
+                    measured.push(2);
+                }
+            }
+            if h.after(installed, Some(ms)).await.is_terminal() {
+                break;
+            }
+        }
+        measured.sort_unstable();
+        assert_eq!(measured, vec![1, 2, 4, 8], "the acceptance kept the search alive");
     }
 
     #[test]

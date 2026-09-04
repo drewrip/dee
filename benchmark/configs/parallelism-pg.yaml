@@ -1,0 +1,45 @@
+# The inverted case, kept small. On DuckDB one query saturates the box, so
+# capping node concurrency wins wherever the uncapped DAG pins the memory
+# ceiling. This Postgres is stock -- max_parallel_workers_per_gather=2 on 14
+# cores -- so a single query cannot fill the machine and node-level
+# concurrency is the only thing that can. The ladder should decline to cap.
+#
+# One project and 3 repetitions: Postgres runs these DAGs ~40x slower than
+# DuckDB, so this is sized to answer the direction question, not to be a
+# precise measurement.
+name: parallelism-pg
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/parallelism-pg
+verbosity: detailed
+
+matrix:
+  project: [p02_adtech]
+  backend: [postgres]
+  sf: [1]
+  variant: [unopt, parallelism]
+
+variants:
+  unopt:       {passes: []}
+  parallelism: {passes: [parallelism]}
+
+dee_opt:
+  parallelism_ladder: [[1, 2, 8]]
+  parallelism_seed_repeats: 2
+  parallelism_confirm_runs: 1
+
+backends:
+  postgres:
+    provider: external
+    host: 127.0.0.1
+    port: 5432
+    user: runner
+    password: password
+    dbname: benchmark
+    num_connections: 16
+
+execution:
+  repetitions: 3
+  warmups: 1
+  sample_interval_ms: 200
+  timeout_s: 3600

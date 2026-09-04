@@ -88,16 +88,49 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
     DeeOptSpec("hmp_strategy", "--hmp-strategy", "str", frozenset({"hmp"}),
                choices=("breadth", "greedy"),
                doc="HMP's search strategy over the candidate ranking."),
+    DeeOptSpec("hmp_cost_method", "--hmp-cost-method", "str", frozenset({"hmp"}),
+               choices=("leafset", "signature", "node_time"),
+               doc="How HMP reads a View's cost off a run's plans. `leafset` matches a View "
+                   "against the region of a consumer's plan whose scanned base relations are "
+                   "still contained in the View's own; `signature` matches operators between "
+                   "plans by name and estimated cardinality."),
     DeeOptSpec("hmp_beam_width", "--hmp-beam-width", "int", frozenset({"hmp"}),
                doc="Beam width for the greedy HMP strategy. Ignored by breadth."),
     DeeOptSpec("hmp_use_pushdown", "--hmp-no-pushdown", "bool", frozenset({"hmp"}), negated=True,
                doc="Run the pushdown pass on each HMP candidate before measuring it."),
+    DeeOptSpec("trial_resume", "--trial-resume", "bool",
+               frozenset({"hmp", "omp", "parallelism"}),
+               doc="Cancel a candidate that overruns the best configuration found so far and "
+                   "finish the run under that configuration, rebuilding only what the cancelled "
+                   "candidate never got to. Off measures every candidate to completion, which is "
+                   "the control a study of trial overrun wants."),
+    DeeOptSpec("trial_budget_eps", "--trial-budget-eps", "float",
+               frozenset({"hmp", "omp", "parallelism"}),
+               doc="Fraction by which a candidate may overrun the best configuration before it "
+                   "is cut short."),
     DeeOptSpec("parallelism_ladder", "--parallelism-ladder", "int_list", frozenset({"parallelism"}),
                doc="Node-concurrency caps the parallelism ladder measures."),
     DeeOptSpec("parallelism_seed_repeats", "--parallelism-seed-repeats", "int", frozenset({"parallelism"}),
                doc="Runs spent measuring the DAG's current setting before the ladder starts."),
     DeeOptSpec("parallelism_confirm_runs", "--parallelism-confirm-runs", "int", frozenset({"parallelism"}),
                doc="Re-measurements a rung must survive after beating the incumbent's best sample."),
+    DeeOptSpec("parallelism_after_materialization", "--parallelism-after-materialization", "bool",
+               frozenset({"parallelism"}),
+               doc="Run the ladder after HMP/OMP rather than before them. The authored DAG is "
+                   "usually one dominant query surrounded by views, which gives the ladder nothing "
+                   "to schedule until materialization has split it into concurrent tables."),
+    DeeOptSpec("parallelism_paired", "--parallelism-paired", "bool", frozenset({"parallelism"}),
+               doc="Judge each rung against a control measured beside it, so warehouse drift "
+                   "cannot be read as a parallelism effect."),
+    DeeOptSpec("parallelism_cpu_guard", "--parallelism-cpu-guard", "float", frozenset({"parallelism"}),
+               doc="Fractional CPU increase past which a rung is refused whatever it did to wall time."),
+    DeeOptSpec("parallelism_adaptive_order", "--parallelism-adaptive-order", "bool",
+               frozenset({"parallelism"}),
+               doc="Probe the narrowest rung first and let the cores it occupies choose the "
+                   "search direction."),
+    DeeOptSpec("parallelism_stop_after_failures", "--parallelism-stop-after-failures", "int",
+               frozenset({"parallelism"}),
+               doc="Rungs that may fail in a row before the ladder stops. 0 measures every rung."),
     DeeOptSpec("profile_iterations", "--profile-iterations", "bool", frozenset({"hmp", "omp", "parallelism"}),
                doc="Capture a resource timeseries for every candidate DAG the optimizer runs."),
 )
@@ -139,7 +172,14 @@ VALID_BACKENDS = ("duckdb", "postgres")
 # only in a setting nothing reads, and quietly measure the same thing several
 # times under different cell ids.
 BACKEND_KEYS: dict[str, frozenset[str]] = {
-    "duckdb": frozenset({"threads", "num_connections", "max_memory"}),
+    # No `num_connections`: pooled DuckDB connections share one database, so
+    # the pool is a second cap on node concurrency rather than extra engine
+    # capacity. Setting it here made the effective parallelism
+    # `min(max_parallelism, num_connections)` -- which silently bounded the
+    # "uncapped" baseline and made every ParallelismTuning rung at or above
+    # the pool size the same experiment as the baseline. dee now sizes the
+    # pool from the DAG's degree of parallelism, and there is nothing to set.
+    "duckdb": frozenset({"threads", "max_memory"}),
     "postgres": frozenset({
         "provider", "image", "host", "port", "user", "password", "dbname",
         "cpus", "memory", "volume_suffix", "num_connections", "settings",

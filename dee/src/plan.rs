@@ -49,6 +49,12 @@ pub struct PlanNode {
     pub cardinality: Option<u64>,
     /// Rows the planner estimated this operator would emit.
     pub estimated_cardinality: Option<f64>,
+    /// The base relation this operator scans, normalized by
+    /// [`normalize_relation`]. `None` for everything that is not a real scan
+    /// -- including the pseudo-scans that read an intermediate rather than a
+    /// relation (see [`is_pseudo_scan`]).
+    #[serde(default)]
+    pub relation: Option<String>,
     pub children: Vec<PlanNode>,
 }
 
@@ -103,6 +109,75 @@ impl PlanNode {
         &self.signature() == key || self.children.iter().any(|c| c.contains(key))
     }
 
+    /// See [`is_aggregate_boundary`].
+    pub fn is_aggregate_boundary(&self) -> bool {
+        is_aggregate_boundary(&self.operator)
+    }
+}
+
+/// Strip a plan's catalog/schema qualification and quoting down to the bare
+/// relation name, lowercased.
+///
+/// The plan prints `warehouse.main.shipments`; the DAG knows `shipments`. Leaf
+/// sets are compared by size, so a spelling mismatch does not fail loudly -- it
+/// produces an empty attribution and a candidate list ordered by nothing at
+/// all. Both sides normalize through here.
+pub fn normalize_relation(name: &str) -> String {
+    name.rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .trim_matches('"')
+        .to_lowercase()
+}
+
+/// Operators that read an *intermediate* -- a CTE, a subquery, a function
+/// result -- rather than a stored relation.
+///
+/// Treating one as its own leaf means the CTE's consumer no longer looks like
+/// it reads the underlying tables, every leaf-set match above it fails, and the
+/// whole chain is attributed one level too low. This is not hypothetical: a CTE
+/// is exactly how an engine represents the duplication being measured.
+pub fn is_pseudo_scan(operator: &str) -> bool {
+    matches!(
+        operator.to_ascii_uppercase().as_str(),
+        // DuckDB
+        "CTE_SCAN"
+            | "DELIM_SCAN"
+            | "CHUNK_SCAN"
+            | "COLUMN_DATA_SCAN"
+            | "RECURSIVE_CTE_SCAN"
+            // Postgres
+            | "CTE SCAN"
+            | "SUBQUERY SCAN"
+            | "WORKTABLE SCAN"
+            | "FUNCTION SCAN"
+            | "VALUES SCAN"
+            | "NAMED TUPLESTORE SCAN"
+            | "RESULT"
+    )
+}
+
+/// Whether an operator collapses cardinality, and so ends the region a view
+/// with a top-level `GROUP BY` occupies.
+///
+/// `WINDOW` and `ORDER_BY` are deliberately absent. They were in this set at
+/// first and it was a bug: a windowed view emits one row per input row, so
+/// treating it as an aggregate made the matcher skip past its very expensive
+/// region.
+pub fn is_aggregate_boundary(operator: &str) -> bool {
+    matches!(
+        operator.to_ascii_uppercase().as_str(),
+        // DuckDB
+        "HASH_GROUP_BY" | "PERFECT_HASH_GROUP_BY" | "UNGROUPED_AGGREGATE" | "GROUP_BY" | "DISTINCT"
+        // Postgres
+            | "AGGREGATE"
+            | "HASHAGGREGATE"
+            | "GROUPAGGREGATE"
+            | "MIXEDAGGREGATE"
+            | "GROUP"
+            | "UNIQUE"
+            | "SETOP"
+    )
 }
 
 /// A plan operator's identity: its name and its estimated output size.
@@ -153,12 +228,25 @@ impl DuckDBPlan {
             .extra_info
             .get("Estimated Cardinality")
             .and_then(json_to_f64);
+        // A scan is identified by the presence of a `Table` key rather than by
+        // an operator-name allowlist: the operator is spelled `SEQ_SCAN` or
+        // `TABLE_SCAN` depending on the DuckDB version, and `READ_PARQUET` /
+        // `READ_CSV` for external data.
+        let relation = if is_pseudo_scan(&operator) {
+            None
+        } else {
+            self.extra_info
+                .get("Table")
+                .and_then(|v| v.as_str())
+                .map(normalize_relation)
+        };
         vec![PlanNode {
             operator,
             // DuckDB's operator_timing is already this operator's own time.
             exclusive_time_s: self.operator_timing,
             cardinality: self.operator_cardinality,
             estimated_cardinality: estimated,
+            relation,
             children,
         }]
     }
@@ -209,6 +297,12 @@ struct PgPlan {
     actual_loops: Option<f64>,
     #[serde(rename = "Plan Rows", default)]
     plan_rows: Option<f64>,
+    /// Emitted by every real scan node -- `Seq Scan`, `Index Scan`, `Index Only
+    /// Scan`, `Bitmap Heap Scan` -- and already unqualified. The pseudo-scans
+    /// do not carry it at all, but they are filtered anyway so the rule is one
+    /// rule on both backends.
+    #[serde(rename = "Relation Name", default)]
+    relation_name: Option<String>,
     #[serde(rename = "Plans", default)]
     plans: Vec<PgPlan>,
 }
@@ -234,11 +328,17 @@ impl PgPlan {
         let exclusive = inclusive.map(|t| (t - children_total).max(0.0));
 
         let loops = self.actual_loops.unwrap_or(1.0);
+        let relation = if is_pseudo_scan(&self.node_type) {
+            None
+        } else {
+            self.relation_name.as_deref().map(normalize_relation)
+        };
         PlanNode {
             operator: self.node_type,
             exclusive_time_s: exclusive,
             cardinality: self.actual_rows.map(|r| (r * loops).round() as u64),
             estimated_cardinality: self.plan_rows,
+            relation,
             children: self.plans.into_iter().map(PgPlan::into_plan_node).collect(),
         }
     }
@@ -265,6 +365,109 @@ mod tests {
               "Actual Loops": 1, "Plan Rows": 1000, "Plans": []}
            ]}
         ]}}]"#;
+
+    #[test]
+    fn postgres_names_the_relation_a_real_scan_reads() {
+        let json = r#"[{"Plan": {"Node Type": "Seq Scan", "Relation Name": "Shipments",
+            "Actual Total Time": 5.0, "Actual Rows": 10, "Actual Loops": 1,
+            "Plan Rows": 10, "Plans": []}}]"#;
+        let plans = parse_postgres_plan(json).unwrap();
+        assert_eq!(plans[0].relation.as_deref(), Some("shipments"));
+    }
+
+    #[test]
+    fn postgres_index_scans_are_leaves_too() {
+        // Ranking a view by the tables it reads must not depend on which access
+        // method the planner picked for them.
+        for node_type in ["Index Scan", "Index Only Scan", "Bitmap Heap Scan"] {
+            let json = format!(
+                r#"[{{"Plan": {{"Node Type": "{node_type}", "Relation Name": "orders",
+                    "Actual Total Time": 1.0, "Actual Rows": 1, "Actual Loops": 1,
+                    "Plan Rows": 1, "Plans": []}}}}]"#
+            );
+            let plans = parse_postgres_plan(&json).unwrap();
+            assert_eq!(
+                plans[0].relation.as_deref(),
+                Some("orders"),
+                "{node_type} did not yield a leaf"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pseudo_scan_is_never_a_leaf() {
+        // A CTE Scan reads an intermediate. Treating it as its own relation
+        // makes every leaf-set match above it fail and attributes the whole
+        // chain one level too low.
+        let json = r#"[{"Plan": {"Node Type": "CTE Scan", "Relation Name": "cte_1",
+            "Actual Total Time": 5.0, "Actual Rows": 10, "Actual Loops": 1,
+            "Plan Rows": 10, "Plans": []}}]"#;
+        let plans = parse_postgres_plan(json).unwrap();
+        assert_eq!(plans[0].relation, None);
+
+        let duck = r#"{"operator_name": "CTE_SCAN", "operator_timing": 0.1,
+            "extra_info": {"Table": "cte_1"}, "children": []}"#;
+        let plans = parse_duckdb_plan(duck).unwrap();
+        assert_eq!(plans[0].relation, None);
+    }
+
+    #[test]
+    fn duckdb_names_the_relation_and_strips_its_qualification() {
+        // The plan prints `warehouse.main.shipments`; the manifest knows
+        // `shipments`. Leaf sets are compared by size, so a mismatch is silent.
+        let json = r#"{"operator_name": "SEQ_SCAN", "operator_timing": 0.5,
+            "extra_info": {"Table": "warehouse.main.Shipments"}, "children": []}"#;
+        let plans = parse_duckdb_plan(json).unwrap();
+        assert_eq!(plans[0].relation.as_deref(), Some("shipments"));
+    }
+
+    #[test]
+    fn duckdb_finds_scans_by_their_table_key_not_their_operator_name() {
+        // The operator is SEQ_SCAN or TABLE_SCAN depending on version, and
+        // READ_PARQUET / READ_CSV for external data.
+        for op in ["SEQ_SCAN", "TABLE_SCAN", "READ_PARQUET"] {
+            let json = format!(
+                r#"{{"operator_name": "{op}", "operator_timing": 0.5,
+                    "extra_info": {{"Table": "orders"}}, "children": []}}"#
+            );
+            let plans = parse_duckdb_plan(&json).unwrap();
+            assert_eq!(plans[0].relation.as_deref(), Some("orders"), "{op}");
+        }
+    }
+
+    #[test]
+    fn an_operator_with_no_table_has_no_relation() {
+        let json = r#"{"operator_name": "HASH_JOIN", "operator_timing": 0.5,
+            "extra_info": {"Estimated Cardinality": 10}, "children": []}"#;
+        let plans = parse_duckdb_plan(json).unwrap();
+        assert_eq!(plans[0].relation, None);
+    }
+
+    #[test]
+    fn window_and_order_by_are_not_aggregate_boundaries() {
+        // They were in this set at first and it was a bug: a windowed view
+        // emits one row per input row, so treating it as an aggregate made the
+        // matcher skip past its very expensive region.
+        assert!(!is_aggregate_boundary("WINDOW"));
+        assert!(!is_aggregate_boundary("ORDER_BY"));
+        assert!(!is_aggregate_boundary("Sort"));
+        for op in [
+            "HASH_GROUP_BY",
+            "PERFECT_HASH_GROUP_BY",
+            "UNGROUPED_AGGREGATE",
+            "GROUP_BY",
+            "DISTINCT",
+            "Aggregate",
+            "HashAggregate",
+            "GroupAggregate",
+            "MixedAggregate",
+            "Group",
+            "Unique",
+            "SetOp",
+        ] {
+            assert!(is_aggregate_boundary(op), "{op} should collapse cardinality");
+        }
+    }
 
     #[test]
     fn postgres_time_is_made_exclusive() {

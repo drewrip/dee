@@ -1,0 +1,43 @@
+# Experiment B: does the ladder find anything once HMP has created concurrent
+# work, and does its position in the pipeline matter?
+#
+# The authored dag-bench DAGs are one dominant query surrounded by views, so a
+# ladder running first has nothing to schedule. HMP splits that query into
+# materialized tables; `parallelism_after_materialization` sweeps both orders
+# so "before" and "after" are one experiment rather than two runs to diff.
+name: parallelism-after-hmp
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/parallelism-after-hmp
+verbosity: detailed
+
+matrix:
+  project: [p03_ecommerce, p05_hr]
+  backend: [duckdb]
+  sf: [1]
+  variant: [unopt, hmp, hmp_parallelism]
+
+variants:
+  unopt:           {passes: []}
+  hmp:             {passes: [hmp]}
+  hmp_parallelism: {passes: [hmp, parallelism]}
+
+dee_opt:
+  hmp_max_runs: 4
+  hmp_strategy: breadth
+  parallelism_ladder: [[1, 2, 4, 8]]
+  parallelism_seed_repeats: 2
+  parallelism_confirm_runs: 1
+  # Only the two hmp_parallelism cells expand: no other variant reads it.
+  parallelism_after_materialization: [false, true]
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 7200

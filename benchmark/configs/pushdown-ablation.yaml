@@ -44,7 +44,6 @@ dee_opt:
 backends:
   duckdb:
     threads: 8
-    num_connections: 8
   postgres:
     provider: container
     image: postgres:18

@@ -220,12 +220,19 @@ pub enum StepOutcome {
         /// already slower than the best plan needs no exact runtime to be
         /// rejected.
         ///
-        /// Honoured only where the run exists solely to measure the candidate
-        /// -- a batch `dee optimize`. Under the server's driver the run is the
-        /// DAG's real work, and killing it to save a search some time would
-        /// mean the pipeline did not run; there the budget is ignored and the
-        /// candidate is measured to completion.
+        /// Honoured by both drivers. Under the server's driver the run is the
+        /// DAG's real work, so cancelling it is only half the answer: the run
+        /// is then finished under `fallback`, rebuilding what the trial never
+        /// got to. A budget with no `fallback` there means the candidate is
+        /// measured to completion, because a pipeline that did not run is not
+        /// an outcome a search gets to choose.
         budget_ms: Option<i64>,
+        /// The DAG a cancelled trial is finished under: this search's
+        /// incumbent, the best it has measured so far.
+        ///
+        /// `None` from a pass with no incumbent yet -- nothing has been
+        /// measured, so there is nothing better to fall back to.
+        fallback: Option<Box<Dag>>,
         record: Box<PassOutcome>,
     },
     /// A `Once` optimization finished its rewrite. The DAG in the context is
@@ -351,6 +358,7 @@ mod tests {
             !StepOutcome::Trial {
                 label: "c1".into(),
                 budget_ms: None,
+                fallback: None,
                 record: record(),
             }
             .persists()

@@ -1,0 +1,61 @@
+# Does leaf-set matching pick better materialization candidates than the older
+# operator-signature match?
+#
+# The two methods read the same run's plans and disagree about which View owns
+# which cost. `signature` matches operators between plans by (name, estimated
+# cardinality), so a View is charged every operator whose key its own plan
+# happens to contain -- which lets a small dimension aggregate outrank the real
+# work, and reports a windowed View's width as its consumer's. `leafset`
+# attributes a View to the region of the consumer's plan whose scanned base
+# relations are still contained in the View's own.
+#
+# Both backends, because the two differ in where a scan's relation is spelled
+# and in whether plan timings are CPU or wall time.
+#
+#   dee-bench run -c configs/cost-method.yaml
+name: cost-method
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/cost-method
+verbosity: detailed
+
+matrix:
+  project: [p01_iot, p03_ecommerce, p05_hr, p07_saas]
+  backend: [duckdb, postgres]
+  sf: [1]
+  variant: [unopt, signature, leafset]
+
+variants:
+  unopt:     {passes: []}
+  signature: {passes: [hmp], hmp_cost_method: signature}
+  leafset:   {passes: [hmp], hmp_cost_method: leafset}
+
+dee_opt:
+  # A budget wide enough that the search, not the ranking, decides what is
+  # tried: the point here is which candidates each method puts first.
+  hmp_max_runs: 6
+  hmp_strategy: breadth
+  hmp_top_cpu_time: 0.8
+  hmp_use_pushdown: false
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+  postgres:
+    provider: container
+    image: postgres:18
+    port: 55433
+    cpus: 8
+    memory: 8g
+    num_connections: 16
+    settings:
+      shared_buffers: 2GB
+      work_mem: 256MB
+      max_parallel_workers: 8
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

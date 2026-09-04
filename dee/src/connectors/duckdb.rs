@@ -501,6 +501,19 @@ impl Connector for DuckDBConnection {
         Ok(parse_duckdb_size_bytes(&memory_usage))
     }
 
+    /// DuckDB's `threads` setting: one pool shared by every query on the
+    /// database, so it bounds the whole engine and not just one statement.
+    async fn parallelism_budget(&self) -> Result<Option<usize>, ConnectorError> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
+        let threads: i64 = conn
+            .query_row("SELECT current_setting('threads')", [], |row| row.get(0))
+            .map_err(|e| ConnectorError::Execute(format!("reading threads - {e}")))?;
+        Ok((threads > 0).then_some(threads as usize))
+    }
+
     async fn sample_system_cpu_usage(&self) -> Result<Option<f64>, ConnectorError> {
         sample_process_cpu_usage(std::process::id())
     }

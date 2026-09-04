@@ -1,0 +1,31 @@
+# End-to-end check of the paired protocol, the CPU guard and the probe against
+# a project whose sf=4 win is already known (2.03x at cap=1, unpaired).
+name: parallelism-verify2
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/parallelism-verify2
+verbosity: detailed
+
+matrix:
+  project: [p09_gaming]
+  backend: [duckdb]
+  sf: [1, 4]
+  variant: [unopt, parallelism]
+
+variants:
+  unopt:       {passes: []}
+  parallelism: {passes: [parallelism]}
+
+dee_opt:
+  parallelism_ladder: [[1, 2, 4, 8]]
+  parallelism_seed_repeats: 2
+  parallelism_confirm_runs: 1
+
+backends:
+  duckdb: {threads: 8, max_memory: 16GB}
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

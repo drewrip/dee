@@ -447,11 +447,13 @@ where
                     // Proposed but never reported on -- a failed or cancelled
                     // run. Re-install it rather than scoring a run that never
                     // finished.
+                    let fallback = self.incumbent_dag(ctx.dag, &state).await;
                     self.build_plan(ctx.dag, &state.top_candidates, &in_flight.modes)
                         .await?;
                     return Ok(StepOutcome::Trial {
                         label: Self::describe_plan(&state.top_candidates, &in_flight.modes),
                         budget_ms: self.budget(&state),
+                        fallback,
                         record: Box::new(self.outcome_from(&state)),
                     });
                 }
@@ -479,6 +481,7 @@ where
                         continue;
                     }
 
+                    let fallback = self.incumbent_dag(ctx.dag, &state).await;
                     self.build_plan(ctx.dag, &state.top_candidates, &modes)
                         .await?;
                     state.in_flight = Some(OmpInFlight {
@@ -489,6 +492,7 @@ where
                     return Ok(StepOutcome::Trial {
                         label: Self::describe_plan(&state.top_candidates, &modes),
                         budget_ms: self.budget(&state),
+                        fallback,
                         record: Box::new(self.outcome_from(&state)),
                     });
                 }
@@ -504,6 +508,25 @@ where
     /// far, since anything slower cannot win and its exact runtime is of no
     /// interest. `None` when early termination is off or nothing has been
     /// measured yet.
+    /// This search's incumbent as a DAG: the authored definition with the best
+    /// mode assignment measured so far applied to it.
+    ///
+    /// The baseline assignment counts as an incumbent -- it is what every plan
+    /// is compared against -- so this is `None` only before a baseline has been
+    /// measured, when there is genuinely nothing to be worse than.
+    async fn incumbent_dag(&self, dag: &Dag, state: &OmpState) -> Option<Box<Dag>> {
+        if state.best_cost == f64::MAX {
+            return None;
+        }
+        let mut fallback = dag.clone();
+        if !state.best_modes.is_empty() {
+            self.build_plan(&mut fallback, &state.top_candidates, &state.best_modes)
+                .await
+                .ok()?;
+        }
+        Some(Box::new(fallback))
+    }
+
     fn budget(&self, state: &OmpState) -> Option<i64> {
         if !self.early_termination || state.best_cost == f64::MAX {
             return None;
@@ -558,12 +581,19 @@ where
         let Some(run) = ctx.run.clone() else {
             return Ok(StepOutcome::Idle);
         };
-        let Some(stats) = run.stats.as_ref() else {
-            return Ok(StepOutcome::Idle);
-        };
         if !run.is_measured() {
             return Ok(StepOutcome::Idle);
         }
+        // No stats on a measured run means the execution produced no usable
+        // time -- cancelled at its budget, or failed. That is a censored
+        // observation, and it is enough to reject: "at least as slow as the
+        // cap", and the cap is already worse than the best plan.
+        //
+        // Clearing `in_flight` is the point: leaving it set makes the next
+        // `Before` step re-install the plan that was just cancelled.
+        let Some(stats) = run.stats.as_ref() else {
+            return self.reject_censored(ctx, state, &run.run_id).await;
+        };
 
         let cost = stats.duration.num_milliseconds() as f64;
 
@@ -656,6 +686,56 @@ where
             in_flight.index,
             &in_flight.modes.join(","),
             cost,
+        )
+        .await?;
+        self.save_state(ctx.store, ctx.dag_id, &state).await?;
+        self.remember_explain(&state);
+        Ok(StepOutcome::Idle)
+    }
+
+    /// File a plan that produced no usable measurement and move the search on.
+    async fn reject_censored(
+        &mut self,
+        ctx: &mut StepContext<'_, C, E>,
+        mut state: OmpState,
+        run_id: &str,
+    ) -> Result<StepOutcome, OptimizerError> {
+        let Some(in_flight) = state.in_flight.take() else {
+            return Ok(StepOutcome::Idle);
+        };
+        if state.phase == "baseline" {
+            // The baseline is not a candidate. Recording a censored one would
+            // give every later plan a number no run produced to beat.
+            return Ok(StepOutcome::Idle);
+        }
+
+        state.runs_used += 1;
+        // A lower bound rather than a measurement, and never a new best.
+        let censored = self.budget(&state).unwrap_or(i64::MAX) as f64;
+        let label = format!(
+            "Plan {}: {}",
+            in_flight.index + 1,
+            Self::describe_plan(&state.top_candidates, &in_flight.modes)
+        );
+        debug!("OMPPass: {label} produced no usable measurement; rejecting as censored");
+        state.iterations.push(IterationStat {
+            iteration: state.iterations.len() + 1,
+            runtime_ms: censored as i64,
+            outcome: Some("cancelled".to_string()),
+            system_samples: Vec::new(),
+            ..Default::default()
+        });
+        state
+            .attempts
+            .push((label, "cancelled (censored)".to_string(), None));
+
+        self.record_trial(
+            ctx.store,
+            ctx.dag_id,
+            run_id,
+            in_flight.index,
+            &in_flight.modes.join(","),
+            censored,
         )
         .await?;
         self.save_state(ctx.store, ctx.dag_id, &state).await?;

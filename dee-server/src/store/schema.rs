@@ -27,6 +27,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: include_str!("migrations/0002_optimizations.sql"),
     },
+    Migration {
+        version: 3,
+        sql: include_str!("migrations/0003_delivery.sql"),
+    },
 ];
 
 /// The version the code expects. Used by `/v1/info` and by tests asserting the

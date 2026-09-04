@@ -14,10 +14,12 @@
 //!   for that one execution; only a converged optimization mints a version.
 //!   Otherwise a search would bury a DAG's real history under its rejected
 //!   experiments.
-//! * A cancellation budget is ignored here. Under `dee optimize` a run exists
-//!   only to measure a candidate and can be abandoned once it is clearly
-//!   losing; here the run is the DAG's real work, and killing it to save the
-//!   search some time would mean the pipeline did not run.
+//! * A cancellation budget is honoured here, but only halfway: the run is the
+//!   DAG's real work, so abandoning a losing candidate is not enough on its
+//!   own -- the run is then finished under that search's incumbent, rebuilding
+//!   only what the cancelled candidate never got to. A trial that offers a
+//!   budget without an incumbent to fall back on is measured to completion,
+//!   because a pipeline that did not run is not an outcome a search may choose.
 
 use std::sync::Arc;
 
@@ -46,11 +48,26 @@ where
     store: Arc<dyn OptStore>,
 }
 
+/// A candidate one optimization installed on this run.
+pub struct InstalledTrial {
+    /// The optimization that proposed it.
+    pub name: String,
+    /// Human-readable identity of the candidate.
+    pub label: String,
+    /// Cancel the run once it has taken this long.
+    pub budget_ms: Option<i64>,
+    /// The DAG to finish the run under if the candidate is cancelled: that
+    /// search's incumbent. Without one there is nothing better to fall back to,
+    /// and the candidate is measured to completion however slow it turns out --
+    /// a pipeline that did not run is not an outcome a search gets to choose.
+    pub fallback: Option<Box<Dag>>,
+}
+
 /// What stepping a DAG's optimizations produced for one execution.
 #[derive(Default)]
 pub struct StepReport {
-    /// `(optimization, candidate label)` for every trial installed.
-    pub trials: Vec<(String, String)>,
+    /// Every candidate installed on this run.
+    pub trials: Vec<InstalledTrial>,
     /// Optimizations that converged, with the DAG each promoted.
     pub promoted: Vec<(String, Dag)>,
     /// Optimizations that finished without a rewrite worth storing.
@@ -174,9 +191,19 @@ where
         // is one to log and set aside.
         match stepper.optimization.step(&mut ctx).await {
             Ok(StepOutcome::Idle) => {}
-            Ok(StepOutcome::Trial { label, .. }) => {
+            Ok(StepOutcome::Trial {
+                label,
+                budget_ms,
+                fallback,
+                ..
+            }) => {
                 log::info!("{}: trying {label} on this run", stepper.name);
-                report.trials.push((stepper.name.clone(), label));
+                report.trials.push(InstalledTrial {
+                    name: stepper.name.clone(),
+                    label,
+                    budget_ms,
+                    fallback,
+                });
             }
             Ok(StepOutcome::Promote { .. }) | Ok(StepOutcome::Rewrote { .. }) => {
                 log::info!("{}: converged; promoting its result", stepper.name);

@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import DEE_OPT_BY_NAME, BenchConfig
+from .config import DEE_OPT_BY_NAME, VALID_PASSES, BenchConfig
 from .infra.base import BackendContext
 from .matrix import Cell
 from .sampler import PhaseMetrics, PhaseSampler, samples_to_rows
@@ -79,10 +79,13 @@ def build_optimizer_config(cell: Cell) -> dict[str, Any]:
     so a variant's pass set is exactly its list and does not shift when those
     defaults change.
     """
+    # Derived from the pass list rather than written out, so a pass added to
+    # dee is benchmarkable as soon as `VALID_PASSES` names it. Spelling the
+    # three known ones here is what left `run_parallelism_pass` silently unset
+    # once ParallelismTuning landed: the optimization then ran no passes at
+    # all and produced no version to measure.
     config: dict[str, Any] = {
-        "run_hmp_pass": "hmp" in cell.passes,
-        "run_omp_pass": "omp" in cell.passes,
-        "run_pushdown_pass": "pushdown" in cell.passes,
+        f"run_{name}_pass": name in cell.passes for name in VALID_PASSES
     }
     for key, value in sorted(cell.dee_opt.items()):
         if value is None:
@@ -418,6 +421,11 @@ class CellRunner:
                 "cpu_seconds": (metrics.cpu_seconds or 0) * share if metrics.cpu_seconds else None,
                 "peak_rss_bytes": metrics.peak_rss_bytes,
                 "peak_engine_mem_bytes": _peak(r.get("system_samples", []), "memory_bytes"),
+                # Only a 'direct' delivery's engine_wall_ms is comparable to
+                # another run's; see the column docs in schema.py.
+                "delivery": (server_run or {}).get("delivery") or "direct",
+                "trial_elapsed_ms": (server_run or {}).get("trial_elapsed_ms"),
+                "resume_elapsed_ms": (server_run or {}).get("resume_elapsed_ms"),
                 "read_bytes": int((metrics.read_bytes or 0) * share) if metrics.read_bytes else None,
                 "written_bytes": int((metrics.written_bytes or 0) * share) if metrics.written_bytes else None,
                 "db_size_bytes": _peak(r.get("system_samples", []), "disk_bytes"),

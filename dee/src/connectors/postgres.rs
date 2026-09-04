@@ -184,6 +184,19 @@ impl Connector for PostgresConnection {
     type Config = PostgresConfig;
     type Connection = PostgresConnection;
 
+    /// `max_parallel_workers`: the server-wide pool every backend draws its
+    /// parallel workers from. The per-gather limit bounds one query; this
+    /// bounds the engine, which is what a second concurrent node contends for.
+    async fn parallelism_budget(&self) -> Result<Option<usize>, ConnectorError> {
+        let row: (String,) = sqlx::query_as("SHOW max_parallel_workers")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| ConnectorError::Execute(format!("reading max_parallel_workers - {e}")))?;
+        // Workers are additional to the backend that requested them, so the
+        // engine can keep one more thing busy than it has workers.
+        Ok(row.0.trim().parse::<usize>().ok().map(|w| w + 1))
+    }
+
     async fn new(config: Self::Config) -> Result<Arc<Self::Connection>, ConnectorError> {
         let conn_options = PgConnectOptions::new_without_pgpass()
             .host(&config.host)

@@ -71,6 +71,33 @@ impl Dispatcher {
 
     /// Start every entry whose turn has come. Returns the groups it started.
     pub async fn dispatch_ready(&self) -> Result<Vec<String>, ServerError> {
+        let claimed = self.claim_ready().await?;
+        // Spawned after the scan rather than inside it, and that ordering is
+        // the whole of the per-DAG serialization. A driver runs concurrently
+        // with the rest of the pass that started it, so a group that fails
+        // fast used to be able to release its DAG at one of the loop's later
+        // await points -- letting the next entry for the *same* DAG claim it
+        // and start in the same pass. Nothing was ever run twice at once, so
+        // it was safe; it just made "one entry per DAG at a time" true by
+        // timing rather than by construction. Holding every claim across the
+        // scan makes it true by construction, and costs no latency: a driver
+        // calls `wake_queue` as it finishes, so the next entry starts on that
+        // wake-up rather than waiting for a tick.
+        for group_id in &claimed {
+            tokio::spawn(driver::drive_group(self.state.clone(), group_id.clone()));
+        }
+        Ok(claimed)
+    }
+
+    /// Decide which entries start now and take ownership of them, without
+    /// starting them.
+    ///
+    /// Separate from [`dispatch_ready`](Self::dispatch_ready) so the decision
+    /// can be observed on its own. A caller that could only watch a finished
+    /// pass could not tell "this entry was passed over because its DAG was
+    /// busy" from "the entry ahead of it finished and this one took its turn",
+    /// which are the same observation and different behaviours.
+    async fn claim_ready(&self) -> Result<Vec<String>, ServerError> {
         let capacity = self.state.config.max_concurrent_runs.max(1);
         let mut started = Vec::new();
 
@@ -116,10 +143,6 @@ impl Dispatcher {
                 entry.run_group_id,
                 entry.dag_name
             );
-            tokio::spawn(driver::drive_group(
-                self.state.clone(),
-                entry.run_group_id.clone(),
-            ));
             started.push(entry.run_group_id);
         }
 
@@ -234,8 +257,15 @@ mod tests {
 
         // This is the whole contract of `dee queue add -n 3`: three entries,
         // one running, in submission order.
-        let started = dispatcher.dispatch_ready().await.unwrap();
-        assert_eq!(started, vec![first], "the front of the queue, and only it");
+        //
+        // Asserted against `claim_ready` rather than `dispatch_ready` on
+        // purpose. Nothing runs in these tests -- no connection is registered,
+        // so a driver fails immediately -- and a driver runs concurrently with
+        // the pass that spawned it, so watching `dispatch_ready` means racing
+        // the first entry's failure against the rest of the scan. Claiming is
+        // the decision; spawning is what the decision authorizes.
+        let started = dispatcher.claim_ready().await.unwrap();
+        assert_eq!(started, vec![first.clone()], "the front of the queue, and only it");
 
         let waiting: Vec<String> = runs::next_pending(&state.store, 10)
             .await
@@ -243,7 +273,28 @@ mod tests {
             .into_iter()
             .map(|g| g.run_group_id)
             .collect();
-        assert_eq!(waiting, vec![second, third]);
+        assert_eq!(waiting, vec![second.clone(), third]);
+
+        // And the claim is what holds them back: while the first entry owns
+        // the DAG, another pass finds nothing it may start.
+        assert!(
+            dispatcher.claim_ready().await.unwrap().is_empty(),
+            "a second pass started an entry for a DAG that is already running one"
+        );
+
+        // Once the first entry is genuinely done, the next one's turn comes.
+        // Both halves of "done" are needed: the in-memory claim *and* the
+        // group's terminal status, since a dispatched group is a blocker in the
+        // store whether or not this process still holds it -- which is what
+        // stops a restarted server from starting a second run for a DAG whose
+        // first one it has forgotten about.
+        state.runs.finish(&first).await;
+        assert!(
+            dispatcher.claim_ready().await.unwrap().is_empty(),
+            "releasing the in-memory claim alone unblocked the queue"
+        );
+        runs::finalize_group(&state.store, first.clone(), None).await.unwrap();
+        assert_eq!(dispatcher.claim_ready().await.unwrap(), vec![second]);
     }
 
     #[tokio::test]

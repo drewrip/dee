@@ -356,10 +356,10 @@ def write_connections(
 ) -> tuple[Path, str]:
     """Write the dee connections.json for this prepared project."""
     if backend == "duckdb":
+        # No pool size: dee sizes DuckDB's pool from the DAG's parallelism.
         cfg: dict[str, Any] = {
             "type": "duckdb",
             "database": str(warehouse),
-            "num_connections": int(backend_config.get("num_connections", 16)),
         }
         if backend_config.get("threads"):
             cfg["threads"] = int(backend_config["threads"])

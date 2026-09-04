@@ -122,12 +122,29 @@ pub async fn optimizer_options() -> Json<Vec<OptimizerOption>> {
         OptimizerOption { name: "hmp_strategy", flag: "--hmp-strategy", kind: "str",
             passes: &["hmp"], choices: Some(&["breadth", "greedy"]),
             default: json!(d.hmp_strategy), doc: "HMP's search strategy over the candidate ranking." },
+        OptimizerOption { name: "hmp_cost_method", flag: "--hmp-cost-method", kind: "str",
+            passes: &["hmp"], choices: Some(&["leafset", "signature", "node_time"]),
+            default: json!(d.hmp_cost_method),
+            doc: "How a View's cost is read off a run's plans. `leafset` matches a View \
+                  against the region of a consumer's plan whose scanned base relations are \
+                  contained in the View's own; `signature` matches operators between plans \
+                  by name and estimated cardinality." },
         OptimizerOption { name: "hmp_beam_width", flag: "--hmp-beam-width", kind: "int",
             passes: &["hmp"], choices: None, default: json!(d.hmp_beam_width),
             doc: "Beam width for the greedy HMP strategy. Ignored by breadth." },
         OptimizerOption { name: "hmp_use_pushdown", flag: "--hmp-no-pushdown", kind: "bool",
             passes: &["hmp"], choices: None, default: json!(d.hmp_use_pushdown),
             doc: "Run pushdown before evaluating each HMP candidate. The CLI flag is the negation." },
+        OptimizerOption { name: "trial_resume", flag: "--trial-resume", kind: "bool",
+            passes: &["hmp", "omp", "parallelism"], choices: None, default: json!(d.trial_resume),
+            doc: "Cancel a candidate that overruns the best configuration found so far and \
+                  finish the run under that configuration, rebuilding only what the cancelled \
+                  candidate never got to. Off measures every candidate to completion." },
+        OptimizerOption { name: "trial_budget_eps", flag: "--trial-budget-eps", kind: "float",
+            passes: &["hmp", "omp", "parallelism"], choices: None,
+            default: json!(d.trial_budget_eps),
+            doc: "Fraction by which a candidate may overrun the best configuration before it \
+                  is cut short." },
         OptimizerOption { name: "profile_iterations", flag: "--profile-iterations", kind: "bool",
             passes: &["hmp", "omp", "parallelism"], choices: None, default: json!(d.profile_iterations),
             doc: "Capture a resource timeseries for every candidate run." },

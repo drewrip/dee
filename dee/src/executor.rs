@@ -56,6 +56,65 @@ pub enum ExecutorError {
     Cancelled,
 }
 
+/// Why a run stopped before every node was built.
+///
+/// The two are not interchangeable and must never be conflated: a `Cancelled`
+/// run is one the *user* asked to stop, and finishing it behind their back
+/// would be wrong. A `Budget` stop is dee's own decision about a candidate it
+/// is measuring, and the pipeline still owes its consumer the tables.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StopReason {
+    /// The run exceeded the budget it was given.
+    Budget,
+    /// The engine's cancel flag was raised.
+    Cancelled,
+}
+
+/// How one execution should behave.
+#[derive(Clone, Debug)]
+pub struct RunOptions {
+    /// Stop the run once it has taken this long. Observed between node
+    /// dispatches, so the real overrun is this plus the longest node still in
+    /// flight -- a DAG whose cost is one dominant node cannot be cut short at
+    /// all.
+    pub budget: Option<std::time::Duration>,
+    /// Nodes whose relations already exist and must not be rebuilt. Their
+    /// dependents become runnable exactly as if they had just finished.
+    pub skip: HashSet<String>,
+    /// Whether a stop drops every relation the run created.
+    ///
+    /// True is the historical behaviour and the right one for a run nobody is
+    /// waiting on. A resume needs it false: the partial work is the whole point.
+    pub cleanup_on_cancel: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            budget: None,
+            skip: HashSet::new(),
+            cleanup_on_cancel: true,
+        }
+    }
+}
+
+/// What one execution did, including one that stopped early.
+#[derive(Debug)]
+pub struct RunOutcome {
+    /// Timings for the nodes that finished. On a stopped run this describes
+    /// part of the DAG, and its `duration` is the time spent, not the DAG's.
+    pub stats: ExecStats,
+    /// Nodes that reported a completed [`NodeStats`]. The *only* evidence that
+    /// a relation is whole -- never infer completion from anything else.
+    pub completed: HashSet<String>,
+    /// Nodes that were still in flight when the run stopped. An aborted node
+    /// may have left a partial relation, or none, so these must be dropped
+    /// before anything reads them.
+    pub dirty: HashSet<String>,
+    /// `None` when every node was built.
+    pub stopped: Option<StopReason>,
+}
+
 #[async_trait]
 pub trait Executor<C>
 where
@@ -65,6 +124,12 @@ where
 
     fn new(conn: Arc<C>) -> Result<Self::ExecutionEngine, ExecutorError>;
     async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError>;
+    /// Execute `dag` under `opts`, reporting what finished even when the run
+    /// stopped early.
+    ///
+    /// [`run`](Self::run) is this with the defaults and a stop reported as
+    /// [`ExecutorError::Cancelled`].
+    async fn run_with(&self, dag: &Dag, opts: RunOptions) -> Result<RunOutcome, ExecutorError>;
     async fn cleanup(&self, dag: &Dag) -> Result<usize, ExecutorError>;
     fn cancel_sender(&self) -> Arc<watch::Sender<bool>>;
 
@@ -231,15 +296,31 @@ where
     }
 
     async fn run(&self, dag: &Dag) -> Result<ExecStats, ExecutorError> {
+        let outcome = self.run_with(dag, RunOptions::default()).await?;
+        match outcome.stopped {
+            Some(_) => Err(ExecutorError::Cancelled),
+            None => Ok(outcome.stats),
+        }
+    }
+
+    async fn run_with(&self, dag: &Dag, opts: RunOptions) -> Result<RunOutcome, ExecutorError> {
         let mut work_graph = dag.nodes.clone();
+        // A skipped node's relation already exists, so it is treated exactly as
+        // if it had just finished: `remove` strips the edge from every dependent,
+        // which is what makes them runnable.
+        for id in &opts.skip {
+            work_graph.remove(id.clone());
+        }
         let mut work_queue: JoinSet<Result<(usize, String, NodeStats), ExecutorError>> =
             JoinSet::new();
         let initial_size = work_graph.num_nodes();
         let mut finished = 0;
         let mut in_progress = HashSet::new();
+        let mut completed: HashSet<String> = HashSet::new();
 
         let node_stats = HashMap::new();
         let start = Utc::now();
+        let deadline = opts.budget.map(|b| tokio::time::Instant::now() + b);
         let (sampler_stop, sampler_handle) = if let Some(profiling) = self.profiling.clone() {
             let (stop, handle) = spawn_sampler(Arc::clone(&self.conn), profiling, start).await;
             (Some(stop), Some(handle))
@@ -254,22 +335,13 @@ where
             .unwrap_or(false);
 
         let mut node_stats = node_stats;
+        let mut stopped: Option<StopReason> = None;
+
         while work_graph.num_nodes() > 0 {
             if *self.cancel_rx.borrow() {
                 debug!("SimpleEngine: cancellation requested, stopping execution");
-                // Abort all queued tasks and wait for them to finish before
-                // cleaning up.  Simply dropping a JoinHandle detaches the task
-                // rather than cancelling it, so in-flight CREATE TABLE/VIEW
-                // statements would race against the cleanup that follows.
-                // abort_all() + drain guarantees no tasks are still modifying
-                // the database when cleanup runs.
-                work_queue.abort_all();
-                while work_queue.join_next().await.is_some() {}
-                if let Some(ref stop) = sampler_stop {
-                    let _ = stop.send(true);
-                }
-                self.cleanup(dag).await?;
-                return Err(ExecutorError::Cancelled);
+                stopped = Some(StopReason::Cancelled);
+                break;
             }
 
             // Every node whose dependencies are met, capped by the DAG's
@@ -359,20 +431,48 @@ where
                 });
             }
             // wait for one node to finish, then loop back to queue any newly-runnable nodes
-            if let Some(item) = work_queue.join_next().await {
+            let joined = match deadline {
+                // The deadline lives here rather than on the shared cancel
+                // channel on purpose: a budget stop and a user's cancel lead to
+                // different places, and one channel could not tell them apart.
+                Some(at) => tokio::select! {
+                    biased;
+                    item = work_queue.join_next() => item,
+                    _ = tokio::time::sleep_until(at) => {
+                        debug!("SimpleEngine: budget exhausted, stopping execution");
+                        stopped = Some(StopReason::Budget);
+                        break;
+                    }
+                },
+                None => work_queue.join_next().await,
+            };
+            if let Some(item) = joined {
                 let (_, node_id, stats) =
                     item.map_err(|j| ExecutorError::Exec(format!("join error - {}", j)))??;
                 debug!("recv result for nidx={:?}", node_id);
                 in_progress.remove(&node_id);
                 work_graph.remove(node_id.clone());
                 node_stats.insert(node_id.clone(), stats);
+                completed.insert(node_id.clone());
                 finished += 1;
                 debug!("finished {}/{} nodes", finished, initial_size);
             }
         }
         debug!("work_queue cleared");
-        let finish = Utc::now();
 
+        // Abort all queued tasks and wait for them to finish. Simply dropping a
+        // JoinHandle detaches the task rather than cancelling it, so in-flight
+        // CREATE TABLE/VIEW statements would race whatever runs next --
+        // a cleanup, or the resume that reuses what this run built.
+        let dirty = if stopped.is_some() {
+            work_queue.abort_all();
+            while work_queue.join_next().await.is_some() {}
+            in_progress.clone()
+        } else {
+            HashSet::new()
+        };
+
+        let finish = Utc::now();
         let system_samples = if let (Some(stop), Some(handle)) = (sampler_stop, sampler_handle) {
             let _ = stop.send(true);
             handle
@@ -382,14 +482,24 @@ where
             Vec::new()
         };
 
-        let exec_stats = ExecStats {
-            start,
-            finish,
-            duration: finish - start,
-            node_stats,
-            system_samples,
-        };
-        Ok(exec_stats)
+        if stopped.is_some() && opts.cleanup_on_cancel {
+            self.cleanup(dag).await?;
+        }
+
+        Ok(RunOutcome {
+            stats: ExecStats {
+                start,
+                finish,
+                duration: finish - start,
+                node_stats,
+                system_samples,
+            },
+            // A skipped node's relation exists and is whole -- that is why it
+            // was skipped -- so it counts as completed by this run's reckoning.
+            completed: completed.union(&opts.skip).cloned().collect(),
+            dirty,
+            stopped,
+        })
     }
 
     async fn cleanup(&self, dag: &Dag) -> Result<usize, ExecutorError> {
@@ -750,6 +860,149 @@ mod tests {
     async fn test_a_cap_wider_than_the_dag_does_not_hold_anything_back() {
         let stats = run_wide(3, Some(16)).await;
         assert!(peak_overlap(&stats) > 1);
+    }
+
+    async fn engine() -> SimpleEngine<DuckDBConnection> {
+        let conn = DuckDBConnection::new(DuckDBConfig::new_from_path(":memory:".to_string()))
+            .await
+            .expect("in-memory duckdb");
+        SimpleEngine::new(conn).expect("engine")
+    }
+
+    /// a -> b -> c, each a trivial table.
+    fn chain_dag() -> Dag {
+        let mut map = HashMap::new();
+        let mut add = |id: &str, sql: &str, deps: &[&str]| {
+            map.insert(
+                id.to_string(),
+                TransformNode {
+                    id: id.to_string(),
+                    query_text: sql.to_string(),
+                    materialize: MaterializeMode::Table,
+                    depends_on: deps.iter().map(|s| s.to_string()).collect(),
+                    schema: None,
+                },
+            );
+        };
+        add("a", "SELECT 1 AS x", &[]);
+        add("b", "SELECT x + 1 AS x FROM a", &["a"]);
+        add("c", "SELECT x + 1 AS x FROM b", &["b"]);
+        Dag {
+            db: "duckdb".to_string(),
+            nodes: Graph::new(map),
+            sources: Vec::new(),
+            max_parallelism: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_a_skipped_node_is_not_rebuilt_but_its_dependents_still_run() {
+        // This is the whole mechanism a resume rests on: `a` already exists, so
+        // the run must build `b` and `c` against it rather than starting over.
+        let engine = engine().await;
+        let dag = chain_dag();
+        engine
+            .conn
+            .new_relation(MaterializeMode::Table, "a".into(), "SELECT 1 AS x".into())
+            .await
+            .expect("seed the skipped relation");
+
+        let outcome = engine
+            .run_with(
+                &dag,
+                RunOptions {
+                    skip: HashSet::from(["a".to_string()]),
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .expect("run");
+
+        assert_eq!(outcome.stopped, None);
+        assert!(
+            !outcome.stats.node_stats.contains_key("a"),
+            "the skipped node was rebuilt"
+        );
+        assert!(outcome.stats.node_stats.contains_key("b"));
+        assert!(outcome.stats.node_stats.contains_key("c"));
+        // A skipped relation is whole, so the caller sees a complete DAG.
+        assert_eq!(
+            outcome.completed,
+            HashSet::from(["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_a_budget_stop_reports_what_finished_and_drops_nothing() {
+        // The point of the whole feature: a cancelled trial's relations survive
+        // for the resume to reuse. If cleanup ran here there would be nothing
+        // to resume from and the search would cost the user a full rebuild.
+        let engine = engine().await;
+        let dag = wide_dag(8, Some(1));
+        let outcome = engine
+            .run_with(
+                &dag,
+                RunOptions {
+                    budget: Some(Duration::from_millis(120)),
+                    cleanup_on_cancel: false,
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .expect("run");
+
+        assert_eq!(outcome.stopped, Some(StopReason::Budget));
+        assert!(
+            outcome.completed.len() < 8,
+            "the budget did not actually cut the run short"
+        );
+        for id in &outcome.completed {
+            // `get_schema` answers `Some(Err(..))` for a relation that is not
+            // there, so presence has to be checked on the Ok, not the Option.
+            assert!(
+                engine
+                    .conn
+                    .get_schema(id.clone())
+                    .await
+                    .is_some_and(|schema| schema.is_ok()),
+                "{id} finished but its relation was dropped"
+            );
+        }
+        // Only a reported NodeStats counts as completed.
+        assert_eq!(
+            outcome.completed,
+            outcome.stats.node_stats.keys().cloned().collect()
+        );
+        assert!(outcome.completed.is_disjoint(&outcome.dirty));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_run_still_cleans_up_and_reports_cancelled() {
+        // Every existing caller goes through `run`, and its contract has not
+        // moved: a stop is an error and leaves the warehouse clean.
+        let engine = engine().await;
+        let dag = wide_dag(8, Some(1));
+        let cancel = engine.cancel_sender();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let _ = cancel.send(true);
+        });
+        let err = engine.run(&dag).await.expect_err("cancelled");
+        handle.await.unwrap();
+        assert!(matches!(err, ExecutorError::Cancelled));
+        for i in 0..8 {
+            // A dropped relation reports either "no such relation" or an error
+            // from the lookup itself, depending on the backend; both mean gone.
+            let gone = engine
+                .conn
+                .get_schema(format!("n{i}"))
+                .await
+                .is_none_or(|schema| schema.is_err());
+            assert!(
+                gone,
+                "n{i} survived a cancellation that should have cleaned up"
+            );
+        }
     }
 
     #[test]

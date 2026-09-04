@@ -108,6 +108,14 @@ pub struct RunRow {
     pub peak_engine_mem_bytes: Option<i64>,
     pub db_size_bytes: Option<i64>,
     pub plan_time_basis: Option<String>,
+    /// How this run's tables reached the warehouse: `direct`, or `resumed`
+    /// after a cancelled candidate. **Only a `direct` run's `duration_ms` is
+    /// comparable to another run's** -- see [`Delivery`].
+    pub delivery: Option<String>,
+    /// What the cancelled candidate had spent when it was stopped, and what the
+    /// resume that finished the run took. Both `None` on a direct delivery.
+    pub trial_elapsed_ms: Option<i64>,
+    pub resume_elapsed_ms: Option<i64>,
     pub error: Option<String>,
 }
 
@@ -496,7 +504,8 @@ async fn cancel_pending(store: &Store, what: CancelPending) -> Result<usize, Sto
 const RUN_SELECT: &str = "SELECT r.run_id, r.run_group_id, r.dag_id, d.name, r.dag_version,
         r.target, r.phase, r.rep_index, r.status, r.queued_at, r.started_at, r.finished_at,
         r.duration_ms, r.node_time_ms, r.node_count, r.rows_produced, r.cleanup_ms,
-        r.peak_engine_mem_bytes, r.db_size_bytes, r.plan_time_basis, r.error
+        r.peak_engine_mem_bytes, r.db_size_bytes, r.plan_time_basis,
+        r.delivery, r.trial_elapsed_ms, r.resume_elapsed_ms, r.error
     FROM runs r JOIN dags d USING (dag_id)";
 
 fn run_from(row: &duckdb::Row<'_>) -> duckdb::Result<RunRow> {
@@ -521,7 +530,10 @@ fn run_from(row: &duckdb::Row<'_>) -> duckdb::Result<RunRow> {
         peak_engine_mem_bytes: row.get(17)?,
         db_size_bytes: row.get(18)?,
         plan_time_basis: row.get(19)?,
-        error: row.get(20)?,
+        delivery: row.get(20)?,
+        trial_elapsed_ms: row.get(21)?,
+        resume_elapsed_ms: row.get(22)?,
+        error: row.get(23)?,
     })
 }
 
@@ -747,6 +759,63 @@ pub async fn mark_run_terminal(
         .await
 }
 
+/// How a run's tables reached the warehouse.
+///
+/// A run whose candidate was cancelled mid-way and finished under the search's
+/// incumbent still delivered every relation the consumer asked for, so it
+/// succeeded. Its wall time, though, measures neither DAG: the second half
+/// started from a warm, half-built warehouse. Recording that here is what lets
+/// every comparison filter on it, rather than each caller having to reconstruct
+/// from the event log whether a run is comparable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    kind: &'static str,
+    trial_ms: Option<i64>,
+    resume_ms: Option<i64>,
+}
+
+impl Delivery {
+    /// One execution of one DAG. The only kind whose elapsed time means
+    /// anything.
+    pub fn direct() -> Self {
+        Self {
+            kind: delivery::DIRECT,
+            trial_ms: None,
+            resume_ms: None,
+        }
+    }
+
+    /// A cancelled candidate followed by a resume under the incumbent.
+    pub fn resumed(trial_ms: i64, resume_ms: i64) -> Self {
+        Self {
+            kind: delivery::RESUMED,
+            trial_ms: Some(trial_ms),
+            resume_ms: Some(resume_ms),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.kind
+    }
+
+    /// Whether this run's elapsed time may be compared with another's.
+    pub fn is_measurement(&self) -> bool {
+        self.kind == delivery::DIRECT
+    }
+}
+
+/// The values `runs.delivery` takes.
+pub mod delivery {
+    /// The run executed one DAG start to finish.
+    pub const DIRECT: &str = "direct";
+    /// A candidate was cancelled at its budget and the run finished under the
+    /// incumbent. Never a measurement -- see [`super::Delivery`].
+    pub const RESUMED: &str = "resumed";
+
+    /// The SQL predicate every runtime comparison must carry.
+    pub const COMPARABLE: &str = "delivery = 'direct'";
+}
+
 /// Everything one successful execution observed, written as one transaction.
 ///
 /// A partially recorded run would be worse than a missing one: it would look
@@ -754,6 +823,7 @@ pub async fn mark_run_terminal(
 pub async fn record_success(
     store: &Store,
     run_id: String,
+    delivery: Delivery,
     stats: ExecStats,
     materializations: Vec<(String, String)>,
     plan_format: String,
@@ -803,7 +873,8 @@ pub async fn record_success(
                     "UPDATE runs
                      SET status = ?, started_at = ?, finished_at = ?, duration_ms = ?,
                          node_time_ms = ?, node_count = ?, rows_produced = ?, cleanup_ms = ?,
-                         peak_engine_mem_bytes = ?, db_size_bytes = ?, plan_time_basis = ?
+                         peak_engine_mem_bytes = ?, db_size_bytes = ?, plan_time_basis = ?,
+                         delivery = ?, trial_elapsed_ms = ?, resume_elapsed_ms = ?
                      WHERE run_id = ?",
                     duckdb::params![
                         status::SUCCEEDED,
@@ -817,6 +888,9 @@ pub async fn record_success(
                         peak_memory,
                         peak_disk,
                         plan_time_basis,
+                        delivery.as_str(),
+                        delivery.trial_ms,
+                        delivery.resume_ms,
                         run_id
                     ],
                 )?;
@@ -1382,6 +1456,7 @@ mod tests {
         record_success(
             &store,
             run_id.clone(),
+            Delivery::direct(),
             exec_stats(42, Some(1000)),
             vec![("a".into(), "table".into())],
             "duckdb_json".into(),
@@ -1425,6 +1500,7 @@ mod tests {
         record_success(
             &store,
             run_id.clone(),
+            Delivery::direct(),
             exec_stats(10, None),
             vec![("a".into(), "view".into())],
             "postgres_json".into(),
@@ -1439,6 +1515,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_resumed_run_is_recorded_as_not_comparable() {
+        // The run delivered its tables, so it succeeded -- but its wall time
+        // covers a cancelled candidate plus a warm-start resume and measures
+        // neither DAG. Anything that compares runtimes has to be able to see
+        // that from the row alone.
+        let (store, dag_id) = seeded().await;
+        let created = create_group(&store, request(&dag_id, 0, 1), "i".into())
+            .await
+            .unwrap();
+        record_success(
+            &store,
+            created.run_ids[0].clone(),
+            Delivery::resumed(1250, 400),
+            exec_stats(5, Some(1)),
+            vec![],
+            "duckdb_json".into(),
+            "cpu_time".into(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let run = get_run(&store, created.run_ids[0].clone())
+            .await
+            .unwrap()
+            .expect("the run was recorded");
+        assert_eq!(run.status, status::SUCCEEDED);
+        assert_eq!(run.delivery.as_deref(), Some(delivery::RESUMED));
+        assert_eq!(run.trial_elapsed_ms, Some(1250));
+        assert_eq!(run.resume_elapsed_ms, Some(400));
+        assert!(!Delivery::resumed(1250, 400).is_measurement());
+
+        // And the predicate every comparison carries actually excludes it.
+        let comparable: i64 = store
+            .read(move |c| {
+                Ok(c.query_row(
+                    &format!("SELECT count(*) FROM runs WHERE {}", delivery::COMPARABLE),
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(comparable, 0);
+    }
+
+    #[tokio::test]
+    async fn test_an_ordinary_run_stays_comparable() {
+        let (store, dag_id) = seeded().await;
+        let created = create_group(&store, request(&dag_id, 0, 1), "i".into())
+            .await
+            .unwrap();
+        record_success(
+            &store,
+            created.run_ids[0].clone(),
+            Delivery::direct(),
+            exec_stats(5, Some(1)),
+            vec![],
+            "duckdb_json".into(),
+            "cpu_time".into(),
+            0,
+        )
+        .await
+        .unwrap();
+        let run = get_run(&store, created.run_ids[0].clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.delivery.as_deref(), Some(delivery::DIRECT));
+        assert_eq!(run.trial_elapsed_ms, None);
+        assert!(Delivery::direct().is_measurement());
+    }
+
+    #[tokio::test]
     async fn test_a_group_succeeds_only_if_every_run_did() {
         let (store, dag_id) = seeded().await;
         let created = create_group(&store, request(&dag_id, 0, 2), "i".into())
@@ -1448,6 +1598,7 @@ mod tests {
         record_success(
             &store,
             created.run_ids[0].clone(),
+            Delivery::direct(),
             exec_stats(5, Some(1)),
             vec![],
             "duckdb_json".into(),

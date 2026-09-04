@@ -24,7 +24,7 @@ dee_opt:
   hmp_strategy: breadth
 
 backends:
-  duckdb: {threads: 16, num_connections: 16}
+  duckdb: {threads: 16}
 
 execution:
   repetitions: 5

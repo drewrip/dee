@@ -3,7 +3,7 @@ use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     marker::PhantomData,
     sync::Arc,
@@ -16,9 +16,11 @@ use crate::{
     plan::OpKey,
     opt::{
         Dag, Optimization, OptimizerError, OptimizerConfig,
-        common::make_temp,
+        common::{dialect_for_db, make_temp},
+        leafset::{PlanArena, ViewRegionRequest, attribute_chain, has_top_level_group_by},
         explain::{render_bar_row, render_card_grid, render_ranked_table},
         pushdown::PushdownPass,
+        resume::node_signature,
         report::{HmpDetail, IterationStat, PassDetail, PassOutcome},
         step::{
             OptimizationType, RegisterContext, StepContext, StepOutcome, StepPhase,
@@ -39,6 +41,54 @@ pub enum HMPStrategy {
     /// Walk the node ranking sequentially, committing each materialization
     /// that improves performance before trying the next node down the ranking.
     Greedy,
+}
+
+/// How HMP turns a run's plans into a per-View cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+// snake_case rather than lowercase: `NodeTime` has to encode as `node_time`,
+// the same spelling the CLI and the benchmark config use for it.
+#[serde(rename_all = "snake_case")]
+pub enum HmpCostMethod {
+    /// Leaf-set matching under DAG-order containment: a View is attributed the
+    /// region of a consumer's plan whose scanned base relations are still
+    /// contained in the View's own. See [`crate::opt::leafset`].
+    #[default]
+    Leafset,
+    /// Match operators between plans by `(name, estimated cardinality)`. The
+    /// original method: cheaper, but that key is the entire notion of operator
+    /// identity across two plans, so an estimate that shifts by one row between
+    /// the View's EXPLAIN and the consumer's EXPLAIN ANALYZE fails to match at
+    /// all, and every View whose plan happens to contain the key is charged the
+    /// operator's full cost.
+    Signature,
+    /// Rank Views by their own measured node time. Also the automatic fallback
+    /// when a run carried no plans at all.
+    NodeTime,
+}
+
+impl HmpCostMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HmpCostMethod::Leafset => "leafset",
+            HmpCostMethod::Signature => "signature",
+            HmpCostMethod::NodeTime => "node_time",
+        }
+    }
+}
+
+impl std::str::FromStr for HmpCostMethod {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "leafset" => Ok(HmpCostMethod::Leafset),
+            "signature" => Ok(HmpCostMethod::Signature),
+            "node_time" | "nodetime" => Ok(HmpCostMethod::NodeTime),
+            other => Err(format!(
+                "unknown hmp cost method '{other}'; expected leafset, signature or node_time"
+            )),
+        }
+    }
 }
 
 /// Where HMP is in its search, as persisted between steps.
@@ -169,6 +219,15 @@ where
     normalize_with_cardinality: bool,
     /// Strategy for searching through the node ranking.
     strategy: HMPStrategy,
+    /// How a View's cost is read off the run's plans.
+    cost_method: HmpCostMethod,
+    /// Cancel a trial once it has overrun the incumbent and finish the run
+    /// under the incumbent instead, rather than measuring every candidate to
+    /// completion.
+    resume_trials: bool,
+    /// Fraction by which a trial may overrun the incumbent before it is cut
+    /// short. Only meaningful when `resume_trials` is set.
+    budget_eps: f64,
     /// Run the PushdownPass before evaluating each candidate materialization
     /// combination, for more accurate cost measurements.
     use_pushdown: bool,
@@ -242,6 +301,16 @@ struct NodeRankingRow {
     /// `--hmp-normalize-with-cardinality` is set) `total_cpu_time_s` divided
     /// by `cardinality`.
     ranking_score: f64,
+    /// Leaf-set matching only: the base relations this View reads, and the
+    /// consumer plan operators its region was matched to.
+    ///
+    /// Empty under the other costing methods, which have no notion of either.
+    /// They are the only way to tell a good attribution from a lucky one, which
+    /// is why they reach the explain report rather than staying in a log line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    leaves: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    matched: Vec<String>,
 }
 
 impl<C, E> HMPPass<C, E>
@@ -259,9 +328,12 @@ where
         show_nodes: Option<String>,
         normalize_with_cardinality: bool,
         strategy: HMPStrategy,
+        cost_method: HmpCostMethod,
         use_pushdown: bool,
         beam_width: usize,
         profile_iterations: bool,
+        resume_trials: bool,
+        budget_eps: f64,
     ) -> Self {
         Self {
             conn,
@@ -272,9 +344,16 @@ where
             show_nodes,
             normalize_with_cardinality,
             strategy,
+            cost_method,
             use_pushdown,
             beam_width: beam_width.max(1),
             profile_iterations,
+            resume_trials,
+            budget_eps: if budget_eps > 0.0 {
+                budget_eps
+            } else {
+                crate::opt::common::DEFAULT_BUDGET_EPS
+            },
             top_cpu_time: if top_cpu_time > 0.0 && top_cpu_time <= 1.0 {
                 top_cpu_time
             } else {
@@ -558,6 +637,8 @@ where
                 total_cpu_time_s,
                 cardinality,
                 ranking_score,
+                leaves: Vec::new(),
+                matched: Vec::new(),
             })
             .collect()
     }
@@ -622,26 +703,31 @@ where
     }
 }
 
+/// The most of one consumer's measured time a single inlined View may be
+/// charged. A consumer that does work of its own always keeps some.
+const MAX_SHARE: f64 = 0.95;
+
+/// The middle observation of `values`, or `None` if there are none.
+fn median(values: &[u64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    Some(if sorted.len().is_multiple_of(2) {
+        (sorted[mid - 1] as f64 + sorted[mid] as f64) / 2.0
+    } else {
+        sorted[mid] as f64
+    })
+}
+
 /// Canonical string signature of a DAG's structure. Used to detect when two
 /// different materialization combinations produce an equivalent DAG (e.g.
 /// after `make_temp`'s landing-pad insertion / view inlining), so we can
 /// avoid re-running a trial we've effectively already tried.
 fn dag_signature(dag: &Dag) -> String {
-    let mut node_sigs: Vec<String> = dag
-        .nodes
-        .nodes()
-        .map(|n| {
-            let mut deps: Vec<&str> = n.depends_on.iter().map(String::as_str).collect();
-            deps.sort_unstable();
-            format!(
-                "{}::{}::{}::[{}]",
-                n.id,
-                n.materialize.as_str(),
-                n.query_text,
-                deps.join(",")
-            )
-        })
-        .collect();
+    let mut node_sigs: Vec<String> = dag.nodes.nodes().map(node_signature).collect();
     node_sigs.sort_unstable();
     node_sigs.join("|")
 }
@@ -704,9 +790,12 @@ where
             config.hmp_show_nodes.clone(),
             config.hmp_normalize_with_cardinality,
             config.hmp_strategy,
+            config.hmp_cost_method,
             config.hmp_use_pushdown,
             config.hmp_beam_width,
             config.profile_iterations,
+            config.trial_resume,
+            config.trial_budget_eps,
         )
     }
 
@@ -762,8 +851,205 @@ where
         Ok(())
     }
 
+    /// Rank candidate Views by leaf-set matching against every persisted
+    /// consumer's EXPLAIN ANALYZE plan.
+    ///
+    /// Everything is denominated in the seconds a consumer's node actually
+    /// took. Plan times are used only as *ratios within one plan*, to split a
+    /// consumer's measured time among the Views inlined into it -- which is
+    /// what keeps this indifferent to DuckDB reporting CPU time and Postgres
+    /// wall time.
+    ///
+    /// Returns `None` when no plan in the run named a single relation. That is
+    /// not "this DAG has no duplication", it is "this method cannot see" -- a
+    /// plan format that does not carry relation names, or a run recorded before
+    /// they were collected -- and the caller falls back rather than reporting a
+    /// ranking of nothing.
+    fn ranking_leafset(&self, dag: &Dag, stats: &ExecStats) -> Option<Vec<NodeRankingRow>> {
+        let dialect = dialect_for_db(&dag.db);
+        let source_names: Vec<String> = dag.sources.iter().map(|s| s.name.clone()).collect();
+        let heights = dag.nodes.heights();
+
+        // Leaf sets and the GROUP BY hint, computed once per View rather than
+        // once per consumer.
+        let views: Vec<&crate::dag::TransformNode> = dag
+            .nodes
+            .nodes()
+            .filter(|n| n.materialize == MaterializeMode::View)
+            .collect();
+        let leaf_sets: HashMap<String, std::collections::BTreeSet<String>> = views
+            .iter()
+            .map(|n| (n.id.clone(), dag.nodes.leaf_sources(&n.id, &source_names)))
+            .collect();
+        let collapses: HashMap<String, bool> = views
+            .iter()
+            .map(|n| (n.id.clone(), has_top_level_group_by(&n.query_text, dialect)))
+            .collect();
+        // Which Views depend on each View. Only the already-placed ones
+        // constrain a search, but the relation itself is a property of the DAG.
+        let view_consumers: HashMap<String, HashSet<String>> = views
+            .iter()
+            .map(|n| {
+                let consumers = dag
+                    .nodes
+                    .reachable(&n.id, |c| c.materialize == MaterializeMode::View)
+                    .into_iter()
+                    .collect();
+                (n.id.clone(), consumers)
+            })
+            .collect();
+
+        let mut saw_a_relation = false;
+        // share[view][consumer] x the consumer's measured seconds.
+        let mut attributed: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut widths: HashMap<String, Vec<u64>> = HashMap::new();
+        let mut matched: HashMap<String, Vec<String>> = HashMap::new();
+
+        for consumer in dag.nodes.nodes() {
+            if !matches!(
+                consumer.materialize,
+                MaterializeMode::Table | MaterializeMode::TempTable
+            ) {
+                continue;
+            }
+            let Some(node_stat) = stats.node_stats.get(&consumer.id) else {
+                continue;
+            };
+            let Some(plan_str) = &node_stat.plan else {
+                continue;
+            };
+            let Some(plans) = self.conn.parse_plan(plan_str) else {
+                continue;
+            };
+            let arena = PlanArena::build(&plans);
+            saw_a_relation |= arena.nodes.iter().any(|n| !n.leaves.is_empty());
+            let total = arena.total_time();
+            if total <= 0.0 {
+                continue;
+            }
+            let measured_s = node_stat.duration.num_milliseconds() as f64 / 1000.0;
+
+            // The Views inlined into this consumer, consumer-most first: a View
+            // can only be placed inside the region of a View that depends on it.
+            let mut inlined: Vec<&crate::dag::TransformNode> = views
+                .iter()
+                .copied()
+                .filter(|v| dag.nodes.frontier_materializes(&v.id).contains(&consumer.id))
+                .collect();
+            inlined.sort_by_key(|v| (heights.get(&v.id).copied().unwrap_or(0), v.id.clone()));
+
+            let requests: Vec<ViewRegionRequest> = inlined
+                .iter()
+                .map(|v| ViewRegionRequest {
+                    id: v.id.clone(),
+                    leaves: leaf_sets.get(&v.id).cloned().unwrap_or_default(),
+                    consumers: view_consumers.get(&v.id).cloned().unwrap_or_default(),
+                    prefers_aggregate: collapses.get(&v.id).copied().unwrap_or(false),
+                })
+                .collect();
+
+            for (view, attribution) in attribute_chain(&arena, &requests) {
+                // Capped: a View is never charged the whole of a consumer that
+                // also does work of its own, and an uncapped share turns one bad
+                // match into a candidate that dominates the ranking.
+                let share = (attribution.secs / total).min(MAX_SHARE);
+                attributed
+                    .entry(view.clone())
+                    .or_default()
+                    .push(share * measured_s);
+                matched.entry(view.clone()).or_default().push(format!(
+                    "{} in {} ({:.0}%)",
+                    arena.nodes[attribution.node].operator,
+                    consumer.id,
+                    share * 100.0
+                ));
+                if let Some(rows) = attribution.cardinality {
+                    widths.entry(view).or_default().push(rows);
+                }
+            }
+        }
+
+        if !saw_a_relation {
+            return None;
+        }
+
+        let mut rows: Vec<NodeRankingRow> = attributed
+            .into_iter()
+            // Only a branch point can have its work deduplicated by being built
+            // once, which is the same gate the other methods apply.
+            .filter(|(view, _)| {
+                dag.nodes.out_degree(view) > 1 && dag.nodes.paths_to_sinks(view) > 1
+            })
+            .map(|(view, mut per_consumer)| {
+                per_consumer.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let sum: f64 = per_consumer.iter().sum();
+                // The largest attribution, because each consumer runs a
+                // possibly-differently-optimized copy and the largest is the one
+                // least likely to have had work pushed out of it.
+                let compute_secs = per_consumer.last().copied().unwrap_or(0.0);
+                // What would simply vanish if the View were built once -- the
+                // quantity the whole hypothesis is about.
+                let duplicated_secs = sum - compute_secs;
+
+                let total_cpu_time_s = if self.downstream_cost {
+                    duplicated_secs
+                } else {
+                    compute_secs
+                };
+                // The median rather than the extreme: one View matches
+                // differently in different consumers, because the optimizer
+                // fuses adjacent Views differently depending on what else is in
+                // the query, and a single bad match should not set the View's
+                // estimated width.
+                let cardinality = widths.get(&view).and_then(|w| median(w));
+                let ranking_score = match (self.normalize_with_cardinality, cardinality) {
+                    (true, Some(c)) if c > 0.0 => total_cpu_time_s / c,
+                    _ => total_cpu_time_s,
+                };
+                let mut regions = matched.remove(&view).unwrap_or_default();
+                regions.sort();
+                NodeRankingRow {
+                    rank: 0,
+                    leaves: leaf_sets
+                        .get(&view)
+                        .map(|l| l.iter().cloned().collect())
+                        .unwrap_or_default(),
+                    matched: regions,
+                    node: view,
+                    total_cpu_time_s,
+                    cardinality,
+                    ranking_score,
+                }
+            })
+            .filter(|r| r.ranking_score > 0.0)
+            .collect();
+
+        rows.sort_by(|a, b| {
+            b.ranking_score
+                .partial_cmp(&a.ranking_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.node.cmp(&b.node))
+        });
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.rank = i + 1;
+        }
+        Some(rows)
+    }
+
     /// The ranking a run's plans imply, as `(node, score)`.
     fn ranking_for(&self, dag: &Dag, stats: &ExecStats) -> Vec<NodeRankingRow> {
+        if self.cost_method == HmpCostMethod::NodeTime {
+            return Self::ranking_from_node_times(dag, stats);
+        }
+        if self.cost_method == HmpCostMethod::Leafset {
+            match self.ranking_leafset(dag, stats) {
+                Some(rows) => return rows,
+                None => warn!(
+                    "HMPPass: no plan in this run named a relation, so leaf-set matching \
+                     has nothing to match against; falling back to signature matching"
+                ),
+            }
+        }
         let aggregate = if self.downstream_cost {
             Self::aggregate_downstream_cost(self.conn.as_ref(), dag, stats)
         } else {
@@ -802,6 +1088,8 @@ where
                     total_cpu_time_s: seconds,
                     cardinality: None,
                     ranking_score: seconds,
+                    leaves: Vec::new(),
+                    matched: Vec::new(),
                 })
             })
             .collect();
@@ -1002,6 +1290,41 @@ where
         });
     }
 
+    /// The wall-clock cap this search's next trial runs under.
+    ///
+    /// `None` until something has been measured -- there is no incumbent to be
+    /// worse than -- and `None` when resuming is off, because a budget without
+    /// a resume behind it would cancel the user's pipeline and leave the tables
+    /// unbuilt. Where it does apply, a candidate can never cost more than
+    /// `1 + eps` times the best combination found so far.
+    fn budget(&self, state: &HmpState) -> Option<i64> {
+        if !self.resume_trials || state.best_ms == i64::MAX || state.best_ms <= 0 {
+            return None;
+        }
+        Some(((state.best_ms as f64) * (1.0 + self.budget_eps)).round() as i64)
+    }
+
+    /// This search's incumbent as a DAG: the authored definition with the best
+    /// combination measured so far materialized in it.
+    ///
+    /// An empty `best_combo` is not "no incumbent" -- it is the incumbent, the
+    /// DAG as authored, which is what every candidate is being compared
+    /// against. Returning `None` there would leave the *first* trials, the ones
+    /// most likely to be bad guesses, running to completion.
+    ///
+    /// `None` only before a baseline has been measured, when there is genuinely
+    /// nothing to be worse than.
+    async fn incumbent_dag(&self, dag: &Dag, state: &HmpState) -> Option<Box<Dag>> {
+        if state.best_ms == i64::MAX {
+            return None;
+        }
+        let mut fallback = dag.clone();
+        if !state.best_combo.is_empty() {
+            self.build_trial(&mut fallback, &state.best_combo).await.ok()?;
+        }
+        Some(Box::new(fallback))
+    }
+
     /// Decide and apply what this run should try.
     async fn step_before(
         &mut self,
@@ -1024,13 +1347,12 @@ where
                     // failed or was cancelled. Re-propose it rather than
                     // scoring it from a run that never happened.
                     let combo = state.in_flight.as_ref().unwrap().combo.clone();
+                    let fallback = self.incumbent_dag(ctx.dag, &state).await;
                     self.build_trial(ctx.dag, &combo).await?;
                     return Ok(StepOutcome::Trial {
                         label: describe(&combo),
-                        // HMP bounds itself by `max_runs`, not by wall time,
-                        // and it needs every candidate's real runtime to
-                        // compare them, so it never asks for a cutoff.
-                        budget_ms: None,
+                        budget_ms: self.budget(&state),
+                        fallback,
                         record: Box::new(self.outcome_from(&state)),
                     });
                 }
@@ -1054,6 +1376,7 @@ where
                     let mut trial = ctx.dag.clone();
                     self.build_trial(&mut trial, &combo).await?;
                     let sig = dag_signature(&trial);
+                    let fallback = self.incumbent_dag(ctx.dag, &state).await;
 
                     if let Some(&measured) = state.tried_combos.get(&sig) {
                         // Already measured under another combo: score this
@@ -1079,10 +1402,8 @@ where
                     *ctx.dag = trial;
                     return Ok(StepOutcome::Trial {
                         label: describe(&combo),
-                        // HMP bounds itself by `max_runs`, not by wall time,
-                        // and it needs every candidate's real runtime to
-                        // compare them, so it never asks for a cutoff.
-                        budget_ms: None,
+                        budget_ms: self.budget(&state),
+                        fallback,
                         record: Box::new(self.outcome_from(&state)),
                     });
                 }
@@ -1144,15 +1465,24 @@ where
         let Some(run) = ctx.run.clone() else {
             return Ok(StepOutcome::Idle);
         };
-        let Some(stats) = run.stats.as_ref() else {
-            return Ok(StepOutcome::Idle);
-        };
         // A warmup is deliberately not a measurement: its whole purpose is to
         // absorb cold-cache cost that the numbers this search compares must
         // not contain.
         if !run.is_measured() {
             return Ok(StepOutcome::Idle);
         }
+        // No stats on a measured run means the execution produced no usable
+        // time -- it was cancelled at its budget, or it failed. Either way it is
+        // a censored observation, and a censored observation is enough to
+        // reject: what it says is "at least as slow as the cap", and the cap is
+        // already worse than the best combination found so far.
+        //
+        // This must clear `in_flight`. Leaving it set would make the next
+        // `Before` step re-propose the very candidate that was just cancelled,
+        // and the search would spend its whole run budget on one bad combo.
+        let Some(stats) = run.stats.as_ref() else {
+            return self.reject_censored(ctx, state, &run.run_id).await;
+        };
 
         let runtime_ms = stats.duration.num_milliseconds();
 
@@ -1260,6 +1590,54 @@ where
             improved,
         )
         .await?;
+        self.save_state(ctx.store, ctx.dag_id, &state).await?;
+        self.remember_explain(&state);
+        Ok(StepOutcome::Idle)
+    }
+
+    /// File a trial that produced no usable measurement and move the search on.
+    async fn reject_censored(
+        &mut self,
+        ctx: &mut StepContext<'_, C, E>,
+        mut state: HmpState,
+        run_id: &str,
+    ) -> Result<StepOutcome, OptimizerError> {
+        let Some(in_flight) = state.in_flight.take() else {
+            // Nothing was proposed, so nothing was censored. A run this search
+            // did not cause failing is not its business.
+            return Ok(StepOutcome::Idle);
+        };
+        if state.phase == "baseline" {
+            // The baseline is the DAG as it stands and is not a candidate; a
+            // search that recorded a censored baseline would compare every
+            // later trial against a number no run produced.
+            return Ok(StepOutcome::Idle);
+        }
+
+        state.runs_used += 1;
+        // A lower bound, not a measurement: at least the budget. Recording it
+        // as the candidate's runtime keeps the beam and the de-duplication from
+        // ever preferring it, without claiming to know how bad it was.
+        let censored_ms = self.budget(&state).unwrap_or(i64::MAX);
+        debug!(
+            "combo {:?} produced no usable measurement; rejecting as censored (>= {censored_ms}ms)",
+            in_flight.combo
+        );
+        state.iterations.push(IterationStat {
+            iteration: state.iterations.len() + 1,
+            runtime_ms: censored_ms,
+            combo: in_flight.combo.clone(),
+            outcome: Some("cancelled".to_string()),
+            system_samples: Vec::new(),
+        });
+        state.tried_combos.insert(in_flight.sig, censored_ms);
+        state.proposals.push(BeamState {
+            combo: in_flight.combo,
+            runtime_ms: censored_ms,
+        });
+
+        self.record_trial(ctx.store, ctx.dag_id, run_id, &state, censored_ms, false)
+            .await?;
         self.save_state(ctx.store, ctx.dag_id, &state).await?;
         self.remember_explain(&state);
         Ok(StepOutcome::Idle)
@@ -1497,6 +1875,16 @@ where
                     } else {
                         "no".to_string()
                     },
+                    if r.leaves.is_empty() {
+                        "-".to_string()
+                    } else {
+                        r.leaves.join(", ")
+                    },
+                    if r.matched.is_empty() {
+                        "-".to_string()
+                    } else {
+                        r.matched.join("; ")
+                    },
                 ]
             })
             .collect();
@@ -1508,6 +1896,11 @@ where
                 "Cardinality",
                 "Ranking score",
                 "In working set",
+                // Empty under signature matching, which has no notion of
+                // either -- these are what make a leaf-set attribution
+                // checkable rather than merely reported.
+                "Reads",
+                "Matched region",
             ],
             &node_rows,
         );
@@ -1679,10 +2072,158 @@ mod tests {
             None,
             false,
             HMPStrategy::Breadth,
+            // The existing tests fabricate operator-signature plans, which is
+            // what this method reads.
+            HmpCostMethod::Signature,
             false,
             beam_width,
             false,
+            true,
+            crate::opt::common::DEFAULT_BUDGET_EPS,
         )
+    }
+
+    /// A DuckDB profiling plan for a consumer that joins `raw_a` and `raw_b`
+    /// and then groups the result.
+    fn grouped_join_plan() -> String {
+        let scan = |table: &str, t: f64| {
+            format!(
+                r#"{{"operator_name":"SEQ_SCAN","operator_timing":{t},
+                     "operator_cardinality":1000,
+                     "extra_info":{{"Table":"{table}","Estimated Cardinality":1000}},
+                     "children":[]}}"#
+            )
+        };
+        format!(
+            r#"{{"operator_name":"HASH_GROUP_BY","operator_timing":1.0,
+                 "operator_cardinality":10,
+                 "extra_info":{{"Estimated Cardinality":10}},
+                 "children":[
+                   {{"operator_name":"HASH_JOIN","operator_timing":6.0,
+                     "operator_cardinality":1000,
+                     "extra_info":{{"Estimated Cardinality":1000}},
+                     "children":[{}, {}]}}]}}"#,
+            scan("raw_a", 1.0),
+            scan("raw_b", 2.0)
+        )
+    }
+
+    fn leafset_dag() -> Dag {
+        //   raw_a, raw_b (declared sources)
+        //        |
+        //     joined (View, branch point: two Table consumers)
+        //      /        \
+        //   out_a(T)   out_b(T)
+        let mut dag = make_dag(vec![
+            node(
+                "joined",
+                "SELECT k, v FROM raw_a JOIN raw_b USING (k)",
+                MaterializeMode::View,
+                &[],
+            ),
+            node(
+                "out_a",
+                "SELECT k, count(*) FROM joined GROUP BY k",
+                MaterializeMode::Table,
+                &["joined"],
+            ),
+            node(
+                "out_b",
+                "SELECT k, count(*) FROM joined GROUP BY k",
+                MaterializeMode::Table,
+                &["joined"],
+            ),
+        ]);
+        dag.sources = ["raw_a", "raw_b"]
+            .iter()
+            .map(|name| crate::dag::SourceNode {
+                name: name.to_string(),
+                schema: std::sync::Arc::new(duckdb::arrow::datatypes::Schema::empty()),
+            })
+            .collect();
+        dag
+    }
+
+    fn leafset_stats(consumer_ms: i64) -> ExecStats {
+        let now = Utc::now();
+        let mut consumer = node_stats(Some(grouped_join_plan()));
+        consumer.duration = chrono::TimeDelta::milliseconds(consumer_ms);
+        let mut node_stats_map = HashMap::new();
+        node_stats_map.insert("out_a".to_string(), consumer.clone());
+        node_stats_map.insert("out_b".to_string(), consumer);
+        node_stats_map.insert("joined".to_string(), node_stats(None));
+        ExecStats {
+            start: now,
+            finish: now,
+            duration: chrono::TimeDelta::milliseconds(consumer_ms * 2),
+            node_stats: node_stats_map,
+            system_samples: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn leafset_charges_a_view_the_region_of_the_plan_it_owns() {
+        let mut pass = test_pass(2).await;
+        pass.cost_method = HmpCostMethod::Leafset;
+        let dag = leafset_dag();
+
+        let rows = pass
+            .ranking_leafset(&dag, &leafset_stats(1000))
+            .expect("the plans name relations");
+        assert_eq!(rows.len(), 1, "only the branch-point View is a candidate");
+        assert_eq!(rows[0].node, "joined");
+
+        // The view reads both relations but does not group, so its region is
+        // the join and its two scans -- 9s of the plan's 10s -- and the
+        // consumer measured 1s. `compute_secs` is the largest of the two
+        // identical consumers.
+        assert!(
+            (rows[0].total_cpu_time_s - 0.9).abs() < 1e-6,
+            "expected a 0.9 share of one consumer, got {}",
+            rows[0].total_cpu_time_s
+        );
+        // The join emitted 1000 rows; the GROUP BY above it emitted 10. Landing
+        // on the aggregate would report the view 100x too narrow, which is what
+        // makes a too-large intermediate look safe to persist.
+        assert_eq!(rows[0].cardinality, Some(1000.0));
+    }
+
+    #[tokio::test]
+    async fn leafset_downstream_cost_reports_only_what_deduplication_removes() {
+        let mut pass = test_pass(2).await;
+        pass.cost_method = HmpCostMethod::Leafset;
+        pass.downstream_cost = true;
+        let rows = pass
+            .ranking_leafset(&leafset_dag(), &leafset_stats(1000))
+            .expect("the plans name relations");
+        // Two consumers each pay 0.9s; building the view once removes one of
+        // them, not both.
+        assert!(
+            (rows[0].total_cpu_time_s - 0.9).abs() < 1e-6,
+            "got {}",
+            rows[0].total_cpu_time_s
+        );
+    }
+
+    #[tokio::test]
+    async fn leafset_declines_rather_than_ranking_nothing_when_plans_name_no_relation() {
+        // A plan format that does not carry relation names must fall back, not
+        // report that the DAG has no duplication.
+        let mut pass = test_pass(2).await;
+        pass.cost_method = HmpCostMethod::Leafset;
+        let dag = leafset_dag();
+        let mut stats = leafset_stats(1000);
+        let bare = Some(
+            r#"{"operator_name":"HASH_JOIN","operator_timing":1.0,
+                "extra_info":{"Estimated Cardinality":10},"children":[]}"#
+                .to_string(),
+        );
+        for id in ["out_a", "out_b"] {
+            stats.node_stats.get_mut(id).unwrap().plan = bare.clone();
+        }
+        assert!(pass.ranking_leafset(&dag, &stats).is_none());
+        // And `ranking_for` takes the fallback rather than returning nothing.
+        let _ = pass.ranking_for(&dag, &stats);
     }
 
     // "shelf" is a materialized Table whose EXPLAIN plan roots two operators:
@@ -1848,6 +2389,131 @@ mod tests {
             hmp.dag_runs_used
         );
         assert!(hmp.dag_runs_used >= 1, "the baseline alone is one run");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_trial_is_rejected_rather_than_re_proposed() {
+        // The failure this guards against: a candidate cancelled at its budget
+        // leaves `in_flight` set, the next `Before` step re-installs the very
+        // same combo, and the search spends its whole run budget on one bad
+        // candidate -- forever, if the candidate is reliably slow.
+        let store = MemoryStore::open("hmp").unwrap();
+        let mut pass = test_pass(2).await;
+        let conn = Arc::clone(&pass.conn);
+        let engine = Arc::clone(&pass.engine);
+
+        pass.register(&RegisterContext {
+            store: &store,
+            dag_id: "dag-1",
+            dag_name: "pipeline",
+        })
+        .await
+        .unwrap();
+
+        let mut state = pass.load_state(&store, "dag-1").await.unwrap().unwrap();
+        state.phase = "searching".to_string();
+        state.best_ms = 1000;
+        state.best_combo = vec!["kept".to_string()];
+        state.working_set = vec!["a".to_string(), "b".to_string()];
+        state.working_order = state.working_set.clone();
+        state.in_flight = Some(InFlight {
+            combo: vec!["a".to_string()],
+            sig: "sig-a".to_string(),
+        });
+        pass.save_state(&store, "dag-1", &state).await.unwrap();
+
+        let mut dag = make_dag(vec![node("x", "SELECT 1", MaterializeMode::Table, &[])]);
+        let mut ctx = StepContext {
+            store: &store,
+            conn,
+            engine,
+            dag: &mut dag,
+            dag_id: "dag-1",
+            dag_name: "pipeline",
+            dag_version: 1,
+            side: StepPhase::After,
+            run: Some(crate::opt::RunContext {
+                run_id: "r1".into(),
+                run_group_id: "g1".into(),
+                run_phase: crate::opt::run_phase::MEASURE.into(),
+                rep_index: 0,
+                // A measured run with no stats: cancelled at its budget.
+                stats: None,
+            }),
+        };
+        let outcome = pass.step(&mut ctx).await.unwrap();
+        assert!(matches!(outcome, StepOutcome::Idle));
+
+        let after = pass.load_state(&store, "dag-1").await.unwrap().unwrap();
+        assert!(
+            after.in_flight.is_none(),
+            "the cancelled candidate is still in flight and will be re-proposed"
+        );
+        assert_eq!(after.runs_used, 1, "the cancelled run still cost a run");
+        // Recorded as a lower bound -- at least the budget -- and never as a
+        // new best.
+        assert_eq!(after.best_ms, 1000);
+        assert_eq!(after.best_combo, vec!["kept".to_string()]);
+        assert_eq!(
+            after.tried_combos.get("sig-a").copied(),
+            Some(1250),
+            "the censored observation must be filed at the budget, not discarded"
+        );
+        assert_eq!(
+            after.iterations.last().unwrap().outcome.as_deref(),
+            Some("cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_baseline_is_not_recorded_as_one() {
+        // The baseline is the DAG as it stands, not a candidate. Recording a
+        // censored baseline would give every later trial a number no run
+        // produced to beat.
+        let store = MemoryStore::open("hmp").unwrap();
+        let mut pass = test_pass(2).await;
+        let conn = Arc::clone(&pass.conn);
+        let engine = Arc::clone(&pass.engine);
+        pass.register(&RegisterContext {
+            store: &store,
+            dag_id: "dag-1",
+            dag_name: "pipeline",
+        })
+        .await
+        .unwrap();
+
+        let mut dag = make_dag(vec![node("x", "SELECT 1", MaterializeMode::Table, &[])]);
+        let mut ctx = StepContext {
+            store: &store,
+            conn,
+            engine,
+            dag: &mut dag,
+            dag_id: "dag-1",
+            dag_name: "pipeline",
+            dag_version: 1,
+            side: StepPhase::After,
+            run: Some(crate::opt::RunContext {
+                run_id: "r1".into(),
+                run_group_id: "g1".into(),
+                run_phase: crate::opt::run_phase::MEASURE.into(),
+                rep_index: 0,
+                stats: None,
+            }),
+        };
+        pass.step(&mut ctx).await.unwrap();
+        let after = pass.load_state(&store, "dag-1").await.unwrap().unwrap();
+        assert_eq!(after.phase, "baseline");
+        assert_eq!(after.baseline_ms, 0);
+        assert_eq!(after.runs_used, 0);
+    }
+
+    #[tokio::test]
+    async fn a_budget_only_exists_once_there_is_something_to_be_worse_than() {
+        let pass = test_pass(2).await;
+        let mut state = HmpState::new();
+        assert_eq!(pass.budget(&state), None, "nothing has been measured yet");
+        state.best_ms = 1000;
+        assert_eq!(pass.budget(&state), Some(1250));
     }
 
     // A continuous optimization's whole premise is that its search survives

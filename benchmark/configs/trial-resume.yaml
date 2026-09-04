@@ -1,0 +1,64 @@
+# What does cancelling a losing candidate cost, and what does it save?
+#
+# A continuous search piggybacks on real runs, so a bad candidate is charged to
+# the pipeline. With `trial_resume` on, a candidate that overruns the best
+# configuration found so far is cancelled and the run is finished under that
+# configuration, rebuilding only what the cancelled candidate never got to.
+#
+# Two things to read out of this matrix:
+#
+#  * **Worst-case overrun.** The longest single run relative to the incumbent,
+#    with the cap against without. Filter `delivery = 'direct'` for runtimes
+#    and read `trial_elapsed_ms + resume_elapsed_ms` for what a cancelled run
+#    actually cost -- a resumed run's `engine_wall_ms` measures neither DAG.
+#  * **Whether the censored observations cost the search anything.** An
+#    uncensored measurement is more informative, so the same configuration may
+#    take more rounds to reach; the trade is bounded exposure, not speed.
+#
+#   dee-bench run -c configs/trial-resume.yaml
+name: trial-resume
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/trial-resume
+verbosity: detailed
+
+matrix:
+  project: [p01_iot, p03_ecommerce, p05_hr, p07_saas]
+  backend: [duckdb, postgres]
+  sf: [1]
+  variant: [unopt, resume, run_to_completion]
+
+variants:
+  unopt: {passes: []}
+  resume: {passes: [hmp], trial_resume: true}
+  # The control: today's behaviour, every candidate measured to the end.
+  run_to_completion: {passes: [hmp], trial_resume: false}
+
+dee_opt:
+  hmp_max_runs: 8
+  hmp_strategy: breadth
+  hmp_top_cpu_time: 0.8
+  hmp_use_pushdown: false
+  trial_budget_eps: 0.25
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+  postgres:
+    provider: container
+    image: postgres:18
+    port: 55433
+    cpus: 8
+    memory: 8g
+    num_connections: 16
+    settings:
+      shared_buffers: 2GB
+      work_mem: 256MB
+      max_parallel_workers: 8
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

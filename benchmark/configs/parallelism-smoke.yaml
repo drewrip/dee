@@ -1,0 +1,37 @@
+# A small study of ParallelismTuning alone: does capping how many nodes run at
+# once beat dee's uncapped default on DuckDB, and how many runs does finding
+# the cap take to repay?
+#
+#   dee-bench run -c configs/parallelism-smoke.yaml
+name: parallelism-smoke
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/parallelism-smoke
+verbosity: detailed
+
+matrix:
+  project: [p01_iot, p03_ecommerce, p05_hr, p07_saas]
+  backend: [duckdb]
+  sf: [1]
+  variant: [unopt, parallelism]
+
+variants:
+  unopt:       {passes: []}
+  parallelism: {passes: [parallelism]}
+
+dee_opt:
+  # Wrapped: one ladder of four rungs, not a sweep of four ladders.
+  parallelism_ladder: [[1, 2, 4, 8]]
+  parallelism_seed_repeats: 2
+  parallelism_confirm_runs: 1
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

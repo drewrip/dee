@@ -23,7 +23,6 @@ dee_opt:
 backends:
   duckdb:
     threads: 8
-    num_connections: 16
 
 execution:
   repetitions: 3

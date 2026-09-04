@@ -103,6 +103,21 @@ pub trait Connector {
         crate::plan::TimeBasis::CpuTime
     }
 
+    /// How much parallelism the engine as a whole can bring to bear, in
+    /// cores or worker slots.
+    ///
+    /// The denominator for "does one node leave capacity another node could
+    /// use". It is the engine's budget rather than the machine's core count
+    /// because the two differ, and it is the *global* budget rather than the
+    /// per-query one because that is what a second concurrent node competes
+    /// for: DuckDB shares one thread pool across every query, so a second node
+    /// gets no threads of its own, while Postgres hands each backend its own
+    /// workers up to a server-wide ceiling. `None` where the engine will not
+    /// say, and the caller falls back to the machine.
+    async fn parallelism_budget(&self) -> Result<Option<usize>, ConnectorError> {
+        Ok(None)
+    }
+
     async fn sample_system_cpu_usage(&self) -> Result<Option<f64>, ConnectorError> {
         Ok(None)
     }

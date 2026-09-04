@@ -1,10 +1,12 @@
 pub mod common;
 pub mod explain;
 pub mod hmp;
+pub mod leafset;
 pub mod omp;
 pub mod parallelism;
 pub mod pushdown;
 pub mod registry;
+pub mod resume;
 pub mod report;
 pub mod step;
 pub mod store;
@@ -21,9 +23,19 @@ use thiserror::Error;
 use crate::{
     connectors::Connector,
     dag::Dag,
-    executor::Executor,
-    opt::{hmp::HMPStrategy, omp::OMPCentrality},
+    executor::{Executor, ExecutorError, RunOptions, StopReason},
+    opt::{
+        hmp::{HMPStrategy, HmpCostMethod},
+        omp::OMPCentrality,
+    },
 };
+
+/// How much longer than the cancelled trial's own budget a resume may take.
+///
+/// A resume is a delivery, not an experiment, so it must not be cut short
+/// again -- but it is still bounded, so a pathological engine state cannot hang
+/// the caller indefinitely.
+const RESUME_BUDGET_MULTIPLE: u32 = 3;
 
 pub use crate::opt::explain::render_explain_html;
 pub use crate::opt::report::{
@@ -381,11 +393,24 @@ where
             return Ok(record);
         }
 
+        // How many iterations in a row did nothing on either side, and whether
+        // any iteration at all produced something other than `Idle`.
+        //
+        // `Idle` is the right answer for a continuous pass that is not changing
+        // the DAG right now but could later, and under the server's driver it
+        // costs nothing -- the run was happening anyway. Batch mode is the
+        // opposite: the loop is the only source of runs, so an idle iteration
+        // is an execution charged to the search that bought nothing.
+        let mut consecutive_idle = 0usize;
+        let mut idle_warned = false;
+        let mut ever_active = false;
+
         // A continuous search with no measurements yet needs a first run to
         // form an opinion, so the loop always executes -- an `Idle` before-step
         // means "run what we have", not "there is nothing to do".
         for iteration in 0..self.max_batch_iterations {
             working = dag.clone();
+            let mut idle_this_iteration = true;
 
             let mut before = None;
             if phase.includes(StepPhase::Before) {
@@ -411,6 +436,7 @@ where
                     record.dag_runs_used = dag_runs_used;
                     return Ok(record);
                 }
+                idle_this_iteration &= matches!(outcome, StepOutcome::Idle);
                 before = Some(outcome);
             }
 
@@ -430,22 +456,89 @@ where
                 debug!("cleanup of the candidate at iteration {iteration}: {e}");
             }
 
-            let stats = match self.engine.run(&working).await {
-                Ok(stats) => stats,
-                Err(e) => return Err(OptimizerError::Exec(e.to_string())),
+            // What the pass asked for: a cap on how far this candidate may
+            // overrun, and the DAG to finish the run under if it does.
+            let (budget_ms, fallback) = match &before {
+                Some(StepOutcome::Trial {
+                    budget_ms,
+                    fallback,
+                    ..
+                }) => (*budget_ms, fallback.clone()),
+                _ => (None, None),
             };
+            let budget = self
+                .config
+                .trial_resume
+                .then_some(budget_ms)
+                .flatten()
+                .filter(|ms| *ms > 0)
+                .map(|ms| std::time::Duration::from_millis(ms as u64));
+
+            let outcome = self
+                .engine
+                .run_with(
+                    &working,
+                    RunOptions {
+                        budget,
+                        // Whatever the trial built is what the resume reuses.
+                        cleanup_on_cancel: budget.is_none(),
+                        ..RunOptions::default()
+                    },
+                )
+                .await
+                .map_err(|e| OptimizerError::Exec(e.to_string()))?;
             dag_runs_used += 1;
             last_run = Some(working.clone());
+
+            let stats = match outcome.stopped {
+                None => Some(outcome.stats),
+                Some(StopReason::Cancelled) => return Err(OptimizerError::Exec(
+                    ExecutorError::Cancelled.to_string(),
+                )),
+                Some(StopReason::Budget) => {
+                    // The candidate is rejected on the strength of having
+                    // overrun; the `After` step is told so by being handed no
+                    // stats. Nothing here is a measurement of the incumbent
+                    // either -- the resume starts from a half-built warehouse.
+                    let incumbent = fallback.as_deref().unwrap_or(dag);
+                    debug!(
+                        "'{}': the candidate at iteration {iteration} overran its budget; \
+                         finishing under the incumbent",
+                        optimization.name()
+                    );
+                    let plan = resume::plan(&working, incumbent, &outcome.completed);
+                    resume::drop_relations(self.conn.as_ref(), &plan.to_drop).await;
+                    self.engine
+                        .run_with(
+                            incumbent,
+                            RunOptions {
+                                skip: plan.reusable,
+                                // A delivery must not be cut short again, but a
+                                // pathological engine state must not hang the
+                                // caller either.
+                                budget: budget.map(|b| b * RESUME_BUDGET_MULTIPLE),
+                                cleanup_on_cancel: false,
+                            },
+                        )
+                        .await
+                        .map_err(|e| OptimizerError::Exec(e.to_string()))?;
+                    last_run = Some(incumbent.clone());
+                    None
+                }
+            };
 
             let label = match &before {
                 Some(StepOutcome::Trial { label, .. }) => label.clone(),
                 _ => format!("iteration {iteration}"),
             };
-            debug!(
-                "{}: {label} ran in {}ms",
-                optimization.name(),
-                stats.duration.num_milliseconds()
-            );
+            match &stats {
+                Some(stats) => debug!(
+                    "{}: {label} ran in {}ms",
+                    optimization.name(),
+                    stats.duration.num_milliseconds()
+                ),
+                None => debug!("{}: {label} was cancelled at its budget", optimization.name()),
+            }
 
             if phase.includes(StepPhase::After) {
                 let mut ctx = StepContext {
@@ -462,10 +555,11 @@ where
                         run_group_id: format!("batch-{dag_id}"),
                         run_phase: run_phase::MEASURE.to_string(),
                         rep_index: iteration as i32,
-                        stats: Some(stats),
+                        stats,
                     }),
                 };
                 let outcome = optimization.step(&mut ctx).await?;
+                idle_this_iteration &= matches!(outcome, StepOutcome::Idle);
                 if let Some(r) = outcome.record() {
                     record = r.clone();
                 }
@@ -477,6 +571,38 @@ where
                     return Ok(record);
                 }
             }
+
+            if idle_this_iteration {
+                consecutive_idle += 1;
+                if consecutive_idle >= IDLE_WARN_AFTER && !idle_warned {
+                    idle_warned = true;
+                    warn!(
+                        "'{}' has neither tried a candidate nor learned anything for {} \
+                         consecutive runs. Its search is not advancing, and in batch mode \
+                         nothing else will make it: every further iteration is a DAG run spent \
+                         for nothing, up to {}. The usual cause is a search that already \
+                         converged under the server's driver -- its state says so and is \
+                         preserved across registrations. Deregister it, or let the continuous \
+                         driver step it around runs the DAG was going to perform anyway.",
+                        optimization.name(),
+                        consecutive_idle,
+                        self.max_batch_iterations
+                    );
+                }
+            } else {
+                consecutive_idle = 0;
+                ever_active = true;
+            }
+        }
+
+        if !ever_active {
+            warn!(
+                "'{}' did nothing at all across {} run(s): it never installed a candidate and \
+                 never reported on one. Those runs measured the DAG as it stands and changed \
+                 nothing.",
+                optimization.name(),
+                dag_runs_used
+            );
         }
 
         warn!(
@@ -502,7 +628,25 @@ fn pass_label(name: &str) -> &'static str {
 }
 
 /// See [`Optimizer::max_batch_iterations`].
+///
+/// Not a generous safety margin: OMP enumerates 2^N mode assignments over every
+/// branch-point candidate ([`OMPPass::plans`](crate::opt::omp)), and `omp_top`
+/// defaults to unbounded, so nine candidates need exactly this many runs and
+/// ten are already truncated here. Lowering it would silently cut off
+/// legitimate searches rather than only pathological ones.
 const DEFAULT_MAX_BATCH_ITERATIONS: usize = 512;
+
+/// Consecutive iterations that neither install a candidate nor learn anything
+/// before the batch driver says so.
+///
+/// One idle iteration is normal -- a search with no measurements returns `Idle`
+/// from its `Before` step by design, and a pass collecting seed measurements
+/// does the same for as many runs as it was configured to seed. A long run of
+/// them is not: batch mode is the only source of runs here, so a pass that
+/// stopped advancing will not start again, and every further iteration is a DAG
+/// execution bought for nothing. Set well above any pass's seeding phase so the
+/// warning cannot fire on a healthy search.
+const IDLE_WARN_AFTER: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -520,6 +664,11 @@ pub struct OptimizerConfig {
     pub hmp_show_nodes: Option<String>,
     pub hmp_normalize_with_cardinality: bool,
     pub hmp_strategy: HMPStrategy,
+    /// HMP: how a View's cost is read off a run's plans. `leafset` attributes a
+    /// View to the region of a consumer's plan whose scanned base relations are
+    /// still contained in the View's own; `signature` is the older method that
+    /// matches operators between plans by name and estimated cardinality.
+    pub hmp_cost_method: HmpCostMethod,
     pub hmp_use_pushdown: bool,
     /// HMP: number of hypotheses the `Greedy` strategy's beam search keeps
     /// alive at each step. Unused by the `Breadth` strategy.
@@ -570,8 +719,32 @@ pub struct OptimizerConfig {
     /// opposite. The probe measures which of those is true here instead of
     /// assuming either.
     pub parallelism_adaptive_order: bool,
+    /// ParallelismTuning: how many rungs may fail in a row before the ladder
+    /// stops, leaving the rest unmeasured. Zero measures every rung.
+    ///
+    /// Searching in the direction the probe chose, a run of failures means the
+    /// useful setting is behind rather than ahead. Replayed over every curve
+    /// dag-bench produced this cut the rungs measured by a third for a worst
+    /// case of 2.6% off the best setting -- but only searching the right way,
+    /// since the same replay in the wrong direction gave up as much as 105%.
+    /// It leans on [`Self::parallelism_adaptive_order`] for that reason.
+    pub parallelism_stop_after_failures: usize,
     /// Collect an `Explain` HTML section from each pass during `run()`.
     pub explain: bool,
+    /// Cancel a trial once it has overrun the best configuration found so far,
+    /// then finish the run under that configuration -- rebuilding only what the
+    /// cancelled trial never got to.
+    ///
+    /// This is what keeps a bad candidate from costing the pipeline its full
+    /// regression. The censored observation ("at least this bad") is all the
+    /// acceptance tests need to reject it, and the consumer still gets its
+    /// tables. Turning it off measures every candidate to completion, which is
+    /// what dee did before and what a study of trial overrun wants as its
+    /// control.
+    pub trial_resume: bool,
+    /// Fraction by which a trial may overrun the incumbent before
+    /// [`Self::trial_resume`] cuts it short.
+    pub trial_budget_eps: f64,
 }
 
 impl Default for OptimizerConfig {
@@ -590,6 +763,7 @@ impl Default for OptimizerConfig {
             hmp_show_nodes: None,
             hmp_normalize_with_cardinality: false,
             hmp_strategy: HMPStrategy::default(),
+            hmp_cost_method: HmpCostMethod::default(),
             hmp_use_pushdown: true,
             hmp_beam_width: 2,
             profile_iterations: false,
@@ -605,7 +779,10 @@ impl Default for OptimizerConfig {
             parallelism_paired: true,
             parallelism_cpu_guard: 0.10,
             parallelism_adaptive_order: true,
+            parallelism_stop_after_failures: 2,
             explain: false,
+            trial_resume: true,
+            trial_budget_eps: crate::opt::common::DEFAULT_BUDGET_EPS,
         }
     }
 }
@@ -754,6 +931,11 @@ impl OptimizerConfig {
         self
     }
 
+    pub fn with_hmp_cost_method(mut self, method: HmpCostMethod) -> Self {
+        self.hmp_cost_method = method;
+        self
+    }
+
     pub fn with_hmp_strategy(mut self, strategy: HMPStrategy) -> Self {
         self.hmp_strategy = strategy;
         self
@@ -831,6 +1013,13 @@ impl OptimizerConfig {
         self
     }
 
+    /// Rungs that may fail in a row before the ladder gives up. Zero measures
+    /// the whole ladder.
+    pub fn with_parallelism_stop_after_failures(mut self, failures: usize) -> Self {
+        self.parallelism_stop_after_failures = failures;
+        self
+    }
+
     pub fn with_parallelism_confirm_runs(mut self, runs: usize) -> Self {
         self.parallelism_confirm_runs = runs.max(1);
         self
@@ -845,6 +1034,160 @@ impl OptimizerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // The batch driver's idle accounting.
+    //
+    // `Idle` is the correct answer for a continuous pass that is not changing
+    // the DAG right now but could later, and the server's driver charges
+    // nothing for it -- the run was happening anyway. These tests are about the
+    // batch driver, where the loop is the only source of runs, so they pin the
+    // one thing that differs: that a search which stops advancing is *named*,
+    // and that a healthy one is never accused of it.
+    // ---------------------------------------------------------------------
+
+    /// An optimization that answers `Idle` for `idle_prefix` iterations and
+    /// then converges. `idle_prefix = usize::MAX` never converges, which is a
+    /// pass whose search has already finished under another driver.
+    struct Stub {
+        idle_prefix: usize,
+        after_steps: usize,
+        phase: StepPhase,
+    }
+
+    #[async_trait::async_trait]
+    impl<C, E> Optimization<C, E> for Stub
+    where
+        C: Connector + Send + Sync + 'static,
+        E: Executor<C> + Send + Sync + 'static,
+    {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        fn optimization_type(&self) -> OptimizationType {
+            OptimizationType::Continuous
+        }
+
+        fn step_phase(&self) -> StepPhase {
+            self.phase
+        }
+
+        fn set_step_phase(&mut self, phase: StepPhase) {
+            self.phase = phase;
+        }
+
+        // Keeps no state: everything this stub decides it decides from its
+        // own step count.
+        async fn register(
+            &self,
+            _ctx: &RegisterContext<'_>,
+        ) -> Result<Option<Registration>, OptimizerError> {
+            Ok(None)
+        }
+
+        async fn deregister(
+            &self,
+            _ctx: &RegisterContext<'_>,
+        ) -> Result<Option<Registration>, OptimizerError> {
+            Ok(None)
+        }
+
+        async fn step(
+            &mut self,
+            ctx: &mut StepContext<'_, C, E>,
+        ) -> Result<StepOutcome, OptimizerError> {
+            if ctx.side != StepPhase::After {
+                return Ok(StepOutcome::Idle);
+            }
+            self.after_steps += 1;
+            if self.after_steps > self.idle_prefix {
+                return Ok(StepOutcome::Done {
+                    record: Box::new(PassOutcome::empty()),
+                });
+            }
+            Ok(StepOutcome::Idle)
+        }
+    }
+
+    async fn drive(idle_prefix: usize, max_iterations: usize) -> (u32, usize) {
+        use crate::connectors::duckdb::{DuckDBConfig, DuckDBConnection};
+        use crate::executor::SimpleEngine;
+        use crate::graph::Graph;
+        use crate::opt::store::MemoryStore;
+        use std::collections::HashMap;
+
+        let conn = DuckDBConnection::new(DuckDBConfig::new_from_path(":memory:".to_string()))
+            .await
+            .expect("in-memory duckdb");
+        let engine = Arc::new(SimpleEngine::new(Arc::clone(&conn)).expect("engine"));
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "a".to_string(),
+            crate::dag::TransformNode {
+                id: "a".to_string(),
+                query_text: "SELECT 1 AS x".to_string(),
+                materialize: crate::dag::MaterializeMode::Table,
+                depends_on: Default::default(),
+                schema: None,
+            },
+        );
+        let mut dag = Dag {
+            db: "duckdb".to_string(),
+            nodes: Graph::new(nodes),
+            sources: Vec::new(),
+            max_parallelism: None,
+        };
+
+        let optimizer = Optimizer::new_with_config(conn, engine, OptimizerConfig::default())
+            .with_max_batch_iterations(max_iterations);
+        let store = MemoryStore::open("stub").unwrap();
+        let mut stub = Stub {
+            idle_prefix,
+            after_steps: 0,
+            phase: StepPhase::Both,
+        };
+        let record = optimizer
+            .converge(&mut stub, &store, &mut dag, "dag-1", "d", 1, )
+            .await
+            .expect("converge");
+        (record.dag_runs_used, stub.after_steps)
+    }
+
+    #[tokio::test]
+    async fn test_a_pass_that_never_advances_spends_every_iteration() {
+        // The behaviour the warning describes, pinned so the warning cannot
+        // quietly stop being true: `Idle` is not terminal, so the batch loop
+        // buys a DAG run per iteration until the cap. Deliberately *not*
+        // changed to break early -- a pass may legitimately have nothing to say
+        // for a while -- but the run count is what the warning is about.
+        let (runs, _) = drive(usize::MAX, 5).await;
+        assert_eq!(runs, 5, "an always-idle pass should reach the cap");
+        assert!(
+            5 < IDLE_WARN_AFTER,
+            "this test must stay below the warning threshold so the other one \
+             is what exercises it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_warning_threshold_is_above_any_seeding_phase() {
+        // A search that returns `Idle` while it collects seed measurements --
+        // ParallelismTuning does exactly this, for `parallelism_seed_repeats`
+        // runs -- must never be accused of having stopped. The threshold is the
+        // whole guarantee, so it is asserted against the largest seeding phase
+        // a default config can ask for rather than left implicit.
+        let defaults = OptimizerConfig::default();
+        assert!(
+            IDLE_WARN_AFTER > defaults.parallelism_seed_repeats + defaults.parallelism_confirm_runs,
+            "the warning could fire on a healthy parallelism search"
+        );
+        // And a pass that goes idle for a while and then converges still
+        // converges, rather than being cut off.
+        let (runs, steps) = drive(3, 50).await;
+        assert_eq!(runs, 4, "three idle runs then the one that converged");
+        assert_eq!(steps, 4);
+    }
 
     #[test]
     fn test_parallelism_runs_after_the_materialization_passes_when_asked() {
@@ -933,5 +1276,33 @@ mod tests {
         // depending on how it was supplied.
         assert_eq!(serde_json::to_string(&HMPStrategy::Breadth).unwrap(), "\"breadth\"");
         assert_eq!(serde_json::to_string(&OMPCentrality::OutDegree).unwrap(), "\"outdegree\"");
+        // `node_time` is two words in the CLI and one key in JSON; the parser
+        // has to accept the CLI's spelling too.
+        assert_eq!(
+            serde_json::to_string(&HmpCostMethod::NodeTime).unwrap(),
+            "\"node_time\""
+        );
+        for method in [
+            HmpCostMethod::Leafset,
+            HmpCostMethod::Signature,
+            HmpCostMethod::NodeTime,
+        ] {
+            assert_eq!(method.as_str().parse::<HmpCostMethod>().unwrap(), method);
+            assert_eq!(
+                serde_json::to_value(method).unwrap(),
+                serde_json::json!(method.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn test_leaf_set_matching_is_the_default_costing_method() {
+        // A DAG submitted without an opinion gets the method that reads a
+        // View's cost from the plan region it owns, not the older
+        // operator-signature match.
+        assert_eq!(
+            OptimizerConfig::default().hmp_cost_method,
+            HmpCostMethod::Leafset
+        );
     }
 }

@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use dee::dag::Dag;
-use dee::executor::{Executor, ExecutorError, ProfilingConfig, SimpleEngine};
+use dee::executor::{Executor, ExecutorError, ProfilingConfig, RunOptions, SimpleEngine, StopReason};
+use dee::opt::resume;
 use tokio::sync::watch;
 
 use dee::opt::{RunContext, StepPhase};
@@ -20,6 +21,12 @@ use crate::exec::connectors::ConnectorHandle;
 use crate::exec::stepper;
 use crate::state::AppState;
 use crate::store::repo::{connections, dags, runs};
+
+/// How much longer than the cancelled candidate's own budget the resume that
+/// finishes the run may take. It is a delivery, not an experiment, so it must
+/// not be cut short again -- but it stays bounded so a pathological engine
+/// state cannot hang the group.
+const RESUME_BUDGET_MULTIPLE: u32 = 3;
 
 /// Run every repetition in `group_id`, recording each.
 ///
@@ -195,7 +202,7 @@ where
         // copy of the stored definition rather than carrying the last one's
         // rewrite forward.
         let mut working = base.clone();
-        let before = stepper::step_all(
+        let mut before = stepper::step_all(
             &mut steppers,
             Arc::clone(&conn),
             Arc::clone(&bare_engine),
@@ -213,16 +220,48 @@ where
             }),
         )
         .await;
-        for (name, label) in &before.trials {
+        for trial in &before.trials {
             runs::log_event(
                 &state.store,
                 Some(run.run_id.clone()),
                 Some(group.run_group_id.clone()),
                 Some(group.dag_id.clone()),
                 "info",
-                format!("{name} is trying {label} on this run"),
+                format!("{} is trying {} on this run", trial.name, trial.label),
             )
             .await?;
+        }
+        // At most one candidate can be budgeted per run: two searches cancelling
+        // the same execution would each attribute the stop to their own
+        // candidate, and only one of them would be right. The first trial that
+        // offers both a budget and an incumbent wins; anything else runs to
+        // completion, which is what happened before this existed.
+        //
+        // Taken out of the report rather than borrowed from it: the report is
+        // consumed by `apply` just below, and this has to outlive the run.
+        let budgeted = before
+            .trials
+            .iter()
+            .position(|t| t.budget_ms.is_some_and(|ms| ms > 0) && t.fallback.is_some())
+            .map(|i| before.trials.remove(i));
+        let budget = budgeted.as_ref().map(|t| {
+            std::time::Duration::from_millis(t.budget_ms.expect("filtered above") as u64)
+        });
+        if let (Some(trial), Some(budget)) = (budgeted.as_ref(), budget) {
+            log::debug!(
+                "{}'s candidate {} runs under a {}ms budget, with a fallback to finish the run",
+                trial.name,
+                trial.label,
+                budget.as_millis()
+            );
+        } else if let Some(trial) = before.trials.first() {
+            log::debug!(
+                "{}'s candidate {} runs to completion (budget {:?}, fallback {})",
+                trial.name,
+                trial.label,
+                trial.budget_ms,
+                trial.fallback.is_some()
+            );
         }
         // A promotion from a `Before` step is the search finishing: the DAG it
         // produced is stored, and this run executes it rather than a candidate.
@@ -296,8 +335,173 @@ where
         }
         let cleanup_ms = (Utc::now() - cleanup_started).num_milliseconds();
 
-        match engine.run(dag).await {
-            Ok(stats) => {
+        let executed = engine
+            .run_with(
+                dag,
+                RunOptions {
+                    budget,
+                    // Whatever a cancelled candidate built is what the resume
+                    // reuses, so a budgeted run must not tidy up after itself.
+                    cleanup_on_cancel: budget.is_none(),
+                    ..RunOptions::default()
+                },
+            )
+            .await;
+
+        match executed {
+            // A candidate that overran its budget. The verdict is drawn from
+            // the censored run itself, so the `After` step happens *first* and
+            // is handed no stats; only then is the delivery paid, under the
+            // incumbent, on the warehouse the candidate half-filled.
+            Ok(outcome) if outcome.stopped == Some(StopReason::Budget) => {
+                let trial = budgeted
+                    .as_ref()
+                    .expect("a budget is only set with a trial behind it");
+                let incumbent = trial.fallback.as_deref().expect("filtered above");
+                let trial_ms = outcome.stats.duration.num_milliseconds();
+                runs::log_event(
+                    &state.store,
+                    Some(run.run_id.clone()),
+                    Some(group.run_group_id.clone()),
+                    Some(group.dag_id.clone()),
+                    "info",
+                    format!(
+                        "{}'s candidate {} exceeded its {trial_ms}ms budget after {}/{} node(s); \
+                         finishing this run under the incumbent",
+                        trial.name,
+                        trial.label,
+                        outcome.completed.len(),
+                        working.nodes.num_nodes()
+                    ),
+                )
+                .await?;
+
+                let mut observed = working.clone();
+                let after = stepper::step_all(
+                    &mut steppers,
+                    Arc::clone(&conn),
+                    Arc::clone(&bare_engine),
+                    &mut observed,
+                    &group.dag_id,
+                    &group.dag_name,
+                    group.dag_version,
+                    StepPhase::After,
+                    Some(RunContext {
+                        run_id: run.run_id.clone(),
+                        run_group_id: group.run_group_id.clone(),
+                        run_phase: run.phase.clone(),
+                        rep_index: run.rep_index,
+                        // No stats is the censored observation: "at least as
+                        // slow as the cap". Every continuous pass reads it as a
+                        // rejection and moves its search on.
+                        stats: None,
+                    }),
+                )
+                .await;
+                if !after.is_empty()
+                    && let Some(version) = stepper::apply(
+                        state,
+                        &group.dag_id,
+                        &group.dag_name,
+                        base_version,
+                        sources,
+                        after,
+                    )
+                    .await
+                {
+                    base = observed.clone();
+                    base_version = version;
+                }
+
+                let plan = resume::plan(&working, incumbent, &outcome.completed);
+                let reused = plan.reusable.len();
+                let kept = plan.reusable.clone();
+                resume::drop_relations(conn.as_ref(), &plan.to_drop).await;
+                let resumed = engine
+                    .run_with(
+                        incumbent,
+                        RunOptions {
+                            skip: plan.reusable,
+                            // A delivery must not be cut short again, but a
+                            // pathological engine state must not hang the group.
+                            budget: budget.map(|b| b * RESUME_BUDGET_MULTIPLE),
+                            cleanup_on_cancel: false,
+                        },
+                    )
+                    .await;
+
+                let delivered = match resumed {
+                    Ok(r) if r.stopped.is_none() => r,
+                    Ok(_) | Err(_) => {
+                        let message = format!(
+                            "{}'s candidate was cancelled and the run could not be finished                              under the incumbent",
+                            trial.name
+                        );
+                        runs::mark_run_terminal(
+                            &state.store,
+                            run.run_id.clone(),
+                            runs::status::FAILED,
+                            Some(message.clone()),
+                        )
+                        .await?;
+                        engine.reset_cancel();
+                        return Err(ServerError::Internal(message));
+                    }
+                };
+
+                // One record for the whole delivery: the nodes the incumbent
+                // built, plus the candidate's nodes that were *kept*. A node the
+                // candidate built and the resume then dropped and rebuilt has
+                // the resume's row already, and a landing pad the incumbent does
+                // not have is not part of what was delivered at all -- recording
+                // either would describe a warehouse that does not exist.
+                //
+                // The elapsed time is *not* a measurement of either DAG: the
+                // resume started from a warm, half-built warehouse. That is what
+                // `delivery` records, so nothing downstream compares it to a
+                // clean run.
+                let mut stats = delivered.stats;
+                let resume_ms = stats.duration.num_milliseconds();
+                for (id, node) in outcome.stats.node_stats {
+                    if kept.contains(&id) {
+                        stats.node_stats.entry(id).or_insert(node);
+                    }
+                }
+                stats.start = outcome.stats.start;
+                stats.duration = stats.finish - stats.start;
+
+                runs::record_success(
+                    &state.store,
+                    run.run_id.clone(),
+                    runs::Delivery::resumed(trial_ms, resume_ms),
+                    stats,
+                    // What is actually in the warehouse is the incumbent's
+                    // relations, not the cancelled candidate's.
+                    incumbent
+                        .nodes
+                        .nodes()
+                        .map(|n| (n.id.clone(), n.materialize.as_str().to_string()))
+                        .collect(),
+                    plan_format.to_string(),
+                    plan_time_basis.clone(),
+                    cleanup_ms,
+                )
+                .await?;
+                runs::log_event(
+                    &state.store,
+                    Some(run.run_id.clone()),
+                    Some(group.run_group_id.clone()),
+                    Some(group.dag_id.clone()),
+                    "info",
+                    format!(
+                        "finished under the incumbent in {resume_ms}ms, reusing {reused} \
+                         relation(s) the cancelled candidate had already built"
+                    ),
+                )
+                .await?;
+            }
+            Ok(outcome) if outcome.stopped.is_none() => {
+                let stats = outcome.stats;
                 let duration_ms = stats.duration.num_milliseconds();
 
                 // What the candidate cost. Stepped before the run is recorded
@@ -344,6 +548,7 @@ where
                 runs::record_success(
                     &state.store,
                     run.run_id.clone(),
+                    runs::Delivery::direct(),
                     stats,
                     materializations,
                     plan_format.to_string(),
@@ -370,7 +575,19 @@ where
                 )
                 .await?;
             }
-            Err(ExecutorError::Cancelled) => {
+            // The user asked for this run to stop. Finishing it behind their
+            // back would be wrong, so this stays exactly what it was.
+            Ok(_) | Err(ExecutorError::Cancelled) => {
+                // A budgeted run was told not to tidy up after itself, because
+                // a resume was going to reuse what it built. A user's cancel
+                // ends that: nothing will read those relations, and leaving a
+                // half-built warehouse behind is not what cancelling did before
+                // budgets existed.
+                if budget.is_some()
+                    && let Err(e) = engine.cleanup(dag).await
+                {
+                    log::warn!("cleanup after cancelling {}: {e}", run.run_id);
+                }
                 runs::mark_run_terminal(
                     &state.store,
                     run.run_id.clone(),
