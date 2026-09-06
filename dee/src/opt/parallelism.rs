@@ -56,6 +56,32 @@
 //! for a second node to recruit and wants the narrow end of the ladder; an
 //! engine that cannot fill it wants the wide end. The probe is one run, and it
 //! is a rung that would have been measured anyway.
+//!
+//! **The narrowest rung decides whether to search at all.** Running one node
+//! at a time is the most relief from concurrency any cap can buy; every wider
+//! cap relieves strictly less of the same thing. So when it comes back slower,
+//! the ladder stops rather than working through rungs that can only do less.
+//! Across the twenty dag-bench cells this rung's direction matched the final
+//! outcome every time -- faster in the eight that went on to win 1.15x to
+//! 2.93x, not faster in the twelve that finished within 5% of where they
+//! started.
+//!
+//! What stops the search is the direction, not the size. A rung can be faster
+//! by less than the margin below and still be telling the truth about which
+//! lever works: `p09_gaming` at sf=1 gains 4% at a cap of 1 and 16% at a cap
+//! of 2, because serialising the DAG outright gives up concurrency that was
+//! not costing anything. Stopping on the margin rather than the direction
+//! loses that 16%.
+//!
+//! **A rung has to win by enough to be worth it.** The rank test is an
+//! ordering claim: it says a rung beat its control every time, not that it
+//! beat it by anything. Two settings that do the same work still separate
+//! cleanly on a quiet machine. On Postgres, `p09_gaming` is one 28s node and
+//! nineteen that cost nothing, so no cap can move it -- and a cap was accepted
+//! anyway on pair ratios of 0.9875 and 0.9960, then measured 2.7% slower once
+//! installed. A rung now has to clear a margin as well as the ordering.
+//! Across dag-bench every real win was at least 15% and every non-win within
+//! 5%, so the default sits in a gap nothing occupies.
 
 use std::{marker::PhantomData, sync::Arc};
 
@@ -90,6 +116,20 @@ use crate::opt::common::DEFAULT_BUDGET_EPS as BUDGET_EPS;
 /// sat at roughly 0.8 and 0.2 of the machine, so the boundary does not need to
 /// be precise to separate them.
 const SATURATION_FRACTION: f64 = 0.5;
+
+/// Fractional improvement a rung must show before it counts as a win.
+///
+/// The rank test asks whether a rung beat its control every time, which is an
+/// ordering claim: it says a difference is consistent, not that it is worth
+/// having. Two settings that do the same thing still separate cleanly if the
+/// machine is quiet enough, and then the ladder installs a cap on a coin flip.
+/// It did exactly that on Postgres -- p09_gaming accepted a cap on pair ratios
+/// of 0.9875 and 0.9960, and the cap measured 2.7% slower afterwards.
+///
+/// Five percent sits in the gap the measurements leave: across dag-bench every
+/// real win was at least 15% and every non-win within 5%, so nothing that
+/// mattered comes close to the line from either side.
+const DEFAULT_MIN_EFFECT: f64 = 0.05;
 
 /// Where the ladder is, as persisted between steps.
 ///
@@ -154,6 +194,11 @@ struct ParallelismState {
     probe_cores: Option<f64>,
     #[serde(default)]
     search_direction: Option<String>,
+    /// The narrowest rung the pruned ladder kept, which is also the first one
+    /// measured. Held so a verdict on it can be recognised as the verdict on
+    /// whether capping is the right lever at all.
+    #[serde(default)]
+    narrowest_rung: Option<usize>,
     /// The rung being measured, and how far through its runs it is.
     in_flight: Option<InFlight>,
     /// Baseline repetitions still owed before the ladder starts.
@@ -191,6 +236,7 @@ impl ParallelismState {
             observed_in_flight: 0,
             probe_cores: None,
             search_direction: None,
+            narrowest_rung: None,
             in_flight: None,
             seed_remaining: 0,
             runs_used: 0,
@@ -307,6 +353,12 @@ where
     /// Rungs that may fail in a row before the ladder gives up. Zero measures
     /// every rung.
     stop_after_failures: usize,
+    /// Fractional improvement a rung must show to be accepted. Zero restores
+    /// the bare ordering test.
+    min_effect: f64,
+    /// Abandon the ladder when the narrowest rung -- measured first, and the
+    /// most concurrency relief any cap can buy -- fails.
+    stop_on_narrowest_failure: bool,
     /// Capture each iteration's CPU/memory/disk timeseries into its
     /// `IterationStat`.
     profile_iterations: bool,
@@ -339,6 +391,8 @@ where
             cpu_guard: 0.10,
             adaptive_order: true,
             stop_after_failures: 2,
+            min_effect: DEFAULT_MIN_EFFECT,
+            stop_on_narrowest_failure: true,
             step_phase: StepPhase::Both,
             explain_data: None,
             _conn: PhantomData,
@@ -357,6 +411,8 @@ where
         pass.cpu_guard = config.parallelism_cpu_guard.max(0.0);
         pass.adaptive_order = config.parallelism_adaptive_order;
         pass.stop_after_failures = config.parallelism_stop_after_failures;
+        pass.min_effect = config.parallelism_min_effect.max(0.0);
+        pass.stop_on_narrowest_failure = config.parallelism_stop_on_narrowest_failure;
         pass
     }
 
@@ -373,9 +429,9 @@ where
         // The widest antichain, not the node count: a cap at or above the most
         // nodes that can ever be runnable together schedules exactly what no
         // cap schedules, so measuring it buys a second copy of the baseline.
-        // Across dag-bench that gap is large -- 10 to 25 nodes, but never more
-        // than 5 to 11 of them in flight -- and every rung above it was a pair
-        // of runs spent on a setting that could not bind.
+        // Across dag-bench that gap is large -- 10 to 25 nodes, but a widest
+        // antichain of only 3 to 7 -- and every rung above it was a pair of
+        // runs spent on a setting that could not bind.
         let width = dag.nodes.max_concurrency().max(1);
         // What a setting actually does on a DAG this shape. `None` is a cap of
         // `width`, since nothing more than that can ever be runnable.
@@ -498,6 +554,14 @@ where
         let mut fallback = dag.clone();
         fallback.max_parallelism = incumbent;
         Some(Box::new(fallback))
+    }
+
+    /// The fraction of the control a rung has to come in under to count.
+    ///
+    /// `1.0` when no margin is configured, which restores the bare ordering
+    /// test.
+    fn win_threshold(&self) -> f64 {
+        1.0 - self.min_effect.clamp(0.0, 1.0)
     }
 
     fn budget(&self, state: &ParallelismState) -> Option<i64> {
@@ -696,13 +760,20 @@ where
         // moment it reports.
         if !self.paired {
             let reference = state.incumbent_best().unwrap_or(f64::MAX);
-            if in_flight.stage == "screen" && cost >= reference {
+            if in_flight.stage == "screen" && cost >= reference * self.win_threshold() {
+                let faster = cost < reference;
                 debug!(
                     "ParallelismTuning: {} screened out at {cost:.2}ms (best {reference:.2}ms)",
                     describe(Some(in_flight.rung))
                 );
                 return self
-                    .resolve_rung(ctx, state, in_flight.rung, "rejected (screen)")
+                    .resolve_rung(
+                        ctx,
+                        state,
+                        in_flight.rung,
+                        if faster { "rejected (below min effect)" } else { "rejected (screen)" },
+                        faster,
+                    )
                     .await;
             }
             if state.trial_samples.len() <= self.confirm_runs {
@@ -737,16 +808,28 @@ where
             state.pair_trial = None;
 
             // Screening on the first completed pair. A rung that cannot beat
-            // the control beside it is rejected for the price of one pair;
-            // only what survives is worth counterbalancing.
-            if state.pair_ratios.len() == 1 && trial >= control {
+            // the control beside it by the margin worth having is rejected for
+            // the price of one pair; only what survives is worth
+            // counterbalancing.
+            if state.pair_ratios.len() == 1 && trial >= control * self.win_threshold() {
+                // Faster, but not by enough to install, is a different finding
+                // from not faster. The first says capping is the right lever
+                // here and this rung is simply not the best one; the second
+                // says it is the wrong lever. Only the second ends the search.
+                let faster = trial < control;
                 debug!(
                     "ParallelismTuning: {} screened out at {trial:.2}ms \
                      (control {control:.2}ms)",
                     describe(Some(in_flight.rung))
                 );
                 return self
-                    .resolve_rung(ctx, state, in_flight.rung, "rejected (screen)")
+                    .resolve_rung(
+                        ctx,
+                        state,
+                        in_flight.rung,
+                        if faster { "rejected (below min effect)" } else { "rejected (screen)" },
+                        faster,
+                    )
                     .await;
             }
 
@@ -769,8 +852,19 @@ where
         // every sample the incumbent has. Either way it assumes nothing about
         // the shape of the distributions: a bimodal rung that reached its fast
         // path during the screen fails as soon as it draws from its slow mode.
-        let wall_wins = if self.paired {
-            !state.pair_ratios.is_empty() && state.pair_ratios.iter().all(|r| *r < 1.0)
+        //
+        // Ordering alone is not enough to install a cap. Two settings that do
+        // the same thing separate cleanly whenever the machine is quiet, so the
+        // test carries a margin as well: the rung has to be faster, every time,
+        // and faster by an amount worth having. `wall_faster` keeps the bare
+        // ordering result so a rung that won but only barely can say so.
+        let threshold = self.win_threshold();
+        let (wall_faster, wall_wins) = if self.paired {
+            let some = !state.pair_ratios.is_empty();
+            (
+                some && state.pair_ratios.iter().all(|r| *r < 1.0),
+                some && state.pair_ratios.iter().all(|r| *r < threshold),
+            )
         } else {
             let trial_worst = state
                 .trial_samples
@@ -778,7 +872,8 @@ where
                 .copied()
                 .reduce(f64::max)
                 .unwrap_or(f64::MAX);
-            trial_worst < state.incumbent_best().unwrap_or(f64::MAX)
+            let best = state.incumbent_best().unwrap_or(f64::MAX);
+            (trial_worst < best, trial_worst < best * threshold)
         };
 
         // The CPU guard. Wall time cannot tell an idle core recruited from
@@ -811,10 +906,14 @@ where
             // Distinguished from a wall-time loss because they mean different
             // things: this rung was faster and refused anyway.
             "rejected (cpu guard)"
+        } else if wall_faster {
+            // Faster every time, but by less than the margin. Worth saying
+            // plainly, because it is the case that used to install a cap.
+            "rejected (below min effect)"
         } else {
             "rejected (rank test)"
         };
-        self.resolve_rung(ctx, state, in_flight.rung, verdict)
+        self.resolve_rung(ctx, state, in_flight.rung, verdict, wall_faster)
             .await
     }
 
@@ -957,6 +1056,7 @@ where
         if self.adaptive_order {
             state.pending.sort_unstable();
         }
+        state.narrowest_rung = state.pending.iter().min().copied();
 
         // Nothing left to compare against: every rung on the ladder does the
         // same thing to this DAG as the setting it already has.
@@ -997,7 +1097,8 @@ where
             "ParallelismTuning: {} produced no usable measurement; rejecting",
             describe(Some(in_flight.rung))
         );
-        self.resolve_rung(ctx, state, in_flight.rung, "rejected (censored)")
+        // A run that produced no time overran the budget, which means slower.
+        self.resolve_rung(ctx, state, in_flight.rung, "rejected (censored)", false)
             .await
     }
 
@@ -1009,6 +1110,7 @@ where
         mut state: ParallelismState,
         rung: usize,
         verdict: &str,
+        faster: bool,
     ) -> Result<StepOutcome, OptimizerError> {
         state.results.push(RungResult {
             parallelism: Some(rung),
@@ -1030,6 +1132,53 @@ where
             state.consecutive_failures = 0;
         } else {
             state.consecutive_failures += 1;
+        }
+
+        // The narrowest rung runs the DAG one node at a time, which is the most
+        // contention relief any cap can buy. If that does not pay, no wider cap
+        // will: the wider ones relieve strictly less of the same thing, and
+        // whatever is left is the engine's own to schedule. Across dag-bench
+        // this rung's direction matched the final outcome in every one of the
+        // 20 cells measured -- faster in the 8 that went on to win 1.15x to
+        // 2.93x, not faster in the 12 that finished within 5% of where they
+        // started -- and again on the Postgres cell that motivated the rule,
+        // where it was censored and the tuned DAG came out 2.7% slower.
+        //
+        // On `faster` rather than on the verdict, and the distinction is not
+        // pedantic. `p09_gaming` at sf=1 runs 4% faster at a cap of 1 and 16%
+        // faster at a cap of 2: serialising the DAG entirely gives up real
+        // concurrency while it relieves contention, so the narrowest rung
+        // understates what capping is worth. Keying this on the verdict
+        // stopped that search one percentage point under the margin and left
+        // the 16% unfound. Direction says whether capping is the lever;
+        // magnitude only says whether this particular rung is worth
+        // installing.
+        //
+        // Tied to measuring it first, which `observe_baseline` arranges only
+        // when it may order the ladder. Searching from the wide end reaches
+        // this rung last, by which point there is nothing left to skip.
+        let narrowest_failed = self.stop_on_narrowest_failure
+            && verdict != "accepted"
+            && !faster
+            && state.narrowest_rung == Some(rung)
+            && state.results.iter().filter(|r| r.verdict != "baseline").count() == 1;
+        if narrowest_failed && !state.pending.is_empty() {
+            debug!(
+                "ParallelismTuning: {} failed as the first and narrowest rung;                  capping is not the lever here, stopping with {} unmeasured",
+                describe(Some(rung)),
+                state.pending.len(),
+            );
+            for rung in std::mem::take(&mut state.pending) {
+                state.results.push(RungResult {
+                    parallelism: Some(rung),
+                    samples: Vec::new(),
+                    control_samples: Vec::new(),
+                    pair_ratios: Vec::new(),
+                    cpu_ratio: None,
+                    verdict: "not measured (search stopped)".to_string(),
+                });
+            }
+            return self.converge(ctx, state).await;
         }
 
         // Walking the ladder in the direction the probe chose, a run of
@@ -1131,6 +1280,7 @@ where
             paired: self.paired,
             probe_cores: state.probe_cores,
             search_direction: state.search_direction.clone(),
+            min_effect: self.min_effect,
             rungs: state.results.clone(),
         }
     }
@@ -1230,18 +1380,19 @@ where
         {cards}
         <div class="panel">
           <h2>Why the ladder looks like this</h2>
-          <div class="subtle">The configured ladder is {ladder:?}. A rung at or above the DAG's node count can never bind — the cap allows more nodes in flight than the DAG has — so it is the same execution as no cap, and rungs that collapse onto each other or onto the DAG's own setting are dropped rather than re-measured.</div>
+          <div class="subtle">The configured ladder is {ladder:?}. A rung at or above the widest set of nodes that can ever be runnable together can never bind — the cap allows more in flight than the DAG can offer — so it is the same execution as no cap, and rungs that collapse onto each other or onto the DAG's own setting are dropped rather than re-measured. The narrowest rung is measured first: it runs one node at a time, which is the most relief from concurrency any cap can buy, so if it comes back slower the rest of the ladder is left unmeasured.</div>
           {rung_table}
         </div>
         <div class="panel">
           <h2>How each setting was judged</h2>
-          <div class="subtle">The baseline is measured {seed} time(s). A rung is then screened against the incumbent's <em>best</em> sample, and only if it beats that is it re-measured {confirm} more time(s). It is accepted only if its <em>worst</em> sample still beats the incumbent's best — an ordering test, so a setting that is merely sometimes fast fails it. Bars show each setting's worst sample, which is the number compared.</div>
+          <div class="subtle">The baseline is measured {seed} time(s). Each rung is then run beside a fresh measurement of the incumbent and judged on the ratio within that pair, which cancels any drift both halves shared; the order alternates so a machine that is steadily speeding up cannot hand the rung a free win. A rung is screened on its first pair and, if it survives, re-measured {confirm} more time(s). It is accepted only if it won <em>every</em> pair — an ordering test, so a setting that is merely sometimes fast fails it — and won them by at least {margin:.0}%. Being faster by less than that is reported as <em>below min effect</em>: not worth installing, but still a sign that capping is the right lever, so the ladder keeps going. Bars show each setting's worst sample.</div>
           <div class="plan-tree">{bars}</div>
         </div>
       </div>"##,
             ladder = data.ladder,
             seed = data.seed_repeats,
             confirm = data.confirm_runs,
+            margin = data.min_effect * 100.0,
         )
     }
 }
@@ -1811,6 +1962,9 @@ mod tests {
         // One node using a tenth of a core cannot be filling the machine, so
         // the rungs worth trying are the wide ones and they should come first.
         let mut h = Harness::paired(vec![1, 2, 8], 2, 1).await;
+        // The narrowest rung fails here, which on its own would end the
+        // search. Switched off so what is under test stays reachable.
+        h.pass.stop_on_narrowest_failure = false;
         for _ in 0..2 {
             let (_, installed) = h.before().await;
             h.after(installed, Some(100)).await;
@@ -1837,6 +1991,9 @@ mod tests {
         // a second node, so the ladder stays in ascending order.
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         let mut h = Harness::paired(vec![1, 2, 8], 2, 1).await;
+        // The narrowest rung fails here, which on its own would end the
+        // search. Switched off so what is under test stays reachable.
+        h.pass.stop_on_narrowest_failure = false;
         for _ in 0..2 {
             let (_, installed) = h.before().await;
             h.after(installed, Some(100)).await;
@@ -2050,6 +2207,9 @@ mod tests {
         // The counter is consecutive failures, not total ones: a rung that
         // wins means the search has not passed the useful setting yet.
         let mut h = Harness::paired(vec![1, 2, 4, 8], 2, 1).await;
+        // The narrowest rung fails here, which on its own would end the
+        // search. Switched off so what is under test stays reachable.
+        h.pass.stop_on_narrowest_failure = false;
         for _ in 0..2 {
             let (_, installed) = h.before().await;
             h.after(installed, Some(100)).await;
@@ -2083,6 +2243,200 @@ mod tests {
         }
         measured.sort_unstable();
         assert_eq!(measured, vec![1, 2, 4, 8], "the acceptance kept the search alive");
+    }
+
+    #[tokio::test]
+    async fn test_a_rung_that_wins_by_less_than_the_margin_is_refused() {
+        // The case that motivated the margin. On Postgres p09_gaming a cap beat
+        // its control on every pair -- ratios of 0.9875 and 0.9960 -- passed the
+        // rank test, and measured 2.7% slower once installed. Consistency is
+        // not the same as worth having.
+        let mut h = Harness::paired(vec![1], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        // One pair, the rung 1% faster. The margin lives in the screen too, so
+        // this costs a single pair rather than the full confirmation.
+        let (_, a) = h.before().await;
+        h.after(a, Some(if a == Some(1) { 990 } else { 1000 })).await;
+        let (_, b) = h.before().await;
+        h.after(b, Some(if b == Some(1) { 990 } else { 1000 })).await;
+
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, None, "1% is not a reason to cap");
+        let rung = detail.rungs.iter().find(|r| r.parallelism == Some(1)).expect("rung");
+        assert_eq!(rung.verdict, "rejected (below min effect)");
+        assert_eq!(rung.pair_ratios.len(), 1, "and it cost one pair, not two");
+    }
+
+    #[tokio::test]
+    async fn test_a_narrow_rung_that_wins_by_a_little_keeps_the_ladder_open() {
+        // p09_gaming at sf=1: 4% faster at a cap of 1, 16% faster at a cap of
+        // 2. Serialising the DAG relieves contention and gives up concurrency
+        // at the same time, so the narrowest rung understates what capping is
+        // worth here. Stopping on the margin instead of the direction is what
+        // lost that 16% the first time this rule was written.
+        let mut h = Harness::paired(vec![1, 2], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(1000)).await;
+        }
+        // Rung 1: 4% faster, under the margin, so not installed.
+        let (_, a) = h.before().await;
+        h.after(a, Some(if a == Some(1) { 960 } else { 1000 })).await;
+        let (_, b) = h.before().await;
+        h.after(b, Some(if b == Some(1) { 960 } else { 1000 })).await;
+
+        let detail = h.pass.explain_data.clone().expect("detail");
+        let one = detail.rungs.iter().find(|r| r.parallelism == Some(1)).expect("rung 1");
+        assert_eq!(one.verdict, "rejected (below min effect)");
+        assert!(
+            !detail.rungs.iter().any(|r| r.verdict.starts_with("not measured")),
+            "being faster by a little is not a reason to stop searching"
+        );
+
+        // Rung 2: 16% faster, which is the setting worth having.
+        for _ in 0..2 {
+            let (_, c) = h.before().await;
+            h.after(c, Some(if c == Some(2) { 840 } else { 1000 })).await;
+            let (_, d) = h.before().await;
+            h.after(d, Some(if d == Some(2) { 840 } else { 1000 })).await;
+        }
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, Some(2), "the ladder reached the real win");
+    }
+
+    #[tokio::test]
+    async fn test_a_rung_whose_margin_does_not_hold_up_is_named_as_such() {
+        // Past the screen on its first pair, then back inside the margin on the
+        // counterbalanced one. Faster every time and still refused -- worth
+        // distinguishing in the report from a rung that simply lost.
+        let mut h = Harness::paired(vec![1], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        // First pair: 10% faster, clears the margin.
+        let (_, a) = h.before().await;
+        h.after(a, Some(if a == Some(1) { 900 } else { 1000 })).await;
+        let (_, b) = h.before().await;
+        h.after(b, Some(if b == Some(1) { 900 } else { 1000 })).await;
+        // Second pair: 1% faster, inside it.
+        let (_, c) = h.before().await;
+        h.after(c, Some(if c == Some(1) { 990 } else { 1000 })).await;
+        let (_, d) = h.before().await;
+        h.after(d, Some(if d == Some(1) { 990 } else { 1000 })).await;
+
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, None);
+        let rung = detail.rungs.iter().find(|r| r.parallelism == Some(1)).expect("rung");
+        assert_eq!(rung.verdict, "rejected (below min effect)");
+        assert!(
+            rung.pair_ratios.iter().all(|r| *r < 1.0),
+            "it did win every pair, which is why the verdict is not the rank test"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_rung_that_clears_the_margin_is_still_accepted() {
+        // The margin must not swallow the wins it was added to protect. Every
+        // real win across dag-bench was at least 15%.
+        let mut h = Harness::paired(vec![1], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        for _ in 0..2 {
+            let (_, a) = h.before().await;
+            h.after(a, Some(if a == Some(1) { 500 } else { 1000 })).await;
+            let (_, b) = h.before().await;
+            h.after(b, Some(if b == Some(1) { 500 } else { 1000 })).await;
+        }
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, Some(1));
+    }
+
+    #[test]
+    fn test_no_margin_restores_the_bare_ordering_test() {
+        // Configurable to zero, which is the behaviour every measurement before
+        // the margin existed was taken under.
+        let mut pass = pass(vec![1]);
+        assert!(pass.win_threshold() < 1.0);
+        pass.min_effect = 0.0;
+        assert_eq!(pass.win_threshold(), 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_the_ladder_stops_when_its_narrowest_rung_fails() {
+        // One node at a time is the most contention relief a cap can buy. If
+        // that does not pay, the wider rungs relieve strictly less of the same
+        // thing, and measuring them is four runs spent to confirm a no.
+        let mut h = Harness::paired(vec![1, 2, 4, 8], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        let (_, control) = h.before().await;
+        h.after(control, Some(100)).await;
+        let (_, probe) = h.before().await;
+        assert_eq!(probe, Some(1), "the narrowest rung goes first");
+        let outcome = h.after(probe, Some(150)).await;
+
+        assert!(outcome.is_terminal(), "the search is over, not merely paused");
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, None);
+        let unmeasured: Vec<Option<usize>> = detail
+            .rungs
+            .iter()
+            .filter(|r| r.verdict == "not measured (search stopped)")
+            .map(|r| r.parallelism)
+            .collect();
+        assert_eq!(
+            unmeasured,
+            vec![Some(2), Some(4), Some(8)],
+            "and it says which rungs it declined to measure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_narrowest_rung_that_wins_leaves_the_ladder_open() {
+        // The rule is about failure. A rung that pays says concurrency is
+        // costing something here, and how much to allow is still open.
+        let mut h = Harness::paired(vec![1, 2, 4, 8], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        for _ in 0..2 {
+            let (_, a) = h.before().await;
+            h.after(a, Some(if a == Some(1) { 50 } else { 100 })).await;
+            let (_, b) = h.before().await;
+            h.after(b, Some(if b == Some(1) { 50 } else { 100 })).await;
+        }
+        let (_, next) = h.before().await;
+        assert!(next.is_some(), "the search carries on past an accepted rung");
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_a_censored_narrowest_rung_also_ends_the_search() {
+        // Postgres p09_gaming: the narrowest rung serialised a DAG whose one
+        // long node was already its whole runtime, overran the budget, and was
+        // cancelled. A censored rung is a failed rung.
+        let mut h = Harness::paired(vec![1, 2, 4], 2, 1).await;
+        for _ in 0..2 {
+            let (_, installed) = h.before().await;
+            h.after(installed, Some(100)).await;
+        }
+        let (_, control) = h.before().await;
+        h.after(control, Some(100)).await;
+        let (_, probe) = h.before().await;
+        let outcome = h.after(probe, None).await;
+        assert!(outcome.is_terminal());
+        let detail = h.pass.explain_data.clone().expect("detail");
+        assert_eq!(detail.chosen_parallelism, None);
     }
 
     #[test]
@@ -2119,6 +2473,9 @@ mod tests {
         // ladder: a rung that cannot beat the incumbent's best sample is
         // rejected without a second measurement.
         let mut h = Harness::new(vec![1, 2], 2, 1).await;
+        // The narrowest rung fails here, which on its own would end the
+        // search. Switched off so what is under test stays reachable.
+        h.pass.stop_on_narrowest_failure = false;
         h.run(100).await;
         h.run(100).await;
 

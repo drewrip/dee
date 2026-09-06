@@ -138,6 +138,14 @@ pub struct OptimizerArgs {
     /// and leaves the rest unmeasured. 0 measures every rung.
     #[arg(long)]
     pub parallelism_stop_after_failures: Option<usize>,
+    /// ParallelismTuning: fraction a rung must improve on its control to be
+    /// accepted (0.05 = 5% faster). 0 accepts any consistent win.
+    #[arg(long)]
+    pub parallelism_min_effect: Option<f64>,
+    /// ParallelismTuning: abandon the ladder when its narrowest rung fails,
+    /// since no wider cap relieves more contention than that one does.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    pub parallelism_stop_on_narrowest_failure: Option<bool>,
 
     /// Capture a resource timeseries for every candidate run.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
@@ -250,6 +258,14 @@ impl OptimizerArgs {
         set(
             "parallelism_stop_after_failures",
             self.parallelism_stop_after_failures.map(|v| json!(v)),
+        );
+        set(
+            "parallelism_min_effect",
+            self.parallelism_min_effect.map(|v| json!(v)),
+        );
+        set(
+            "parallelism_stop_on_narrowest_failure",
+            self.parallelism_stop_on_narrowest_failure.map(|v| json!(v)),
         );
         set("profile_iterations", self.profile_iterations.map(|v| json!(v)));
         set("trial_resume", self.trial_resume.map(|v| json!(v)));

@@ -131,6 +131,14 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
     DeeOptSpec("parallelism_stop_after_failures", "--parallelism-stop-after-failures", "int",
                frozenset({"parallelism"}),
                doc="Rungs that may fail in a row before the ladder stops. 0 measures every rung."),
+    DeeOptSpec("parallelism_min_effect", "--parallelism-min-effect", "float",
+               frozenset({"parallelism"}),
+               doc="Fraction a rung must improve on its control to be accepted. 0 accepts any "
+                   "consistent win, however small."),
+    DeeOptSpec("parallelism_stop_on_narrowest_failure", "--parallelism-stop-on-narrowest-failure",
+               "bool", frozenset({"parallelism"}),
+               doc="Abandon the ladder when its narrowest rung fails, since no wider cap relieves "
+                   "more contention than that one does."),
     DeeOptSpec("profile_iterations", "--profile-iterations", "bool", frozenset({"hmp", "omp", "parallelism"}),
                doc="Capture a resource timeseries for every candidate DAG the optimizer runs."),
 )

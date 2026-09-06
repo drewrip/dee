@@ -134,6 +134,9 @@ pub struct ParallelismDetail {
     /// (one node leaves cores unused, try the widest rungs first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_direction: Option<String>,
+    /// Fractional improvement a rung had to show to be accepted.
+    #[serde(default)]
+    pub min_effect: f64,
     /// Every setting the search resolved, baseline first, in the order tried.
     pub rungs: Vec<RungResult>,
 }

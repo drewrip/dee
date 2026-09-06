@@ -5,10 +5,11 @@ use crate::{
 };
 use async_trait::async_trait;
 use duckdb::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    Column, ConnectOptions, Executor, PgPool, Row, Statement, TypeInfo,
+    Column, ConnectOptions, Executor, PgPool, Postgres, Row, Statement, TypeInfo,
+    pool::PoolConnection,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -36,12 +37,97 @@ fn materialize_mode_in_pg(mode: MaterializeMode) -> String {
     }
 }
 
+/// Cancels the statement running on a backend if the future that issued it is
+/// dropped before the statement finishes.
+///
+/// Postgres does not stop a running statement when its client goes away. A
+/// `CREATE TABLE ... AS` writes nothing to the socket until it completes, so
+/// the backend never notices the closed connection and runs to the end -- we
+/// have watched one keep six processes busy for 47 minutes after its client
+/// died. sqlx 0.8 keeps the backend's cancellation key private, so the only
+/// way to reach the statement is to ask the server over a second connection.
+///
+/// This matters because cancelling a run is routine: ParallelismTuning cuts
+/// every trial that overruns its budget. An orphaned statement goes on
+/// building the very relation the next run is about to build, and the two
+/// collide in the catalog -- `duplicate key value violates unique constraint
+/// "pg_type_typname_nsp_index"`. When they happen not to collide, the orphan
+/// still burns CPU underneath every measurement that follows, which is worse:
+/// it corrupts the numbers instead of failing loudly.
+struct CancelOnDrop {
+    pool: PgPool,
+    pid: i32,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    /// The statement finished on its own; there is nothing to cancel.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (pool, pid) = (self.pool.clone(), self.pid);
+        // Being dropped is the whole signal here, so the cancel cannot be
+        // awaited -- it is handed to the runtime to deliver. `pg_cancel_backend`
+        // needs no special privilege against a backend of the same role, and is
+        // a no-op against one that has already gone idle.
+        tokio::spawn(async move {
+            if let Err(e) = sqlx::query("SELECT pg_cancel_backend($1)")
+                .bind(pid)
+                .execute(&pool)
+                .await
+            {
+                warn!("couldn't cancel postgres backend {pid}: {e}");
+            }
+        });
+    }
+}
+
 impl PostgresConnection {
+    /// Take a connection off the pool along with a guard that cancels whatever
+    /// it is running should this future be dropped.
+    ///
+    /// The extra round trip for `pg_backend_pid()` is the price of the guard:
+    /// the pid belongs to the specific backend the statement will run on, so it
+    /// has to be read on that connection rather than looked up once.
+    async fn acquire_guarded(
+        &self,
+    ) -> Result<(PoolConnection<Postgres>, CancelOnDrop), ConnectorError> {
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            ConnectorError::Execute(format!("couldn't retrieve connection from pool - {}", e))
+        })?;
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| {
+                ConnectorError::Execute(format!("couldn't read postgres backend pid - {}", e))
+            })?;
+        Ok((
+            conn,
+            CancelOnDrop {
+                pool: self.pool.clone(),
+                pid,
+                armed: true,
+            },
+        ))
+    }
+
     /// Run an EXPLAIN that was asked for `FORMAT JSON` and return its text.
     ///
     /// Postgres returns the document as a single row of a single column.
     async fn explain_json(&self, sql: &str) -> Result<String, ConnectorError> {
-        let row = sqlx::query(sql).fetch_one(&self.pool).await.map_err(|e| {
+        // `EXPLAIN ANALYZE` on a CTAS runs the statement, so this is the path
+        // that leaves an orphan behind when a run is cut short.
+        let (mut conn, guard) = self.acquire_guarded().await?;
+        let row = sqlx::query(sql).fetch_one(&mut *conn).await;
+        guard.disarm();
+        let row = row.map_err(|e| {
             ConnectorError::Execute(format!("{} - query_text:\n{}", e, sql))
         })?;
         // `EXPLAIN (FORMAT JSON)` comes back as a `json`-typed column, so it
@@ -216,13 +302,11 @@ impl Connector for PostgresConnection {
     }
 
     async fn execute(&self, query_text: String) -> Result<usize, ConnectorError> {
-        let mut conn = self.pool.acquire().await.map_err(|e| {
-            ConnectorError::Execute(format!("couldn't retrieve connection from pool - {}", e))
-        })?;
+        let (mut conn, guard) = self.acquire_guarded().await?;
         let temp_q: &str = &query_text;
-        let rows = conn
-            .execute(temp_q)
-            .await
+        let rows = conn.execute(temp_q).await;
+        guard.disarm();
+        let rows = rows
             .map_err(|e| ConnectorError::Execute(format!("couldn't execute SQL - {}", e)))?;
         Ok(rows.rows_affected() as usize)
     }

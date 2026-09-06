@@ -729,6 +729,30 @@ pub struct OptimizerConfig {
     /// since the same replay in the wrong direction gave up as much as 105%.
     /// It leans on [`Self::parallelism_adaptive_order`] for that reason.
     pub parallelism_stop_after_failures: usize,
+    /// ParallelismTuning: fractional improvement a rung must show before it is
+    /// accepted (0.05 = 5% faster). Zero accepts any consistent win.
+    ///
+    /// The rank test is an ordering claim -- it says a rung beat its control
+    /// every time, not that it beat it by anything. On a quiet machine two
+    /// settings that do the same work still separate, and the ladder installs a
+    /// cap for nothing. On Postgres that cost 2.7%: p09_gaming accepted a cap
+    /// on pair ratios of 0.9875 and 0.9960. Across dag-bench every real win was
+    /// at least 15% and every non-win within 5%, so the margin has room.
+    pub parallelism_min_effect: f64,
+    /// ParallelismTuning: give up on the ladder when its narrowest rung fails.
+    ///
+    /// The narrowest rung runs one node at a time, which is the most relief
+    /// from concurrency any cap can buy; wider caps relieve strictly less of
+    /// the same thing. Over the 20 dag-bench cells this rung's direction
+    /// matched the final outcome every time.
+    ///
+    /// Direction, not size: a rung that is faster by less than
+    /// [`Self::parallelism_min_effect`] still says capping is the right lever,
+    /// and a wider rung may be worth much more. Needs
+    /// [`Self::parallelism_adaptive_order`] to have put the narrowest rung
+    /// first -- searching from the wide end reaches it last, with nothing left
+    /// to skip.
+    pub parallelism_stop_on_narrowest_failure: bool,
     /// Collect an `Explain` HTML section from each pass during `run()`.
     pub explain: bool,
     /// Cancel a trial once it has overrun the best configuration found so far,
@@ -780,6 +804,8 @@ impl Default for OptimizerConfig {
             parallelism_cpu_guard: 0.10,
             parallelism_adaptive_order: true,
             parallelism_stop_after_failures: 2,
+            parallelism_min_effect: 0.05,
+            parallelism_stop_on_narrowest_failure: true,
             explain: false,
             trial_resume: true,
             trial_budget_eps: crate::opt::common::DEFAULT_BUDGET_EPS,
@@ -1017,6 +1043,19 @@ impl OptimizerConfig {
     /// the whole ladder.
     pub fn with_parallelism_stop_after_failures(mut self, failures: usize) -> Self {
         self.parallelism_stop_after_failures = failures;
+        self
+    }
+
+    /// Fractional improvement a rung must show to be accepted. Negative
+    /// values are clamped to zero, which restores the bare ordering test.
+    pub fn with_parallelism_min_effect(mut self, effect: f64) -> Self {
+        self.parallelism_min_effect = effect.max(0.0);
+        self
+    }
+
+    /// Abandon the ladder when its narrowest rung fails.
+    pub fn with_parallelism_stop_on_narrowest_failure(mut self, stop: bool) -> Self {
+        self.parallelism_stop_on_narrowest_failure = stop;
         self
     }
 
