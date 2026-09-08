@@ -1,0 +1,52 @@
+# The Postgres half of the confirmation.
+#
+# p09_gaming already showed the stop rule cutting 12 runs to 4 and reversing a
+# 2.7% regression into no change. Two more projects here to check that was the
+# rule working rather than one DAG's shape: p02_adtech and p07_saas, the two
+# cheapest Postgres DAGs measured (~34s and ~36s a run at sf=1), both of which
+# DuckDB also declined to cap at sf=1.
+#
+# The expectation is the same verdict every time -- rung 1 fails, the ladder
+# stops, the DAG stays uncapped -- and the interesting number is what that
+# costs. Anything that accepts a cap here is the margin failing, since these
+# DAGs have nothing for a cap to do.
+#
+# The server is external, so cpu_seconds covers the dee process rather than the
+# backend: the CPU guard and the probe are both inert and the ladder decides on
+# wall time. That is the configuration the stop rule was designed for.
+name: parallelism-confirm-pg
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/parallelism-confirm-pg
+verbosity: detailed
+
+matrix:
+  project: [p02_adtech, p07_saas]
+  backend: [postgres]
+  sf: [1]
+  variant: [unopt, parallelism]
+
+variants:
+  unopt:       {passes: []}
+  parallelism: {passes: [parallelism]}
+
+dee_opt:
+  parallelism_ladder: [[1, 2, 4, 8]]
+  parallelism_seed_repeats: 2
+  parallelism_confirm_runs: 1
+
+backends:
+  postgres:
+    provider: external
+    host: 127.0.0.1
+    port: 5432
+    user: runner
+    password: password
+    dbname: benchmark
+    num_connections: 16
+
+execution:
+  repetitions: 3
+  warmups: 1
+  sample_interval_ms: 200
+  timeout_s: 7200

@@ -308,22 +308,57 @@ struct PgPlan {
 }
 
 impl PgPlan {
-    /// Inclusive time for this node across all its loops, in seconds.
-    fn inclusive_time_s(&self) -> Option<f64> {
-        let per_loop_ms = self.actual_total_time?;
-        Some(per_loop_ms * self.actual_loops.unwrap_or(1.0) / 1000.0)
+    /// Whether this node fans its subtree out across parallel workers.
+    fn is_gather(&self) -> bool {
+        matches!(self.node_type.as_str(), "Gather" | "Gather Merge")
     }
 
-    fn into_plan_node(self) -> PlanNode {
+    /// How many processes executed this node's children.
+    ///
+    /// Below a Gather, Postgres runs the subplan once per participating
+    /// process and reports each node's `Actual Loops` as that count. The
+    /// Gather's immediate child is the root of exactly one such subplan, so
+    /// its loop count *is* the number of processes -- which means nothing has
+    /// to be assumed about whether the leader joined in.
+    fn child_procs(&self, procs: f64) -> f64 {
+        if !self.is_gather() {
+            return procs;
+        }
+        self.plans
+            .first()
+            .and_then(|c| c.actual_loops)
+            .filter(|loops| *loops > 0.0)
+            .unwrap_or(procs)
+    }
+
+    /// Inclusive **wall** time for this node across its loops, in seconds.
+    ///
+    /// `Actual Total Time` is an average per loop. Multiplying by `Actual
+    /// Loops` is right when the loops are sequential re-executions -- the
+    /// inner side of a nested loop -- and wrong when they are parallel
+    /// workers, which ran at the same time. Left uncorrected it turns a
+    /// parallel subtree's wall time into a CPU-like sum while the Gather above
+    /// it still reports plain wall, so the subtraction in `into_plan_node`
+    /// goes negative and clamps the Gather to zero -- silently attributing
+    /// none of the run to the operator that gathered it. `procs` divides that
+    /// parallel dimension back out, leaving genuine nested-loop repetition
+    /// multiplied as before.
+    fn inclusive_time_s(&self, procs: f64) -> Option<f64> {
+        let per_loop_ms = self.actual_total_time?;
+        Some(per_loop_ms * self.actual_loops.unwrap_or(1.0) / procs / 1000.0)
+    }
+
+    fn into_plan_node(self, procs: f64) -> PlanNode {
         // `Actual Total Time` includes every child, so a node's own cost is
         // what remains after subtracting them. Without this, parents would be
         // charged for their children's work and the cost of a shared subplan
         // would be counted many times over.
-        let inclusive = self.inclusive_time_s();
+        let inclusive = self.inclusive_time_s(procs);
+        let child_procs = self.child_procs(procs);
         let children_total: f64 = self
             .plans
             .iter()
-            .filter_map(|c| c.inclusive_time_s())
+            .filter_map(|c| c.inclusive_time_s(child_procs))
             .sum();
         let exclusive = inclusive.map(|t| (t - children_total).max(0.0));
 
@@ -339,7 +374,11 @@ impl PgPlan {
             cardinality: self.actual_rows.map(|r| (r * loops).round() as u64),
             estimated_cardinality: self.plan_rows,
             relation,
-            children: self.plans.into_iter().map(PgPlan::into_plan_node).collect(),
+            children: self
+                .plans
+                .into_iter()
+                .map(|c| c.into_plan_node(child_procs))
+                .collect(),
         }
     }
 }
@@ -347,7 +386,12 @@ impl PgPlan {
 /// Parse Postgres `EXPLAIN (FORMAT JSON)` output, with or without ANALYZE.
 pub fn parse_postgres_plan(json: &str) -> Option<Vec<PlanNode>> {
     let wrappers: Vec<PgPlanWrapper> = serde_json::from_str(json).ok()?;
-    Some(wrappers.into_iter().map(|w| w.plan.into_plan_node()).collect())
+    Some(
+        wrappers
+            .into_iter()
+            .map(|w| w.plan.into_plan_node(1.0))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -495,9 +539,53 @@ mod tests {
         let json = r#"[{"Plan": {"Node Type": "Nested Loop", "Actual Total Time": 5.0,
             "Actual Rows": 10, "Actual Loops": 4, "Plan Rows": 40, "Plans": []}}]"#;
         let plans = parse_postgres_plan(json).unwrap();
-        // Postgres reports per-loop averages, so a node run 4 times did 4x the work.
+        // Postgres reports per-loop averages, so a node run 4 times did 4x the
+        // work. Sequential loops keep being multiplied -- only the parallel
+        // dimension is divided back out, see the Gather test below.
         assert_eq!(plans[0].cardinality, Some(40));
         assert!((plans[0].exclusive_time_s.unwrap() - 0.020).abs() < 1e-9);
+    }
+
+    #[test]
+    fn postgres_parallel_workers_do_not_multiply_wall_time() {
+        // Shape taken from a real `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`:
+        // three workers launched, so everything under the Gather Merge reports
+        // `Actual Loops: 4` -- four processes that ran at the same time, not
+        // four sequential passes.
+        let json = r#"[{"Plan": {
+            "Node Type": "Aggregate", "Actual Total Time": 116.591,
+            "Actual Rows": 3, "Actual Loops": 1, "Plan Rows": 3, "Plans": [
+            {"Node Type": "Gather Merge", "Actual Total Time": 116.585,
+             "Actual Rows": 12, "Actual Loops": 1, "Plan Rows": 9,
+             "Workers Launched": 3, "Plans": [
+            {"Node Type": "Sort", "Actual Total Time": 107.178,
+             "Actual Rows": 3, "Actual Loops": 4, "Plan Rows": 3, "Plans": [
+            {"Node Type": "Seq Scan", "Actual Total Time": 14.09,
+             "Actual Rows": 300000, "Actual Loops": 4, "Plan Rows": 387097,
+             "Relation Name": "orders", "Plans": []}]}]}]}}]"#;
+        let plans = parse_postgres_plan(json).unwrap();
+        let gather = &plans[0].children[0];
+        let sort = &gather.children[0];
+
+        // Before the parallel divisor, Sort's inclusive time came out as
+        // 107.178 * 4 = 428ms against the Gather's 116ms, so the subtraction
+        // went negative and `.max(0.0)` silently charged the Gather nothing.
+        assert!(
+            gather.exclusive_time_s.unwrap() > 0.0,
+            "the Gather was clamped to zero again"
+        );
+        assert!((gather.exclusive_time_s.unwrap() - 0.009407).abs() < 1e-6);
+        assert!((sort.exclusive_time_s.unwrap() - 0.093088).abs() < 1e-6);
+
+        // Wall time still nests: no node may exceed the root that contains it.
+        let root = plans[0].exclusive_time_s.unwrap()
+            + gather.exclusive_time_s.unwrap()
+            + sort.exclusive_time_s.unwrap()
+            + sort.children[0].exclusive_time_s.unwrap();
+        assert!((root - 0.116591).abs() < 1e-6, "exclusive times lost {root}");
+
+        // Rows are unaffected: every worker really did emit its share.
+        assert_eq!(sort.children[0].cardinality, Some(1_200_000));
     }
 
     #[test]

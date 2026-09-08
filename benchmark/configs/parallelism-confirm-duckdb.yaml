@@ -1,0 +1,50 @@
+# Does the narrowest-rung stop and the minimum effect size hold up on DuckDB?
+#
+# Five projects at both scale factors, chosen for what their sf=4 or sf=1
+# behaviour tests rather than for coverage:
+#
+#   p09_gaming sf=4 (2.03x at cap=1), p03_ecommerce sf=4 (1.87x at cap=1) and
+#   p08_healthcare sf=4 (1.79x at cap=2) -- the narrowest
+#   rung was accepted in each, so the stop rule must not fire and the wins must
+#   survive the margin. p08_healthcare is the one cell where rung 1 was
+#   accepted and rung 2 accepted on top of it, which is the only proof the
+#   ladder still climbs past a rung that paid.
+#
+#   p02_adtech, p03_ecommerce and p05_hr at sf=1 -- no win, rung 1 screened
+#   out. These are where the stop rule should end the search at once and the
+#   ladder should cost 4 runs rather than 6-7.
+#
+# Backend and ladder match parallelism-all exactly so the comparison is to
+# those recorded numbers. One caveat on runs-used: parallelism-all predates
+# paired measurement, so the new runs carry a control beside every rung the
+# old ones did not. A cell that fails at rung 1 pays 2 runs there instead of
+# 1, which is the honest direction for this comparison to be wrong in.
+name: parallelism-confirm-duckdb
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/parallelism-confirm-duckdb
+verbosity: detailed
+
+matrix:
+  project: [p02_adtech, p03_ecommerce, p05_hr, p08_healthcare, p09_gaming]
+  backend: [duckdb]
+  sf: [1, 4]
+  variant: [unopt, parallelism]
+
+variants:
+  unopt:       {passes: []}
+  parallelism: {passes: [parallelism]}
+
+dee_opt:
+  parallelism_ladder: [[1, 2, 4, 8]]
+  parallelism_seed_repeats: 2
+  parallelism_confirm_runs: 1
+
+backends:
+  duckdb: {threads: 8, max_memory: 16GB}
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 7200

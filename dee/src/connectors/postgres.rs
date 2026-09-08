@@ -12,7 +12,11 @@ use sqlx::{
     pool::PoolConnection,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PostgresConfig {
@@ -26,8 +30,18 @@ pub struct PostgresConfig {
 
 impl PostgresConfig {}
 
+/// See the DuckDB connector's constant of the same name.
+const INTERRUPT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct PostgresConnection {
     pool: PgPool,
+    /// Backends this connector currently has a statement running on.
+    ///
+    /// [`CancelOnDrop`] already cancels when the issuing future is dropped, but
+    /// that fires asynchronously and a caller cannot wait for it. Cancelling a
+    /// DAG needs a signal it can *await*, so that by the time it starts
+    /// dropping and rebuilding relations nothing is still writing to them.
+    inflight: Arc<Mutex<HashSet<i32>>>,
 }
 
 fn materialize_mode_in_pg(mode: MaterializeMode) -> String {
@@ -58,6 +72,7 @@ struct CancelOnDrop {
     pool: PgPool,
     pid: i32,
     armed: bool,
+    inflight: Arc<Mutex<HashSet<i32>>>,
 }
 
 impl CancelOnDrop {
@@ -69,6 +84,9 @@ impl CancelOnDrop {
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
+        if let Ok(mut g) = self.inflight.lock() {
+            g.remove(&self.pid);
+        }
         if !self.armed {
             return;
         }
@@ -108,12 +126,16 @@ impl PostgresConnection {
             .map_err(|e| {
                 ConnectorError::Execute(format!("couldn't read postgres backend pid - {}", e))
             })?;
+        if let Ok(mut g) = self.inflight.lock() {
+            g.insert(pid);
+        }
         Ok((
             conn,
             CancelOnDrop {
                 pool: self.pool.clone(),
                 pid,
                 armed: true,
+                inflight: Arc::clone(&self.inflight),
             },
         ))
     }
@@ -297,7 +319,10 @@ impl Connector for PostgresConnection {
             .connect_with(conn_options)
             .await
             .map_err(|_| ConnectorError::Create("couldn't create PgPool".into()))?;
-        let pg_conn = PostgresConnection { pool };
+        let pg_conn = PostgresConnection {
+            pool,
+            inflight: Arc::new(Mutex::new(HashSet::new())),
+        };
         Ok(Arc::new(pg_conn))
     }
 
@@ -309,6 +334,46 @@ impl Connector for PostgresConnection {
         let rows = rows
             .map_err(|e| ConnectorError::Execute(format!("couldn't execute SQL - {}", e)))?;
         Ok(rows.rows_affected() as usize)
+    }
+
+    async fn interrupt_inflight(&self) -> usize {
+        let pids: Vec<i32> = match self.inflight.lock() {
+            Ok(g) => g.iter().copied().collect(),
+            Err(_) => return 0,
+        };
+        // Awaited, unlike the drop guard's best-effort spawn: the caller is
+        // about to drop and rebuild the relations these statements are writing,
+        // and needs the cancels to have actually reached the server first.
+        // `pg_cancel_backend` needs no special privilege against a backend of
+        // the same role and is a no-op against one already idle.
+        let deadline = std::time::Instant::now() + INTERRUPT_QUIESCE_TIMEOUT;
+        loop {
+            let current: Vec<i32> = match self.inflight.lock() {
+                Ok(g) => g.iter().copied().collect(),
+                Err(_) => Vec::new(),
+            };
+            if current.is_empty() {
+                return pids.len();
+            }
+            for pid in &current {
+                if let Err(e) = sqlx::query("SELECT pg_cancel_backend($1)")
+                    .bind(pid)
+                    .execute(&self.pool)
+                    .await
+                {
+                    warn!("couldn't cancel postgres backend {pid}: {e}");
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    "{} postgres statement(s) still running {INTERRUPT_QUIESCE_TIMEOUT:?} after \
+                     being cancelled; giving up waiting for them",
+                    current.len()
+                );
+                return pids.len();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn new_relation(

@@ -359,6 +359,8 @@ where
     /// Abandon the ladder when the narrowest rung -- measured first, and the
     /// most concurrency relief any cap can buy -- fails.
     stop_on_narrowest_failure: bool,
+    /// How much of a cancelled trial the resume may keep.
+    reuse_policy: crate::opt::resume::ReusePolicy,
     /// Capture each iteration's CPU/memory/disk timeseries into its
     /// `IterationStat`.
     profile_iterations: bool,
@@ -393,6 +395,7 @@ where
             stop_after_failures: 2,
             min_effect: DEFAULT_MIN_EFFECT,
             stop_on_narrowest_failure: true,
+            reuse_policy: Default::default(),
             step_phase: StepPhase::Both,
             explain_data: None,
             _conn: PhantomData,
@@ -413,6 +416,7 @@ where
         pass.stop_after_failures = config.parallelism_stop_after_failures;
         pass.min_effect = config.parallelism_min_effect.max(0.0);
         pass.stop_on_narrowest_failure = config.parallelism_stop_on_narrowest_failure;
+        pass.reuse_policy = config.trial_reuse;
         pass
     }
 
@@ -564,6 +568,11 @@ where
         1.0 - self.min_effect.clamp(0.0, 1.0)
     }
 
+    /// The wall-clock cap a rung runs under: the incumbent's own worst sample.
+    ///
+    /// The incumbent's *worst* rather than its best, because the ladder accepts
+    /// on an ordering test against that sample -- a rung that has already
+    /// passed it cannot win, so there is nothing left to measure.
     fn budget(&self, state: &ParallelismState) -> Option<i64> {
         state
             .incumbent_worst()
@@ -598,6 +607,7 @@ where
                     let fallback = Self::incumbent_dag(ctx.dag, state.incumbent);
                     ctx.dag.max_parallelism = setting;
                     return Ok(StepOutcome::Trial {
+                        reuse: self.reuse_policy,
                         label,
                         fallback,
                         // A control is the incumbent and cannot overrun it in
@@ -643,6 +653,7 @@ where
                 });
                 self.save_state(ctx.store, ctx.dag_id, &state).await?;
                 Ok(StepOutcome::Trial {
+                    reuse: self.reuse_policy,
                     label,
                     fallback,
                     budget_ms: (stage != "control")
@@ -1596,12 +1607,15 @@ mod tests {
     }
 
     #[test]
-    fn test_the_budget_bounds_a_trials_overrun_by_eps() {
+    fn test_a_rung_is_cut_off_the_moment_it_can_no_longer_win() {
         let mut state = ParallelismState::new();
         state.incumbent_samples = vec![100.0, 200.0];
-        // Against the worst sample, so a run at the incumbent's own slow end
+        // Exactly the incumbent's worst sample: that is the number the
+        // acceptance test compares against, so a rung that reaches it has
+        // already lost and there is nothing further to measure. Measured
+        // against the *worst* sample so a run at the incumbent's own slow end
         // is not cancelled for being ordinary.
-        assert_eq!(pass(vec![1]).budget(&state), Some(250));
+        assert_eq!(pass(vec![1]).budget(&state), Some(200));
     }
 
     #[test]

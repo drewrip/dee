@@ -120,6 +120,8 @@ where
     /// Capture each iteration's CPU/memory/disk timeseries into its
     /// `IterationStat`.
     profile_iterations: bool,
+    /// How much of a cancelled trial the resume may keep.
+    reuse_policy: crate::opt::resume::ReusePolicy,
     /// Which side of an execution to step on. `Both` by author's default: a
     /// plan is installed before a run and scored after it.
     step_phase: StepPhase,
@@ -150,6 +152,7 @@ where
             early_termination,
             use_pushdown,
             profile_iterations,
+            reuse_policy: Default::default(),
             step_phase: StepPhase::Both,
             explain_data: None,
             _phantom: PhantomData,
@@ -176,7 +179,7 @@ where
     E: Executor<C> + Send + Sync,
 {
     pub fn from_config(conn: Arc<C>, engine: Arc<E>, config: &OptimizerConfig) -> Self {
-        Self::new(
+        let mut pass = Self::new(
             conn,
             engine,
             config.omp_top,
@@ -184,7 +187,9 @@ where
             config.omp_early_termination,
             config.omp_use_pushdown,
             config.profile_iterations,
-        )
+        );
+        pass.reuse_policy = config.trial_reuse;
+        pass
     }
 
     async fn load_state(
@@ -451,6 +456,7 @@ where
                     self.build_plan(ctx.dag, &state.top_candidates, &in_flight.modes)
                         .await?;
                     return Ok(StepOutcome::Trial {
+                        reuse: self.reuse_policy,
                         label: Self::describe_plan(&state.top_candidates, &in_flight.modes),
                         budget_ms: self.budget(&state),
                         fallback,
@@ -490,6 +496,7 @@ where
                     });
                     self.save_state(ctx.store, ctx.dag_id, &state).await?;
                     return Ok(StepOutcome::Trial {
+                        reuse: self.reuse_policy,
                         label: Self::describe_plan(&state.top_candidates, &modes),
                         budget_ms: self.budget(&state),
                         fallback,

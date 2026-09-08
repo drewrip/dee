@@ -27,6 +27,7 @@ use crate::{
     opt::{
         hmp::{HMPStrategy, HmpCostMethod},
         omp::OMPCentrality,
+        resume::ReusePolicy,
     },
 };
 
@@ -506,11 +507,21 @@ where
                          finishing under the incumbent",
                         optimization.name()
                     );
-                    let plan = resume::plan(&working, incumbent, &outcome.completed);
+                    let plan = resume::plan(
+                        &working,
+                        incumbent,
+                        &outcome.completed,
+                        self.config.trial_reuse,
+                    );
                     resume::drop_relations(self.conn.as_ref(), &plan.to_drop).await;
-                    self.engine
+                    // The incumbent with the cancelled run's usable pads wired
+                    // back in, so its remaining nodes read what that run already
+                    // materialized instead of recomputing it.
+                    let resumed_dag = resume::resume_dag(incumbent, &plan.pads);
+                    let delivered = self
+                        .engine
                         .run_with(
-                            incumbent,
+                            &resumed_dag,
                             RunOptions {
                                 skip: plan.reusable,
                                 // A delivery must not be cut short again, but a
@@ -522,6 +533,20 @@ where
                         )
                         .await
                         .map_err(|e| OptimizerError::Exec(e.to_string()))?;
+                    // A resume that stopped early delivered a half-built DAG.
+                    // Reporting it as a delivery would leave the caller with an
+                    // incomplete warehouse and no indication of it.
+                    if let Some(reason) = delivered.stopped {
+                        return Err(OptimizerError::Exec(format!(
+                            "the candidate at iteration {iteration} overran its budget and the \
+                             run could not be finished under the incumbent either ({reason:?})"
+                        )));
+                    }
+                    // The pads are scaffolding, not part of the incumbent:
+                    // drop them now that the run has consumed them.
+                    let spent: Vec<String> =
+                        plan.pads.iter().map(|(_, pad)| pad.clone()).collect();
+                    resume::drop_relations(self.conn.as_ref(), &spent).await;
                     last_run = Some(incumbent.clone());
                     None
                 }
@@ -767,8 +792,23 @@ pub struct OptimizerConfig {
     /// control.
     pub trial_resume: bool,
     /// Fraction by which a trial may overrun the incumbent before
-    /// [`Self::trial_resume`] cuts it short.
+    /// [`Self::trial_resume`] cuts it short. **Zero by default**: a candidate
+    /// that has reached the incumbent's runtime has already lost the only
+    /// comparison the search makes, so it is stopped there. Raising it buys a
+    /// more precise measurement of a configuration that is rejected either way,
+    /// and costs that slack twice over -- once in the trial, once in the resume
+    /// that has to finish the run.
     pub trial_budget_eps: f64,
+    /// How much of a cancelled trial the resume may keep.
+    ///
+    /// `equivalent` leans on the invariant that every DAG dee produces holds
+    /// the same tuples as the one it came from, so a relation the trial
+    /// finished is reusable if the incumbent has a node of that name -- and the
+    /// trial's landing pads are used to finish the run rather than thrown away.
+    /// `strict` keeps only relations whose node is defined identically in both
+    /// DAGs; it is the escape hatch, because the failure mode of getting the
+    /// invariant wrong is silent.
+    pub trial_reuse: ReusePolicy,
 }
 
 impl Default for OptimizerConfig {
@@ -809,6 +849,7 @@ impl Default for OptimizerConfig {
             explain: false,
             trial_resume: true,
             trial_budget_eps: crate::opt::common::DEFAULT_BUDGET_EPS,
+            trial_reuse: ReusePolicy::default(),
         }
     }
 }

@@ -108,6 +108,13 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
                frozenset({"hmp", "omp", "parallelism"}),
                doc="Fraction by which a candidate may overrun the best configuration before it "
                    "is cut short."),
+    DeeOptSpec("trial_reuse", "--trial-reuse", "str",
+               frozenset({"hmp", "omp", "parallelism"}),
+               choices=("equivalent", "strict"),
+               doc="How much of a cancelled candidate the resume keeps. `equivalent` reuses every "
+                   "relation it finished that the incumbent also has, and reads its landing pads "
+                   "instead of recomputing them; `strict` keeps only identically-defined nodes, "
+                   "which is the control for measuring what the reuse is worth."),
     DeeOptSpec("parallelism_ladder", "--parallelism-ladder", "int_list", frozenset({"parallelism"}),
                doc="Node-concurrency caps the parallelism ladder measures."),
     DeeOptSpec("parallelism_seed_repeats", "--parallelism-seed-repeats", "int", frozenset({"parallelism"}),

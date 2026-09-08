@@ -228,6 +228,8 @@ where
     /// Fraction by which a trial may overrun the incumbent before it is cut
     /// short. Only meaningful when `resume_trials` is set.
     budget_eps: f64,
+    /// How much of a cancelled trial the resume may keep.
+    reuse_policy: crate::opt::resume::ReusePolicy,
     /// Run the PushdownPass before evaluating each candidate materialization
     /// combination, for more accurate cost measurements.
     use_pushdown: bool,
@@ -290,17 +292,20 @@ struct OperatorRankingRow {
 
 /// One row of the `--hmp-show-nodes` ranking table: a View (out-degree > 1)
 /// and the aggregate CPU time of every operator traced back to it.
+///
+/// Public so that a costing method can be evaluated offline against measured
+/// ground truth -- see `ranking_for`.
 #[derive(Serialize, Debug, Clone)]
-struct NodeRankingRow {
-    rank: usize,
-    node: String,
-    total_cpu_time_s: f64,
+pub struct NodeRankingRow {
+    pub rank: usize,
+    pub node: String,
+    pub total_cpu_time_s: f64,
     /// Estimated cardinality of the View's own EXPLAIN plan, when available.
-    cardinality: Option<f64>,
+    pub cardinality: Option<f64>,
     /// The value nodes are ranked by: `total_cpu_time_s`, or (when
     /// `--hmp-normalize-with-cardinality` is set) `total_cpu_time_s` divided
     /// by `cardinality`.
-    ranking_score: f64,
+    pub ranking_score: f64,
     /// Leaf-set matching only: the base relations this View reads, and the
     /// consumer plan operators its region was matched to.
     ///
@@ -308,9 +313,9 @@ struct NodeRankingRow {
     /// They are the only way to tell a good attribution from a lucky one, which
     /// is why they reach the explain report rather than staying in a log line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    leaves: Vec<String>,
+    pub leaves: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    matched: Vec<String>,
+    pub matched: Vec<String>,
 }
 
 impl<C, E> HMPPass<C, E>
@@ -334,6 +339,7 @@ where
         profile_iterations: bool,
         resume_trials: bool,
         budget_eps: f64,
+        reuse_policy: crate::opt::resume::ReusePolicy,
     ) -> Self {
         Self {
             conn,
@@ -349,7 +355,11 @@ where
             beam_width: beam_width.max(1),
             profile_iterations,
             resume_trials,
-            budget_eps: if budget_eps > 0.0 {
+            reuse_policy,
+            // Zero is the default and a meaningful setting -- stop the trial
+            // the moment it can no longer win -- so only a nonsensical negative
+            // falls back.
+            budget_eps: if budget_eps >= 0.0 {
                 budget_eps
             } else {
                 crate::opt::common::DEFAULT_BUDGET_EPS
@@ -796,6 +806,7 @@ where
             config.profile_iterations,
             config.trial_resume,
             config.trial_budget_eps,
+            config.trial_reuse,
         )
     }
 
@@ -1037,7 +1048,10 @@ where
     }
 
     /// The ranking a run's plans imply, as `(node, score)`.
-    fn ranking_for(&self, dag: &Dag, stats: &ExecStats) -> Vec<NodeRankingRow> {
+    ///
+    /// Public so a costing method can be scored offline against ground truth
+    /// measured by materializing the Views it ranks.
+    pub fn ranking_for(&self, dag: &Dag, stats: &ExecStats) -> Vec<NodeRankingRow> {
         if self.cost_method == HmpCostMethod::NodeTime {
             return Self::ranking_from_node_times(dag, stats);
         }
@@ -1350,6 +1364,7 @@ where
                     let fallback = self.incumbent_dag(ctx.dag, &state).await;
                     self.build_trial(ctx.dag, &combo).await?;
                     return Ok(StepOutcome::Trial {
+                        reuse: self.reuse_policy,
                         label: describe(&combo),
                         budget_ms: self.budget(&state),
                         fallback,
@@ -1401,6 +1416,7 @@ where
 
                     *ctx.dag = trial;
                     return Ok(StepOutcome::Trial {
+                        reuse: self.reuse_policy,
                         label: describe(&combo),
                         budget_ms: self.budget(&state),
                         fallback,
@@ -2080,6 +2096,7 @@ mod tests {
             false,
             true,
             crate::opt::common::DEFAULT_BUDGET_EPS,
+            Default::default(),
         )
     }
 
@@ -2456,7 +2473,7 @@ mod tests {
         assert_eq!(after.best_combo, vec!["kept".to_string()]);
         assert_eq!(
             after.tried_combos.get("sig-a").copied(),
-            Some(1250),
+            Some(1000),
             "the censored observation must be filed at the budget, not discarded"
         );
         assert_eq!(
@@ -2513,7 +2530,22 @@ mod tests {
         let mut state = HmpState::new();
         assert_eq!(pass.budget(&state), None, "nothing has been measured yet");
         state.best_ms = 1000;
-        assert_eq!(pass.budget(&state), Some(1250));
+        // Exactly the incumbent: the search only asks whether a candidate is
+        // faster, so a trial that reaches the incumbent's time has already
+        // answered no and is stopped there.
+        assert_eq!(pass.budget(&state), Some(1000));
+    }
+
+    #[tokio::test]
+    async fn a_zero_budget_eps_is_honoured_rather_than_read_as_unset() {
+        // `0.0` is the default and a deliberate setting. Coercing it to a
+        // fallback -- which an `if eps > 0.0` check would -- would silently
+        // restore the slack this is meant to remove.
+        let mut pass = test_pass(2).await;
+        pass.budget_eps = 0.0;
+        let mut state = HmpState::new();
+        state.best_ms = 800;
+        assert_eq!(pass.budget(&state), Some(800));
     }
 
     // A continuous optimization's whole premise is that its search survives

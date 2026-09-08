@@ -61,6 +61,8 @@ pub struct InstalledTrial {
     /// and the candidate is measured to completion however slow it turns out --
     /// a pipeline that did not run is not an outcome a search gets to choose.
     pub fallback: Option<Box<Dag>>,
+    /// How much of this candidate the resume may keep if it is cancelled.
+    pub reuse: dee::opt::resume::ReusePolicy,
 }
 
 /// What stepping a DAG's optimizations produced for one execution.
@@ -195,6 +197,7 @@ where
                 label,
                 budget_ms,
                 fallback,
+                reuse,
                 ..
             }) => {
                 log::info!("{}: trying {label} on this run", stepper.name);
@@ -203,6 +206,7 @@ where
                     label,
                     budget_ms,
                     fallback,
+                    reuse,
                 });
             }
             Ok(StepOutcome::Promote { .. }) | Ok(StepOutcome::Rewrote { .. }) => {

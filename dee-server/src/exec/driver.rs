@@ -413,13 +413,19 @@ where
                     base_version = version;
                 }
 
-                let plan = resume::plan(&working, incumbent, &outcome.completed);
+                let plan = resume::plan(&working, incumbent, &outcome.completed, trial.reuse);
                 let reused = plan.reusable.len();
                 let kept = plan.reusable.clone();
                 resume::drop_relations(conn.as_ref(), &plan.to_drop).await;
+                // The incumbent with the cancelled candidate's usable landing
+                // pads wired back in, so the nodes still to build read what that
+                // candidate already materialized instead of recomputing it. The
+                // relations delivered are the incumbent's either way.
+                let resumed_dag = resume::resume_dag(incumbent, &plan.pads);
+                let pads_used = plan.pads.len();
                 let resumed = engine
                     .run_with(
-                        incumbent,
+                        &resumed_dag,
                         RunOptions {
                             skip: plan.reusable,
                             // A delivery must not be cut short again, but a
@@ -434,7 +440,8 @@ where
                     Ok(r) if r.stopped.is_none() => r,
                     Ok(_) | Err(_) => {
                         let message = format!(
-                            "{}'s candidate was cancelled and the run could not be finished                              under the incumbent",
+                            "{}'s candidate was cancelled and the run could not be finished \
+                             under the incumbent",
                             trial.name
                         );
                         runs::mark_run_terminal(
@@ -487,6 +494,12 @@ where
                     cleanup_ms,
                 )
                 .await?;
+                // The pads are scaffolding, not part of the incumbent: drop
+                // them now the run has consumed them, so what is left in the
+                // warehouse is exactly what the incumbent describes.
+                let spent: Vec<String> = plan.pads.into_iter().map(|(_, pad)| pad).collect();
+                resume::drop_relations(conn.as_ref(), &spent).await;
+
                 runs::log_event(
                     &state.store,
                     Some(run.run_id.clone()),
@@ -495,7 +508,8 @@ where
                     "info",
                     format!(
                         "finished under the incumbent in {resume_ms}ms, reusing {reused} \
-                         relation(s) the cancelled candidate had already built"
+                         relation(s) the cancelled candidate had already built and reading \
+                         {pads_used} of its landing pad(s) instead of recomputing them"
                     ),
                 )
                 .await?;

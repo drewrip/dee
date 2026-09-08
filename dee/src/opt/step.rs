@@ -233,6 +233,8 @@ pub enum StepOutcome {
         /// `None` from a pass with no incumbent yet -- nothing has been
         /// measured, so there is nothing better to fall back to.
         fallback: Option<Box<Dag>>,
+        /// How much of this trial the resume may keep if it is cancelled.
+        reuse: crate::opt::resume::ReusePolicy,
         record: Box<PassOutcome>,
     },
     /// A `Once` optimization finished its rewrite. The DAG in the context is
@@ -359,6 +361,7 @@ mod tests {
                 label: "c1".into(),
                 budget_ms: None,
                 fallback: None,
+                reuse: Default::default(),
                 record: record(),
             }
             .persists()

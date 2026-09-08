@@ -15,7 +15,9 @@ use crate::{
     connectors::{Connector, PushdownInfo},
     dag::MaterializeMode,
     executor::Executor,
-    opt::common::dialect_for_db,
+    opt::common::{
+        bare_table_name, dialect_for_db, inline_view_ast, rewrite_node_refs, table_ref_matches,
+    },
     opt::{
         Dag, Optimization, OptimizerError,
         explain::{render_card_grid, render_ranked_table},
@@ -27,17 +29,6 @@ use crate::{
     },
 };
 
-/// Extract the bare (unquoted, unqualified) table name from a node ID that may
-/// be a one-, two-, or three-part quoted identifier such as
-/// `"warehouse"."main"."stg_accounts"`.
-fn bare_table_name(node_id: &str) -> String {
-    node_id
-        .split('.')
-        .last()
-        .unwrap_or(node_id)
-        .trim_matches('"')
-        .to_string()
-}
 
 // ---------------------------------------------------------------------------
 // Dead-column elimination
@@ -96,35 +87,6 @@ fn contains_star(expr: &Expression) -> bool {
     expr.dfs().any(|e| matches!(e, Expression::Star(_)))
 }
 
-/// `true` if `table` is a reference to the DAG node `node_id`.
-///
-/// Node IDs can be one-, two-, or three-part quoted identifiers such as
-/// `"warehouse"."main"."stg_orders"`. Matching compares from the right and
-/// only on the parts both sides actually spell out, so an unqualified
-/// `stg_orders` in a query matches the node, while a *different* schema's
-/// `"warehouse"."raw"."stg_orders"` does not.
-fn table_ref_matches(table: &polyglot_sql::expressions::TableRef, node_id: &str) -> bool {
-    let parts: Vec<&str> = node_id.split('.').map(|p| p.trim_matches('"')).collect();
-    let Some(name) = parts.last() else {
-        return false;
-    };
-    if !table.name.name.eq_ignore_ascii_case(name) {
-        return false;
-    }
-    let qualifiers: Vec<&str> = parts[..parts.len() - 1].to_vec();
-    let refs: Vec<&str> = [table.catalog.as_ref(), table.schema.as_ref()]
-        .into_iter()
-        .flatten()
-        .map(|i| i.name.as_str())
-        .collect();
-    // Compare the qualifiers both sides spell out, right-aligned.
-    for (r, q) in refs.iter().rev().zip(qualifiers.iter().rev()) {
-        if !r.eq_ignore_ascii_case(q) {
-            return false;
-        }
-    }
-    true
-}
 
 /// `true` if any of `select`'s FROM/JOIN targets is a direct reference to
 /// `source_id` (regardless of how many other sources/joins are present).
@@ -668,44 +630,6 @@ fn columns_needed_from(
     Some((cols, rewritten))
 }
 
-/// Rewrite every reference to a DAG node in `sql` to the name it is
-/// materialized under for analysis, at the AST level.
-///
-/// `mapping` is keyed by node ID. Matching happens on parsed table
-/// references (see [`table_ref_matches`]), so a node ID that also occurs as a
-/// substring of a string literal, a column name, or a longer identifier is
-/// left alone — unlike the plain `str::replace` this replaced, which would
-/// happily rewrite `WHERE env = 'staging'` into a comparison against a
-/// scratch table name and hand the connector a query that means something
-/// else entirely.
-///
-/// Returns `None` if `sql` doesn't parse or can't be regenerated; callers
-/// fall back to textual substitution, which is what this did before.
-fn rewrite_node_refs(
-    sql: &str,
-    mapping: &HashMap<String, String>,
-    dialect: DialectType,
-) -> Option<String> {
-    let parsed = polyglot_sql::parse_one(sql, dialect).ok()?;
-    let rewritten = polyglot_sql::traversal::transform(parsed, &|node| {
-        let Expression::Table(table) = &node else {
-            return Ok(Some(node));
-        };
-        let Some((_, new_name)) = mapping
-            .iter()
-            .find(|(node_id, _)| table_ref_matches(table, node_id))
-        else {
-            return Ok(Some(node));
-        };
-        let mut table = table.clone();
-        table.name = polyglot_sql::expressions::Identifier::new(new_name.clone());
-        table.schema = None;
-        table.catalog = None;
-        Ok(Some(Expression::Table(table)))
-    })
-    .ok()?;
-    polyglot_sql::generate(&rewritten, dialect).ok()
-}
 
 /// Apply [`rewrite_node_refs`], falling back to longest-first textual
 /// substitution when the SQL can't be parsed (an exotic dialect construct);
@@ -727,77 +651,6 @@ fn rewrite_node_refs_or_replace(
     out
 }
 
-/// Inline `view_sql` (the query text of `view_id`) into `table_sql` by
-/// replacing every AST-level table reference to `view_id` with a
-/// parenthesized, aliased subquery wrapping `view_sql` — the AST-based
-/// counterpart of a plain `str::replace`.
-///
-/// Operating on the parsed AST (rather than raw substring substitution)
-/// avoids matching `view_id`'s name where it merely appears as a substring
-/// of an unrelated, longer identifier, and lets the original table's alias
-/// (or, if it had none, its own name — so any qualified column references
-/// elsewhere in the query keep resolving) carry over onto the new subquery
-/// precisely, rather than by accident of leftover trailing text.
-///
-/// Every occurrence of `view_id` in `table_sql` is replaced (matching
-/// `str::replace`'s multi-occurrence behavior for self-joins etc.), each
-/// getting its own independent copy of `view_sql`'s AST.
-///
-/// Returns `None` if `table_sql` or `view_sql` doesn't parse, if
-/// regenerating the rewritten AST fails, or if `view_id` was not found
-/// anywhere in `table_sql` — callers fall back to plain string substitution
-/// in all of those cases.
-fn inline_view_ast(
-    table_sql: &str,
-    view_id: &str,
-    view_sql: &str,
-    dialect: DialectType,
-) -> Option<String> {
-    let bare_view = bare_table_name(view_id);
-    let table_expr = polyglot_sql::parse_one(table_sql, dialect).ok()?;
-    let view_expr = polyglot_sql::parse_one(view_sql, dialect).ok()?;
-
-    let replaced_any = std::cell::Cell::new(false);
-    let rewritten = polyglot_sql::traversal::transform(table_expr, &|node| {
-        let Expression::Table(t) = &node else {
-            return Ok(Some(node));
-        };
-        if !table_ref_matches(t, view_id) {
-            return Ok(Some(node));
-        }
-        replaced_any.set(true);
-        let alias = t
-            .alias
-            .clone()
-            .unwrap_or_else(|| polyglot_sql::expressions::Identifier::new(bare_view.clone()));
-        Ok(Some(Expression::Subquery(Box::new(
-            polyglot_sql::expressions::Subquery {
-                this: view_expr.clone(),
-                alias: Some(alias),
-                column_aliases: t.column_aliases.clone(),
-                alias_explicit_as: t.alias_explicit_as,
-                alias_keyword: None,
-                order_by: None,
-                limit: None,
-                offset: None,
-                distribute_by: None,
-                sort_by: None,
-                cluster_by: None,
-                lateral: false,
-                modifiers_inside: true,
-                trailing_comments: vec![],
-                inferred_type: None,
-            },
-        ))))
-    })
-    .ok()?;
-
-    if !replaced_any.get() {
-        return None;
-    }
-
-    polyglot_sql::generate(&rewritten, dialect).ok()
-}
 
 /// Extract the column names referenced by a raw SQL predicate string (as
 /// returned by [`Connector::pushdown`]'s `filters`), by parsing it as a
@@ -1572,8 +1425,22 @@ where
             // is updated.
             for (frontier_id, pruned_sql) in &result.frontier_sql {
                 debug!("PushdownPass: updating frontier '{frontier_id}' with pruned SQL");
+                // The pruned text comes from `minor`, where the views above this
+                // node have already been inlined, so it no longer names them.
+                // `depends_on` has to follow: a node that still claims an edge
+                // to a view its query does not mention describes a DAG that is
+                // not the one being run, and anything reasoning about the graph
+                // afterwards -- the resume's reuse decisions above all -- reads
+                // that edge as real.
+                let minor_deps = minor
+                    .nodes
+                    .get(frontier_id.clone())
+                    .map(|n| n.depends_on.clone());
                 if let Some(n) = dag.nodes.get_mut(frontier_id.clone()) {
                     n.query_text = pruned_sql.clone();
+                    if let Some(deps) = minor_deps {
+                        n.depends_on = deps;
+                    }
                 }
                 if let Some(n) = minor.nodes.get_mut(frontier_id.clone()) {
                     n.query_text = pruned_sql.clone();

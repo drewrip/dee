@@ -35,6 +35,15 @@ pub enum CliHMPStrategy {
 // are written for whoever is reading the help rather than for whoever is
 // reading the source.
 #[derive(clap::ValueEnum, Clone, Debug)]
+pub enum CliTrialReuse {
+    /// Keep every relation the cancelled candidate finished that the incumbent
+    /// also has, and read its landing pads instead of recomputing them.
+    Equivalent,
+    /// Keep only relations whose node is defined identically in both DAGs.
+    Strict,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
 pub enum CliHmpCostMethod {
     /// Charge a view the region of its consumer's plan that reads the same
     /// base relations it does.
@@ -157,9 +166,13 @@ pub struct OptimizerArgs {
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
     pub trial_resume: Option<bool>,
     /// Fraction by which a candidate may overrun the best configuration before
-    /// it is cut short.
+    /// it is cut short. Zero (the default) stops it as soon as it can no longer
+    /// be faster than the incumbent.
     #[arg(long)]
     pub trial_budget_eps: Option<f64>,
+    /// How much of a cancelled candidate the resume may keep.
+    #[arg(long)]
+    pub trial_reuse: Option<CliTrialReuse>,
 }
 
 impl OptimizerArgs {
@@ -270,6 +283,13 @@ impl OptimizerArgs {
         set("profile_iterations", self.profile_iterations.map(|v| json!(v)));
         set("trial_resume", self.trial_resume.map(|v| json!(v)));
         set("trial_budget_eps", self.trial_budget_eps.map(|v| json!(v)));
+        set(
+            "trial_reuse",
+            self.trial_reuse.as_ref().map(|r| match r {
+                CliTrialReuse::Equivalent => json!("equivalent"),
+                CliTrialReuse::Strict => json!("strict"),
+            }),
+        );
 
         // The server refuses a path here, so only the log-the-table form is
         // reachable remotely: the flag chooses between `""` and off.

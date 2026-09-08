@@ -460,13 +460,31 @@ where
         }
         debug!("work_queue cleared");
 
-        // Abort all queued tasks and wait for them to finish. Simply dropping a
-        // JoinHandle detaches the task rather than cancelling it, so in-flight
-        // CREATE TABLE/VIEW statements would race whatever runs next --
-        // a cleanup, or the resume that reuses what this run built.
+        // Stop the SQL, then wait for it to have stopped.
+        //
+        // Both halves are load-bearing and neither is sufficient alone.
+        // `abort_all` only cancels a task at an await point, and the driver
+        // call that runs a node's query blocks without one -- so on its own it
+        // leaves the statement running and merely stops anyone listening.
+        // `interrupt_inflight` reaches past the task to the engine and makes
+        // the statement itself fail. Draining afterwards is what turns
+        // "signalled" into "stopped": until every task has returned, a
+        // `CREATE TABLE` may still be writing the very relation the caller is
+        // about to drop, reuse, or rebuild.
         let dirty = if stopped.is_some() {
+            let signalled = self.conn.interrupt_inflight().await;
+            debug!("SimpleEngine: interrupted {signalled} in-flight query(ies)");
             work_queue.abort_all();
-            while work_queue.join_next().await.is_some() {}
+            // Every task, to completion. A node that finished between the stop
+            // and the interrupt is still recorded, so nothing already built is
+            // thrown away.
+            while let Some(joined) = work_queue.join_next().await {
+                if let Ok(Ok((_, node_id, node))) = joined {
+                    in_progress.remove(&node_id);
+                    node_stats.insert(node_id.clone(), node);
+                    completed.insert(node_id);
+                }
+            }
             in_progress.clone()
         } else {
             HashSet::new()
@@ -930,6 +948,104 @@ mod tests {
             outcome.completed,
             HashSet::from(["a".to_string(), "b".to_string(), "c".to_string()])
         );
+    }
+
+    /// A DAG that is one very long query. Nothing to schedule around it, so the
+    /// only way to stop it is to stop the query itself.
+    fn one_slow_node() -> Dag {
+        let mut map = HashMap::new();
+        map.insert(
+            "slow".to_string(),
+            TransformNode {
+                id: "slow".to_string(),
+                // Big enough to take many seconds; the test asserts it does not.
+                query_text: "SELECT count(*) AS n FROM range(3000000000) t(i)".to_string(),
+                materialize: MaterializeMode::Table,
+                depends_on: HashSet::new(),
+                schema: None,
+            },
+        );
+        Dag {
+            db: "duckdb".to_string(),
+            nodes: Graph::new(map),
+            sources: Vec::new(),
+            max_parallelism: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_a_budget_actually_stops_a_long_running_query() {
+        // The property the whole cancel-and-resume mechanism rests on. Before
+        // the connector could interrupt, the budget only stopped *waiting* for
+        // the query: the statement ran to completion regardless, so the cap did
+        // not bind and the run overran by however long its longest node took.
+        let engine = engine().await;
+        let started = std::time::Instant::now();
+        let outcome = engine
+            .run_with(
+                &one_slow_node(),
+                RunOptions {
+                    budget: Some(Duration::from_millis(300)),
+                    cleanup_on_cancel: false,
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .expect("run");
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome.stopped, Some(StopReason::Budget));
+        assert!(
+            outcome.completed.is_empty(),
+            "the query cannot have finished in {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the budget did not bind: the run took {elapsed:?} against a 300ms budget, \
+             which means the query kept going after it was cancelled"
+        );
+        eprintln!("duckdb budget stop took {elapsed:?} against a 300ms budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_nothing_is_still_writing_once_a_stopped_run_returns() {
+        // "Signalled" is not "stopped". The caller drops and rebuilds relations
+        // immediately after this returns, so a statement still writing one
+        // would race that -- which is how a cancelled run corrupts the
+        // warehouse it was supposed to leave alone.
+        let engine = engine().await;
+        let outcome = engine
+            .run_with(
+                &one_slow_node(),
+                RunOptions {
+                    budget: Some(Duration::from_millis(300)),
+                    cleanup_on_cancel: false,
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .expect("run");
+        assert_eq!(outcome.stopped, Some(StopReason::Budget));
+
+        // Nothing is in flight any more, so the connector has nothing to
+        // interrupt. If a task were still running this would be non-zero.
+        assert_eq!(
+            engine.conn.interrupt_inflight().await,
+            0,
+            "a query was still running after the run returned"
+        );
+        // And the relation it was writing can be dropped and rebuilt without
+        // racing anything.
+        engine
+            .conn
+            .drop_relation(MaterializeMode::Table, "slow".into())
+            .await
+            .ok();
+        engine
+            .conn
+            .new_relation(MaterializeMode::Table, "slow".into(), "SELECT 1 AS n".into())
+            .await
+            .expect("the relation could not be rebuilt after the cancelled run");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

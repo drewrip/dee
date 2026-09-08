@@ -1,0 +1,57 @@
+# p09_gaming on Postgres at sf=1, under the pruned/paired ladder.
+#
+# Why this project: it is the clearest DuckDB result that is also tractable on
+# Postgres. On DuckDB it wins 2.03x at cap=1 (sf=4) -- the strongest win among
+# projects that are not p10_energy -- and at sf=1 it is the cheapest Postgres
+# DAG measured, ~27s a run. It is also the project the earlier stock-Postgres
+# probe (parallelism-pg-big) used, so search cost is directly comparable.
+#
+# What changed since that run: the structural prune, the observed prune, the
+# measured probe, and stopping after repeated failures. p09_gaming's DAG has a
+# maximum antichain of 5, so rung 8 is the uncapped DAG wearing a hat -- the
+# old ladder measured it anyway and "accepted" it as a win over the baseline it
+# actually was. The prune should drop it before any query runs.
+#
+# Ladder is the standard [1,2,4,8] rather than pg-big's [1,2,8]: this run
+# carries one more rung than the run it is compared against, so any reduction
+# in runs used is understated, not flattered.
+#
+# Postgres here is on the raised settings (shared_buffers=4GB, work_mem=256MB,
+# max_parallel_workers=12, per_gather=6), not the stock config pg-big ran on.
+# Wall times are therefore not comparable across the two runs; runs-used is.
+name: parallelism-pg-gaming
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/parallelism-pg-gaming
+verbosity: detailed
+
+matrix:
+  project: [p09_gaming]
+  backend: [postgres]
+  sf: [1]
+  variant: [unopt, parallelism]
+
+variants:
+  unopt:       {passes: []}
+  parallelism: {passes: [parallelism]}
+
+dee_opt:
+  parallelism_ladder: [[1, 2, 4, 8]]
+  parallelism_seed_repeats: 2
+  parallelism_confirm_runs: 1
+
+backends:
+  postgres:
+    provider: external
+    host: 127.0.0.1
+    port: 5432
+    user: runner
+    password: password
+    dbname: benchmark
+    num_connections: 16
+
+execution:
+  repetitions: 3
+  warmups: 1
+  sample_interval_ms: 200
+  timeout_s: 3600

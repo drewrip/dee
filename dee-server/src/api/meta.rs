@@ -144,7 +144,16 @@ pub async fn optimizer_options() -> Json<Vec<OptimizerOption>> {
             passes: &["hmp", "omp", "parallelism"], choices: None,
             default: json!(d.trial_budget_eps),
             doc: "Fraction by which a candidate may overrun the best configuration before it \
-                  is cut short." },
+                  is cut short. Zero (the default) stops a candidate the moment it can no \
+                  longer be faster than the incumbent." },
+        OptimizerOption { name: "trial_reuse", flag: "--trial-reuse", kind: "str",
+            passes: &["hmp", "omp", "parallelism"], choices: Some(&["equivalent", "strict"]),
+            default: json!(d.trial_reuse),
+            doc: "How much of a cancelled candidate the resume keeps. `equivalent` relies on \
+                  every DAG dee produces holding the same tuples as the one it came from, so a \
+                  finished relation is reusable whenever the incumbent has a node of that name, \
+                  and the candidate's landing pads are read rather than recomputed. `strict` \
+                  keeps only identically-defined nodes." },
         OptimizerOption { name: "profile_iterations", flag: "--profile-iterations", kind: "bool",
             passes: &["hmp", "omp", "parallelism"], choices: None, default: json!(d.profile_iterations),
             doc: "Capture a resource timeseries for every candidate run." },

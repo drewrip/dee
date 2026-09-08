@@ -4,11 +4,20 @@ use crate::{
 };
 use async_trait::async_trait;
 use duckdb::arrow::datatypes::SchemaRef;
-use duckdb::{Config, DuckdbConnectionManager, params};
+use duckdb::{Config, DuckdbConnectionManager, InterruptHandle, params};
 use log::{info, trace};
 use r2d2::Pool;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, process::Command, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    process::Command,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tempfile;
 
@@ -129,8 +138,58 @@ impl DuckDBConfig {
     }
 }
 
+/// How long to wait for interrupted statements to actually stop before giving
+/// up and saying so. Generous: the alternative to waiting is letting a caller
+/// drop a relation another statement is still writing.
+const INTERRUPT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct DuckDBConnection {
     pub pool: Pool<DuckdbConnectionManager>,
+    /// Interrupt handles for the queries currently executing on this
+    /// connector, keyed by an arbitrary ticket.
+    ///
+    /// Cancelling a DAG means cancelling the SQL, not just dropping the future
+    /// that is waiting on it. DuckDB's driver call is blocking and contains no
+    /// await point, so aborting the task cannot stop it -- the statement runs
+    /// to completion regardless, and anything that then drops or rebuilds the
+    /// relation races a write that is still in progress. An interrupt handle is
+    /// the only thing that actually stops the query, so every statement that
+    /// builds a relation registers one for as long as it runs.
+    inflight: Arc<Mutex<HashMap<u64, Arc<InterruptHandle>>>>,
+    next_ticket: Arc<AtomicU64>,
+}
+
+/// Registers an interrupt handle for as long as it is alive, so a query is
+/// always deregistered on the way out -- including when it fails, and including
+/// when it is the interrupt itself that made it fail.
+struct Inflight {
+    registry: Arc<Mutex<HashMap<u64, Arc<InterruptHandle>>>>,
+    ticket: u64,
+}
+
+impl Inflight {
+    fn register(
+        registry: &Arc<Mutex<HashMap<u64, Arc<InterruptHandle>>>>,
+        next: &Arc<AtomicU64>,
+        handle: Arc<InterruptHandle>,
+    ) -> Self {
+        let ticket = next.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut g) = registry.lock() {
+            g.insert(ticket, handle);
+        }
+        Self {
+            registry: Arc::clone(registry),
+            ticket,
+        }
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.registry.lock() {
+            g.remove(&self.ticket);
+        }
+    }
 }
 
 fn materialize_mode_in_duckdb(mode: MaterializeMode) -> String {
@@ -225,6 +284,35 @@ fn rows_written_from_plan(json_str: &str) -> Option<usize> {
     find(&serde_json::from_str::<serde_json::Value>(json_str).ok()?)
 }
 
+impl DuckDBConnection {
+    /// Run `f` on a blocking pool thread with the connection's interrupt handle
+    /// registered for the duration.
+    ///
+    /// Two things this buys, and both are required for a cancellable DAG:
+    /// the runtime keeps its workers, and [`interrupt_inflight`] has something
+    /// to interrupt. The handle is deregistered by `Inflight`'s `Drop`, so a
+    /// query that fails -- including one the interrupt killed -- still cleans
+    /// up after itself.
+    async fn blocking<F, R>(&self, f: F) -> Result<R, ConnectorError>
+    where
+        F: FnOnce(&duckdb::Connection) -> Result<R, ConnectorError> + Send + 'static,
+        R: Send + 'static,
+    {
+        let pool = self.pool.clone();
+        let registry = Arc::clone(&self.inflight);
+        let next = Arc::clone(&self.next_ticket);
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get().map_err(|_| {
+                ConnectorError::Execute("didn't get connection from pool".to_string())
+            })?;
+            let _guard = Inflight::register(&registry, &next, conn.interrupt_handle());
+            f(&conn)
+        })
+        .await
+        .map_err(|e| ConnectorError::Execute(format!("blocking task failed: {e}")))?
+    }
+}
+
 #[async_trait]
 impl Connector for DuckDBConnection {
     type Config = DuckDBConfig;
@@ -268,17 +356,62 @@ impl Connector for DuckDBConnection {
             })?;
         }
 
-        Ok(Arc::new(Self { pool }))
+        Ok(Arc::new(Self {
+            pool,
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+            next_ticket: Arc::new(AtomicU64::new(0)),
+        }))
     }
 
     async fn execute(&self, query_text: String) -> Result<usize, ConnectorError> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
-        conn.execute(&query_text.clone(), params![]).map_err(|e| {
-            ConnectorError::Execute(format!("{} - query_text:\n{}", e.to_string(), query_text))
+        // On a blocking pool thread rather than inline: the driver call blocks
+        // with no await inside it, so running it on a runtime worker both
+        // starves the runtime and makes the task impossible to cancel.
+        self.blocking(move |conn| {
+            conn.execute(&query_text.clone(), params![]).map_err(|e| {
+                ConnectorError::Execute(format!("{} - query_text:\n{}", e, query_text))
+            })
         })
+        .await
+    }
+
+    async fn interrupt_inflight(&self) -> usize {
+        let snapshot = || -> Vec<Arc<InterruptHandle>> {
+            match self.inflight.lock() {
+                Ok(g) => g.values().cloned().collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let signalled = snapshot().len();
+        if signalled == 0 {
+            return 0;
+        }
+
+        // Signal, then wait for the statements to unwind. The task that issued
+        // one may already have been aborted while the query itself is still
+        // running on a blocking thread, so the registry -- not the task set --
+        // is what says whether the engine is quiet. Re-signal each round: a
+        // statement can start between the snapshot and the interrupt.
+        let deadline = std::time::Instant::now() + INTERRUPT_QUIESCE_TIMEOUT;
+        loop {
+            let handles = snapshot();
+            if handles.is_empty() {
+                return signalled;
+            }
+            for h in &handles {
+                h.interrupt();
+            }
+            if std::time::Instant::now() >= deadline {
+                log::warn!(
+                    "{} query(ies) still running {:?} after being interrupted; \
+                     giving up waiting for them",
+                    handles.len(),
+                    INTERRUPT_QUIESCE_TIMEOUT
+                );
+                return signalled;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn new_relation(
@@ -302,12 +435,7 @@ impl Connector for DuckDBConnection {
         name: String,
         query_text: String,
     ) -> Result<(usize, Option<String>), ConnectorError> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
-
-        match relation_type {
+        self.blocking(move |conn| match relation_type {
             MaterializeMode::View => {
                 let explain_query = format!("EXPLAIN (FORMAT JSON) {}", query_text);
                 let mut stmt = conn.prepare(&explain_query).map_err(|e| {
@@ -390,7 +518,8 @@ impl Connector for DuckDBConnection {
 
                 Ok((rows_written, Some(json_str)))
             }
-        }
+        })
+        .await
     }
 
     async fn drop_relation(

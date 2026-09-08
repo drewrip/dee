@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use polyglot_sql::dialects::DialectType;
+use polyglot_sql::{dialects::DialectType, expressions::Expression};
 
 use crate::{
     dag::{Dag, MaterializeMode, TransformNode},
@@ -17,15 +17,21 @@ use crate::{
 /// [`DialectType::DuckDB`] when the dialect is unknown or empty, because
 /// DuckDB is the primary target engine and its dialect is the safest default.
 /// Fraction by which a trial may overrun the best configuration known before it
-/// is worth abandoning.
+/// is abandoned. **Zero: a trial is stopped the moment it stops being able to
+/// win.**
 ///
-/// A candidate already slower than the best known setting needs no exact
-/// runtime to be rejected, so there is nothing to learn from letting it
-/// finish -- only a censored observation ("at least this bad"), which is all
-/// the acceptance tests consume. Shared by every search that budgets a trial,
-/// so that "how much worse a run may get" is one number rather than one per
-/// pass.
-pub const DEFAULT_BUDGET_EPS: f64 = 0.25;
+/// The acceptance tests ask one question -- is this candidate faster than the
+/// incumbent? Once a trial's elapsed time reaches the incumbent's, the answer
+/// is already no, and every further second buys a more precise measurement of
+/// a configuration that has been rejected either way. So the budget is exactly
+/// the incumbent, and the slack that used to sit on top of it is gone.
+///
+/// The cost of the slack was not the slack itself: a cancelled run is charged
+/// the budget *plus* the resume that finishes it, so widening the budget widens
+/// the worst delivered run twice over. Shared by every search that budgets a
+/// trial, so "how long may a losing candidate run" is one number rather than
+/// one per pass.
+pub const DEFAULT_BUDGET_EPS: f64 = 0.0;
 
 pub fn dialect_for_db(db: &str) -> DialectType {
     match db.to_lowercase().as_str() {
@@ -37,6 +43,170 @@ pub fn dialect_for_db(db: &str) -> DialectType {
         "default" => DialectType::Generic,
         _ => DialectType::DuckDB,
     }
+}
+
+// ---------------------------------------------------------------------------
+// AST-level reference rewriting
+//
+// Shared by `make_temp` and the pushdown pass. Both need to substitute one
+// relation reference for another inside a query, and both need it to happen on
+// the parsed AST rather than the raw text: a plain `str::replace` will happily
+// rewrite `WHERE env = 'staging'` into a comparison against a table name, or
+// corrupt a longer identifier that merely contains the node's name, and hand
+// the engine a query that means something else entirely.
+// ---------------------------------------------------------------------------
+
+/// Extract the bare (unquoted, unqualified) table name from a node ID that may
+/// be a one-, two-, or three-part quoted identifier such as
+/// `"warehouse"."main"."stg_accounts"`.
+pub(crate) fn bare_table_name(node_id: &str) -> String {
+    node_id
+        .split('.')
+        .last()
+        .unwrap_or(node_id)
+        .trim_matches('"')
+        .to_string()
+}
+
+/// `true` if `table` is a reference to the DAG node `node_id`.
+///
+/// Node IDs can be one-, two-, or three-part quoted identifiers such as
+/// `"warehouse"."main"."stg_orders"`. Matching compares from the right and
+/// only on the parts both sides actually spell out, so an unqualified
+/// `stg_orders` in a query matches the node, while a *different* schema's
+/// `"warehouse"."raw"."stg_orders"` does not.
+pub(crate) fn table_ref_matches(table: &polyglot_sql::expressions::TableRef, node_id: &str) -> bool {
+    let parts: Vec<&str> = node_id.split('.').map(|p| p.trim_matches('"')).collect();
+    let Some(name) = parts.last() else {
+        return false;
+    };
+    if !table.name.name.eq_ignore_ascii_case(name) {
+        return false;
+    }
+    let qualifiers: Vec<&str> = parts[..parts.len() - 1].to_vec();
+    let refs: Vec<&str> = [table.catalog.as_ref(), table.schema.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|i| i.name.as_str())
+        .collect();
+    // Compare the qualifiers both sides spell out, right-aligned.
+    for (r, q) in refs.iter().rev().zip(qualifiers.iter().rev()) {
+        if !r.eq_ignore_ascii_case(q) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Rewrite every reference to a DAG node in `sql` to the name it is
+/// materialized under for analysis, at the AST level.
+///
+/// `mapping` is keyed by node ID. Matching happens on parsed table
+/// references (see [`table_ref_matches`]), so a node ID that also occurs as a
+/// substring of a string literal, a column name, or a longer identifier is
+/// left alone — unlike the plain `str::replace` this replaced, which would
+/// happily rewrite `WHERE env = 'staging'` into a comparison against a
+/// scratch table name and hand the connector a query that means something
+/// else entirely.
+///
+/// Returns `None` if `sql` doesn't parse or can't be regenerated; callers
+/// fall back to textual substitution, which is what this did before.
+pub(crate) fn rewrite_node_refs(
+    sql: &str,
+    mapping: &HashMap<String, String>,
+    dialect: DialectType,
+) -> Option<String> {
+    let parsed = polyglot_sql::parse_one(sql, dialect).ok()?;
+    let rewritten = polyglot_sql::traversal::transform(parsed, &|node| {
+        let Expression::Table(table) = &node else {
+            return Ok(Some(node));
+        };
+        let Some((_, new_name)) = mapping
+            .iter()
+            .find(|(node_id, _)| table_ref_matches(table, node_id))
+        else {
+            return Ok(Some(node));
+        };
+        let mut table = table.clone();
+        table.name = polyglot_sql::expressions::Identifier::new(new_name.clone());
+        table.schema = None;
+        table.catalog = None;
+        Ok(Some(Expression::Table(table)))
+    })
+    .ok()?;
+    polyglot_sql::generate(&rewritten, dialect).ok()
+}
+
+/// Inline `view_sql` (the query text of `view_id`) into `table_sql` by
+/// replacing every AST-level table reference to `view_id` with a
+/// parenthesized, aliased subquery wrapping `view_sql` — the AST-based
+/// counterpart of a plain `str::replace`.
+///
+/// Operating on the parsed AST (rather than raw substring substitution)
+/// avoids matching `view_id`'s name where it merely appears as a substring
+/// of an unrelated, longer identifier, and lets the original table's alias
+/// (or, if it had none, its own name — so any qualified column references
+/// elsewhere in the query keep resolving) carry over onto the new subquery
+/// precisely, rather than by accident of leftover trailing text.
+///
+/// Every occurrence of `view_id` in `table_sql` is replaced (matching
+/// `str::replace`'s multi-occurrence behavior for self-joins etc.), each
+/// getting its own independent copy of `view_sql`'s AST.
+///
+/// Returns `None` if `table_sql` or `view_sql` doesn't parse, if
+/// regenerating the rewritten AST fails, or if `view_id` was not found
+/// anywhere in `table_sql` — callers fall back to plain string substitution
+/// in all of those cases.
+pub(crate) fn inline_view_ast(
+    table_sql: &str,
+    view_id: &str,
+    view_sql: &str,
+    dialect: DialectType,
+) -> Option<String> {
+    let bare_view = bare_table_name(view_id);
+    let table_expr = polyglot_sql::parse_one(table_sql, dialect).ok()?;
+    let view_expr = polyglot_sql::parse_one(view_sql, dialect).ok()?;
+
+    let replaced_any = std::cell::Cell::new(false);
+    let rewritten = polyglot_sql::traversal::transform(table_expr, &|node| {
+        let Expression::Table(t) = &node else {
+            return Ok(Some(node));
+        };
+        if !table_ref_matches(t, view_id) {
+            return Ok(Some(node));
+        }
+        replaced_any.set(true);
+        let alias = t
+            .alias
+            .clone()
+            .unwrap_or_else(|| polyglot_sql::expressions::Identifier::new(bare_view.clone()));
+        Ok(Some(Expression::Subquery(Box::new(
+            polyglot_sql::expressions::Subquery {
+                this: view_expr.clone(),
+                alias: Some(alias),
+                column_aliases: t.column_aliases.clone(),
+                alias_explicit_as: t.alias_explicit_as,
+                alias_keyword: None,
+                order_by: None,
+                limit: None,
+                offset: None,
+                distribute_by: None,
+                sort_by: None,
+                cluster_by: None,
+                lateral: false,
+                modifiers_inside: true,
+                trailing_comments: vec![],
+                inferred_type: None,
+            },
+        ))))
+    })
+    .ok()?;
+
+    if !replaced_any.get() {
+        return None;
+    }
+
+    polyglot_sql::generate(&rewritten, dialect).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -67,12 +237,30 @@ pub fn dialect_for_db(db: &str) -> DialectType {
 ///
 /// Returns the name of the created landing-pad node.
 pub fn make_temp(dag: &mut Dag, view_name: &str) -> Result<String, OptimizerError> {
+    let dialect = dialect_for_db(&dag.db);
+    let lp_name = landing_pad_name(view_name);
+
+    // Already promoted. Re-running would be actively destructive rather than
+    // merely redundant: the pad is now a TempTable child of the view, so it is
+    // itself the whole materialized frontier, and the rebase below would
+    // repoint the pad at *itself* -- a relation that reads itself, and a cycle
+    // in a graph whose topological sort gives up silently on one.
+    //
+    // Reachable in ordinary use: HMP and OMP both step the same working DAG,
+    // and they routinely rank the same hot view first.
+    if dag
+        .nodes
+        .get(lp_name.clone())
+        .is_some_and(|lp| lp.depends_on.contains(view_name))
+    {
+        return Ok(lp_name);
+    }
+
     // 2. Compute the materialization frontier BEFORE inserting the landing pad,
     //    so lp itself is not included in the frontier set.
     let frontier: HashSet<String> = dag.nodes.frontier_materializes(view_name);
 
     // 1. Create the landing-pad TempTable, named after the node it backs.
-    let lp_name = landing_pad_name(view_name);
 
     let mut lp_deps = HashSet::new();
     lp_deps.insert(view_name.to_string());
@@ -132,10 +320,21 @@ pub fn make_temp(dag: &mut Dag, view_name: &str) -> Result<String, OptimizerErro
                         OptimizerError::Exec(format!("make_temp: node '{m_id}' not found"))
                     })?;
 
-                    // Substitute the view name with an inline subquery.
-                    m_node.query_text = m_node
-                        .query_text
-                        .replace(v_id.as_str(), &format!("({view_sql})"));
+                    // Substitute the view name with an inline subquery, on the
+                    // AST. A plain `str::replace` here corrupts a name that
+                    // occurs inside a string literal, a column alias, or a
+                    // longer identifier, and drops the alias the subquery needs
+                    // for qualified column references to keep resolving.
+                    match inline_view_ast(&m_node.query_text, &v_id, &view_sql, dialect) {
+                        Some(rewritten) => m_node.query_text = rewritten,
+                        None => {
+                            return Err(OptimizerError::Exec(format!(
+                                "make_temp: could not inline view '{v_id}' into '{m_id}' at the \
+                                 AST level; refusing to fall back to text substitution, which \
+                                 would silently change what the query means"
+                            )));
+                        }
+                    }
                     m_node.depends_on.remove(&v_id);
                     for dep in view_deps {
                         m_node.depends_on.insert(dep);
@@ -150,7 +349,17 @@ pub fn make_temp(dag: &mut Dag, view_name: &str) -> Result<String, OptimizerErro
             .get_mut(m_id.clone())
             .ok_or_else(|| OptimizerError::Exec(format!("make_temp: node '{m_id}' not found")))?;
 
-        m_node.query_text = m_node.query_text.replace(view_name, &lp_name);
+        // Rename the reference on the AST, for the same reason as above.
+        let mapping = HashMap::from([(view_name.to_string(), lp_name.clone())]);
+        match rewrite_node_refs(&m_node.query_text, &mapping, dialect) {
+            Some(rewritten) => m_node.query_text = rewritten,
+            None => {
+                return Err(OptimizerError::Exec(format!(
+                    "make_temp: could not repoint '{m_id}' from '{view_name}' to '{lp_name}' at \
+                     the AST level; refusing to fall back to text substitution"
+                )));
+            }
+        }
         if m_node.depends_on.remove(view_name) {
             m_node.depends_on.insert(lp_name.clone());
         }
@@ -243,6 +452,141 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             schema: None,
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // The rebase must preserve what each consumer means.
+    //
+    // Every one of these corrupted the consumer under the old `str::replace`,
+    // and a corrupted consumer is not merely a mis-measured candidate: the
+    // resume reuses relations across DAGs on the strength of dee's rewrites
+    // being correctness-preserving, so a rewrite that changes meaning is a
+    // delivered-data bug.
+    // ---------------------------------------------------------------------
+
+    /// `orders` is the promoted view; the consumer also reads a relation whose
+    /// name merely *contains* it.
+    #[test]
+    fn test_rebase_does_not_touch_a_longer_identifier() {
+        let mut dag = make_dag(vec![
+            node("orders", MaterializeMode::View, &[], "SELECT * FROM raw"),
+            node(
+                "m",
+                MaterializeMode::Table,
+                &["orders"],
+                "SELECT o.id FROM orders o JOIN orders_summary s ON s.id = o.id",
+            ),
+        ]);
+        make_temp(&mut dag, "orders").unwrap();
+        let sql = dag.nodes.get("m".to_string()).unwrap().query_text.clone();
+        assert!(
+            sql.contains("orders_summary"),
+            "the unrelated relation was renamed: {sql}"
+        );
+        assert!(
+            !sql.contains("lp_orders_summary"),
+            "a longer identifier was corrupted: {sql}"
+        );
+        assert!(sql.contains("lp_orders"), "the reference was not repointed: {sql}");
+    }
+
+    /// The name appears inside a string literal, where it is data, not a
+    /// relation.
+    #[test]
+    fn test_rebase_does_not_touch_a_string_literal() {
+        let mut dag = make_dag(vec![
+            node("orders", MaterializeMode::View, &[], "SELECT * FROM raw"),
+            node(
+                "m",
+                MaterializeMode::Table,
+                &["orders"],
+                "SELECT count(*) AS n FROM orders WHERE src = 'orders'",
+            ),
+        ]);
+        make_temp(&mut dag, "orders").unwrap();
+        let sql = dag.nodes.get("m".to_string()).unwrap().query_text.clone();
+        assert!(
+            sql.contains("'orders'"),
+            "a string literal was rewritten, silently changing which rows match: {sql}"
+        );
+    }
+
+    /// The name appears as an output column alias, which is part of this
+    /// relation's contract with everything downstream.
+    #[test]
+    fn test_rebase_does_not_rename_an_output_column() {
+        let mut dag = make_dag(vec![
+            node("orders", MaterializeMode::View, &[], "SELECT * FROM raw"),
+            node(
+                "m",
+                MaterializeMode::Table,
+                &["orders"],
+                "SELECT id AS orders FROM orders",
+            ),
+        ]);
+        make_temp(&mut dag, "orders").unwrap();
+        let sql = dag.nodes.get("m".to_string()).unwrap().query_text.clone();
+        assert!(
+            !sql.contains("AS lp_orders") && !sql.contains("as lp_orders"),
+            "the output column was renamed, changing the relation's schema: {sql}"
+        );
+    }
+
+    /// An inlined view must keep the name the consumer's qualified references
+    /// resolve against, or every `v1.x` in the consumer dangles.
+    #[test]
+    fn test_inlining_an_intermediate_view_keeps_its_alias() {
+        let mut dag = make_dag(vec![
+            node("base", MaterializeMode::View, &[], "SELECT id, amt FROM raw"),
+            node(
+                "v1",
+                MaterializeMode::View,
+                &["base"],
+                "SELECT id, amt FROM base",
+            ),
+            node(
+                "m",
+                MaterializeMode::Table,
+                &["v1"],
+                "SELECT v1.id, v1.amt FROM v1",
+            ),
+        ]);
+        make_temp(&mut dag, "base").unwrap();
+        let sql = dag.nodes.get("m".to_string()).unwrap().query_text.clone();
+        assert!(
+            sql.contains("v1"),
+            "the inlined subquery lost the alias that `v1.id` resolves against: {sql}"
+        );
+        assert!(sql.contains("lp_base"), "the pad was not wired in: {sql}");
+    }
+
+    /// Applying the same promotion twice must not build a relation that reads
+    /// itself. Reachable whenever two passes rank the same hot view first.
+    #[test]
+    fn test_make_temp_twice_leaves_no_self_loop() {
+        let mut dag = make_dag(vec![
+            node("v", MaterializeMode::View, &[], "SELECT * FROM raw"),
+            node("m", MaterializeMode::Table, &["v"], "SELECT * FROM v"),
+        ]);
+        make_temp(&mut dag, "v").unwrap();
+        make_temp(&mut dag, "v").unwrap();
+
+        let lp = dag.nodes.get("lp_v".to_string()).unwrap();
+        assert!(
+            !lp.depends_on.contains("lp_v"),
+            "the pad depends on itself: {:?}",
+            lp.depends_on
+        );
+        assert!(
+            !lp.query_text.contains("lp_v"),
+            "the pad reads itself: {}",
+            lp.query_text
+        );
+        assert!(
+            lp.depends_on.contains("v"),
+            "the pad stopped backing its view: {:?}",
+            lp.depends_on
+        );
     }
 
     // Layout: n (View) --> m (Table)

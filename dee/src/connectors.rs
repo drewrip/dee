@@ -45,6 +45,23 @@ pub trait Connector {
 
     async fn execute(&self, query_text: String) -> Result<usize, ConnectorError>;
 
+    /// Stop the queries this connector currently has in flight, returning how
+    /// many were signalled.
+    ///
+    /// Cancelling a DAG means cancelling the SQL. Dropping or aborting the task
+    /// that awaits a query does not stop the engine executing it: the driver
+    /// call blocks, and the statement runs to completion regardless. Anything
+    /// that then drops or rebuilds the relation races a write still in flight,
+    /// which is how a cancelled run corrupts the warehouse it was supposed to
+    /// leave alone.
+    ///
+    /// **When this returns, nothing is executing.** Signalling alone is not
+    /// enough: the task that issued a statement can be aborted while the
+    /// statement itself is still unwinding, so this signals and then waits for
+    /// the engine to actually go quiet, re-signalling as it waits. Callers rely
+    /// on that to drop and rebuild those relations safely.
+    async fn interrupt_inflight(&self) -> usize;
+
     async fn new_relation(
         &self,
         relation_type: MaterializeMode,
