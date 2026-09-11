@@ -1214,19 +1214,29 @@ where
         // explains an otherwise inexplicable ranking, and reading it off a plan
         // by hand is not practical.
         if log::log_enabled!(log::Level::Debug) {
-            let mut consts: Vec<(&String, f64, f64, u64)> = model
+            let mut consts: Vec<(&String, f64, f64, f64, u64)> = model
                 .operators()
                 .filter_map(|(k, o)| {
-                    Some((k, o.seconds_per_byte()?, o.bytes_per_tuple()?, o.seconds_per_byte_n))
+                    Some((
+                        k,
+                        o.seconds_per_byte()?,
+                        o.unweighted_seconds_per_byte()?,
+                        o.bytes_per_tuple()?,
+                        o.seconds_per_byte_n,
+                    ))
                 })
                 .collect();
             consts.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             debug!(
-                "HMPPass learned constants (mean {:.4e} s/byte):",
+                "HMPPass learned constants (weighted mean {:.4e} s/byte):",
                 model.mean_seconds_per_byte().unwrap_or(0.0)
             );
-            for (key, spb, bytes_per_tuple, n) in &consts {
-                debug!("  {key:<48} {spb:>11.4e} s/byte  {bytes_per_tuple:>8.1} bytes/tuple  n={n}");
+            // Both means, because the gap between them is how much one small
+            // observation was distorting the constant.
+            for (key, spb, plain, bytes_per_tuple, n) in &consts {
+                debug!(
+                    "  {key:<44} {spb:>11.4e} s/byte  (unweighted {plain:>11.4e})                       {bytes_per_tuple:>8.1} bytes/tuple  n={n}"
+                );
             }
         }
 

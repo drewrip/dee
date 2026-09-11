@@ -23,14 +23,20 @@
 //! # Aggregating repeat observations
 //!
 //! An operator type is seen many times, and each sighting gives its own
-//! seconds-per-byte. They are combined with a plain mean: every observation
-//! counts once, regardless of how many bytes it moved. That is deliberately the
-//! simplest choice and not obviously the right one --- an unweighted mean lets a
-//! single-row operator, where fixed per-call overhead dwarfs anything
-//! proportional to bytes, pull the constant as hard as a scan of a million
-//! rows. [`OperatorSamples`] keeps the byte and second totals separately so a
-//! byte-weighted mean can be fitted from the same stored state later without
-//! re-collecting anything.
+//! seconds-per-byte. They are combined **weighted by bytes**: total seconds
+//! over total bytes, so an observation counts in proportion to the work it
+//! actually represents.
+//!
+//! The unweighted mean of the ratios was tried first and is kept alongside as
+//! [`OperatorSamples::unweighted_seconds_per_byte`], because the difference
+//! between them is not academic. On p03_ecommerce a single `HASH_GROUP_BY`
+//! whose output was small enough that fixed per-call overhead dwarfed anything
+//! proportional to bytes measured 1.6e-4 s/byte --- a hundred thousand times a
+//! hash join's 6.2e-10. Counted once, it set the constant for its whole
+//! operator type, and multiplied by a 6.9M-row view it priced that view at
+//! 13,199 seconds on a DAG that runs in three. Weighting by bytes puts that
+//! same sighting where it belongs: it moved a few hundred bytes, so it moves
+//! the constant by a few hundred bytes' worth.
 
 use std::collections::HashMap;
 
@@ -62,8 +68,19 @@ pub struct OperatorSamples {
 }
 
 impl OperatorSamples {
-    /// The mean of the per-observation seconds-per-byte ratios.
+    /// Total seconds over total bytes: the byte-weighted constant.
+    ///
+    /// This is what prices a plan. A sighting counts for as much as the work it
+    /// did, so an operator called once on a handful of bytes cannot outvote a
+    /// scan of a million rows.
     pub fn seconds_per_byte(&self) -> Option<f64> {
+        (self.bytes_total > 0.0).then(|| self.seconds_total / self.bytes_total)
+    }
+
+    /// The plain mean of the per-observation ratios, every sighting counting
+    /// once. Not used to price anything; kept because it is the obvious
+    /// alternative and the two are worth comparing on a real DAG.
+    pub fn unweighted_seconds_per_byte(&self) -> Option<f64> {
         (self.seconds_per_byte_n > 0)
             .then(|| self.seconds_per_byte_sum / self.seconds_per_byte_n as f64)
     }
@@ -162,12 +179,19 @@ impl LearnedCostModel {
             .or_else(|| self.mean_seconds_per_byte())
     }
 
-    /// The mean seconds-per-byte over every observation of every operator type.
+    /// The byte-weighted seconds-per-byte over every operator type: the whole
+    /// model's total seconds over its total bytes.
+    ///
+    /// Weighted for the same reason the per-operator constant is, and more
+    /// urgently --- this is the fallback an operator type nobody has ever seen
+    /// gets priced at, so one wild observation anywhere would otherwise set the
+    /// price of everything unknown.
     pub fn mean_seconds_per_byte(&self) -> Option<f64> {
-        let (sum, n) = self.ops.values().fold((0.0, 0u64), |(s, n), o| {
-            (s + o.seconds_per_byte_sum, n + o.seconds_per_byte_n)
-        });
-        (n > 0).then(|| sum / n as f64)
+        let (seconds, bytes) = self
+            .ops
+            .values()
+            .fold((0.0, 0.0), |(s, b), o| (s + o.seconds_total, b + o.bytes_total));
+        (bytes > 0.0).then(|| seconds / bytes)
     }
 
     /// The mean output tuple width over every observation of every operator
@@ -276,9 +300,10 @@ mod tests {
     }
 
     #[test]
-    fn repeat_observations_of_an_operator_are_averaged() {
+    fn repeat_observations_of_an_operator_are_combined() {
         let mut model = LearnedCostModel::new();
-        // 100 bytes in 1s, then 100 bytes in 3s: 0.01 and 0.03 s/byte.
+        // 100 bytes in 1s, then 100 bytes in 3s: 0.01 and 0.03 s/byte. Equal
+        // byte counts, so weighting changes nothing and both means agree.
         for seconds in [1.0, 3.0] {
             let json = format!(
                 r#"{{"operator_name":"FILTER","operator_timing":{seconds},
@@ -288,6 +313,37 @@ mod tests {
             model.observe(&parse_duckdb_plan(&json).unwrap());
         }
         assert!((model.seconds_per_byte("FILTER").unwrap() - 0.02).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_tiny_observation_cannot_outvote_a_large_one() {
+        // The p03 failure in miniature. One call on 100 bytes that took 1s --
+        // fixed overhead, nothing to do with bytes -- against a million bytes in
+        // 1s. Counted once each the constant would be ~5e-3 s/byte, set almost
+        // entirely by the operator that moved a thousandth of the bytes.
+        let mut model = LearnedCostModel::new();
+        for (seconds, rows, bytes) in [(1.0, 10u64, 100u64), (1.0, 100_000u64, 1_000_000u64)] {
+            let json = format!(
+                r#"{{"operator_name":"HASH_GROUP_BY","operator_timing":{seconds},
+                     "operator_cardinality":{rows},"result_set_size":{bytes},
+                     "extra_info":{{"Aggregates":["sum(#1)"]}},"children":[]}}"#
+            );
+            model.observe(&parse_duckdb_plan(&json).unwrap());
+        }
+
+        let key = "HASH_GROUP_BY[sum]";
+        // Weighted: 2 seconds over 1,000,100 bytes.
+        let weighted = model.seconds_per_byte(key).unwrap();
+        assert!((weighted - 2.0 / 1_000_100.0).abs() < 1e-15, "was {weighted}");
+        // Unweighted: (0.01 + 0.000001) / 2, ~2500x larger, and the reason the
+        // p03 ranking put 13,199 seconds on a three-second DAG.
+        let unweighted = model
+            .ops
+            .get(key)
+            .unwrap()
+            .unweighted_seconds_per_byte()
+            .unwrap();
+        assert!(unweighted > weighted * 2000.0, "unweighted was {unweighted}");
     }
 
     #[test]

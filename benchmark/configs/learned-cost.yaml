@@ -1,18 +1,22 @@
-# Quick check that the `learned_cost` method drives a real HMP search.
+# Does the `learned_cost` method drive a real HMP search?
 #
-# One cell: DuckDB, p03_ecommerce at sf=1, twelve DAG runs of budget. The point
-# is the search trace -- does the runtime actually come down as HMP spends its
-# budget on the candidates the learned seconds-per-byte constants ranked first.
+# Two cells: DuckDB at sf=1 on p03_ecommerce and p05_hr, twelve DAG runs of
+# budget each. The point is the search trace -- does the runtime come down as
+# HMP spends its budget on the candidates the learned seconds-per-byte constants
+# ranked first.
 #
-#   dee-bench run -c configs/learned-cost-p03.yaml
-name: learned-cost-p03
+# Run with `RUST_LOG=dee::opt::hmp=debug` to get the fitted constants and the
+# ranking's cumulative share into `server.log`; they are what explain the trace.
+#
+#   dee-bench run -c configs/learned-cost.yaml
+name: learned-cost
 dag_bench: ${DAG_BENCH}
-dee_bin: /Users/aripberg/dee/target/release/dee
-output_dir: ../results/learned-cost-p03
+dee_bin: ../../target/release/dee
+output_dir: ../results/learned-cost
 verbosity: detailed
 
 matrix:
-  project: [p03_ecommerce]
+  project: [p03_ecommerce, p05_hr]
   backend: [duckdb]
   sf: [1]
   variant: [learned_cost]
