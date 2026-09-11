@@ -89,13 +89,21 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
                choices=("breadth", "greedy"),
                doc="HMP's search strategy over the candidate ranking."),
     DeeOptSpec("hmp_cost_method", "--hmp-cost-method", "str", frozenset({"hmp"}),
-               choices=("leafset", "signature", "node_time", "learned_cost"),
+               choices=("leafset", "signature", "node_time", "learned_cost", "dup_attribution"),
                doc="How HMP reads a View's cost off a run's plans. `leafset` matches a View "
                    "against the region of a consumer's plan whose scanned base relations are "
                    "still contained in the View's own; `signature` matches operators between "
                    "plans by name and estimated cardinality; `learned_cost` prices the View's "
                    "own plan with per-operator seconds-per-byte constants fitted to the "
-                   "EXPLAIN ANALYZE plans of every CREATE TABLE run so far."),
+                   "EXPLAIN ANALYZE plans of every CREATE TABLE run so far; `dup_attribution` "
+                   "inlines the View into each consumer as a materialized CTE, EXPLAINs them, "
+                   "and charges it every copy of itself but one."),
+    DeeOptSpec("hmp_dup_cost_model", "--hmp-dup-cost-model", "str", frozenset({"hmp"}),
+               choices=("learned_cost", "cardinality", "operators"),
+               doc="What HMP's `dup_attribution` cost method prices a plan region with. "
+                   "`learned_cost` gives seconds, from constants fitted to executed plans; "
+                   "`cardinality` sums the region's estimated output rows; `operators` counts "
+                   "its operators. Ignored by every other cost method."),
     DeeOptSpec("hmp_beam_width", "--hmp-beam-width", "int", frozenset({"hmp"}),
                doc="Beam width for the greedy HMP strategy. Ignored by breadth."),
     DeeOptSpec("hmp_use_pushdown", "--hmp-no-pushdown", "bool", frozenset({"hmp"}), negated=True,

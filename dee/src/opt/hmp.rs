@@ -17,6 +17,7 @@ use crate::{
     opt::{
         Dag, Optimization, OptimizerError, OptimizerConfig,
         common::{dialect_for_db, make_temp},
+        dup::{SubtreeCostMethod, duplicate_cost},
         leafset::{PlanArena, ViewRegionRequest, attribute_chain, has_top_level_group_by},
         learned::LearnedCostModel,
         explain::{render_bar_row, render_card_grid, render_ranked_table},
@@ -73,6 +74,17 @@ pub enum HmpCostMethod {
     /// constants are a property of the engine and the machine, so what one DAG
     /// learns prices every other DAG's Views.
     LearnedCost,
+    /// Ask the engine what each consumer would do with the View inlined into it
+    /// as a materialized CTE, and charge the View every copy but one. See
+    /// [`crate::opt::dup`].
+    ///
+    /// The only method that measures the duplication rather than inferring it
+    /// from the graph, and the only one that talks to the database: it costs
+    /// one EXPLAIN per consumer per candidate. `--hmp-dup-cost-model` chooses
+    /// what the resulting plan regions are priced with;
+    /// `--hmp-downstream-cost` has no effect, because a duplicate cost is
+    /// already what this reports.
+    DupAttribution,
 }
 
 impl HmpCostMethod {
@@ -82,6 +94,7 @@ impl HmpCostMethod {
             HmpCostMethod::Signature => "signature",
             HmpCostMethod::NodeTime => "node_time",
             HmpCostMethod::LearnedCost => "learned_cost",
+            HmpCostMethod::DupAttribution => "dup_attribution",
         }
     }
 }
@@ -95,9 +108,10 @@ impl std::str::FromStr for HmpCostMethod {
             "signature" => Ok(HmpCostMethod::Signature),
             "node_time" | "nodetime" => Ok(HmpCostMethod::NodeTime),
             "learned_cost" | "learnedcost" => Ok(HmpCostMethod::LearnedCost),
+            "dup_attribution" | "dupattribution" | "dup" => Ok(HmpCostMethod::DupAttribution),
             other => Err(format!(
                 "unknown hmp cost method '{other}'; expected leafset, signature, \
-                 node_time or learned_cost"
+                 node_time, learned_cost or dup_attribution"
             )),
         }
     }
@@ -233,6 +247,9 @@ where
     strategy: HMPStrategy,
     /// How a View's cost is read off the run's plans.
     cost_method: HmpCostMethod,
+    /// What `DupAttribution` prices a plan region with. Unused by the other
+    /// methods, which have no notion of a region.
+    dup_cost_model: SubtreeCostMethod,
     /// Cancel a trial once it has overrun the incumbent and finish the run
     /// under the incumbent instead, rather than measuring every candidate to
     /// completion.
@@ -354,6 +371,7 @@ where
         normalize_with_cardinality: bool,
         strategy: HMPStrategy,
         cost_method: HmpCostMethod,
+        dup_cost_model: SubtreeCostMethod,
         use_pushdown: bool,
         beam_width: usize,
         profile_iterations: bool,
@@ -371,6 +389,7 @@ where
             normalize_with_cardinality,
             strategy,
             cost_method,
+            dup_cost_model,
             use_pushdown,
             beam_width: beam_width.max(1),
             profile_iterations,
@@ -829,6 +848,7 @@ where
             config.hmp_normalize_with_cardinality,
             config.hmp_strategy,
             config.hmp_cost_method,
+            config.hmp_dup_cost_model,
             config.hmp_use_pushdown,
             config.hmp_beam_width,
             config.profile_iterations,
@@ -945,13 +965,27 @@ where
         Ok(())
     }
 
+    /// Whether this configuration prices anything with the seconds-per-byte
+    /// constants, and so has a reason to read and write them.
+    ///
+    /// `LearnedCost` prices Views with them directly; `DupAttribution` prices
+    /// plan regions with them when that is the region cost model it was given.
+    /// Nothing else touches them, and every other DAG registered on this store
+    /// pays for the query if they do.
+    fn uses_learned_constants(&self) -> bool {
+        match self.cost_method {
+            HmpCostMethod::LearnedCost => true,
+            HmpCostMethod::DupAttribution => {
+                self.dup_cost_model == SubtreeCostMethod::LearnedCost
+            }
+            _ => false,
+        }
+    }
+
     /// Fold what earlier runs learned into this pass's in-memory model, so the
     /// ranking about to be computed is priced by everything known so far.
-    ///
-    /// Only for `LearnedCost`: the other methods never read the model, and
-    /// every other DAG registered on this store pays for the query otherwise.
     async fn adopt_learned(&self, store: &dyn OptStore) {
-        if self.cost_method != HmpCostMethod::LearnedCost {
+        if !self.uses_learned_constants() {
             return;
         }
         let stored = self.load_learned(store).await;
@@ -962,7 +996,7 @@ where
 
     /// Persist what the ranking just learned, so the next run starts from it.
     async fn publish_learned(&self, store: &dyn OptStore) {
-        if self.cost_method != HmpCostMethod::LearnedCost {
+        if !self.uses_learned_constants() {
             return;
         }
         let snapshot = match self.learned.lock() {
@@ -1168,6 +1202,38 @@ where
         Some(rows)
     }
 
+    /// Fold everything this run's executed plans reveal into the learned cost
+    /// model.
+    ///
+    /// Only TABLE/TEMP_TABLE nodes: they are the ones whose plan is an EXPLAIN
+    /// ANALYZE with real timings behind it, and a constant fitted to an
+    /// estimate is not fitted to anything.
+    ///
+    /// Separate from the ranking that uses it because two methods learn from a
+    /// run --- `LearnedCost` prices Views with the constants directly, and
+    /// `DupAttribution` prices plan regions with them --- and a method that
+    /// forgot to learn first would silently price everything at the previous
+    /// run's constants.
+    fn learn_from(&self, dag: &Dag, stats: &ExecStats) {
+        let Ok(mut model) = self.learned.lock() else {
+            return;
+        };
+        for node in dag.nodes.nodes() {
+            if !matches!(
+                node.materialize,
+                MaterializeMode::Table | MaterializeMode::TempTable
+            ) {
+                continue;
+            }
+            if let Some(node_stat) = stats.node_stats.get(&node.id)
+                && let Some(plan_str) = &node_stat.plan
+                && let Some(plans) = self.conn.parse_plan(plan_str)
+            {
+                model.observe(&plans);
+            }
+        }
+    }
+
     /// Rank candidate Views by pricing each View's own plan with
     /// seconds-per-byte constants fitted to the run's executed plans.
     ///
@@ -1188,25 +1254,8 @@ where
     /// could be priced --- the caller falls back rather than reporting a ranking
     /// of nothing.
     fn ranking_learned(&self, dag: &Dag, stats: &ExecStats) -> Option<Vec<NodeRankingRow>> {
-        let mut model = self.learned.lock().ok()?;
-
-        // Learn from what ran. Only TABLE/TEMP_TABLE nodes: they are the ones
-        // whose plan is an EXPLAIN ANALYZE with real timings behind it, and a
-        // constant fitted to an estimate is not fitted to anything.
-        for node in dag.nodes.nodes() {
-            if !matches!(
-                node.materialize,
-                MaterializeMode::Table | MaterializeMode::TempTable
-            ) {
-                continue;
-            }
-            if let Some(node_stat) = stats.node_stats.get(&node.id)
-                && let Some(plan_str) = &node_stat.plan
-                && let Some(plans) = self.conn.parse_plan(plan_str)
-            {
-                model.observe(&plans);
-            }
-        }
+        self.learn_from(dag, stats);
+        let model = self.learned.lock().ok()?;
         if model.is_empty() {
             return None;
         }
@@ -1323,13 +1372,137 @@ where
         Some(rows)
     }
 
+    /// Rank candidate Views by the duplicate computation each one causes,
+    /// measured by asking the engine.
+    ///
+    /// The method itself lives in [`crate::opt::dup`]; this is the part that
+    /// is HMP's: which Views are candidates at all, and what a ranking row
+    /// made of one looks like.
+    ///
+    /// Unlike every other method here, the score is a duplicate cost by
+    /// construction, so `--hmp-downstream-cost` neither applies nor is
+    /// consulted. A View whose duplication comes out at zero or below --- the
+    /// engine plans its copies for no more than one standalone build would
+    /// cost --- is dropped from the ranking rather than ranked last, because
+    /// there is nothing for materializing it to remove.
+    ///
+    /// Returns `None` when not one candidate could be measured, which is
+    /// "this method could not see" and not "this DAG duplicates nothing": the
+    /// caller falls back rather than searching an empty ranking.
+    async fn ranking_dup(&self, dag: &Dag, stats: &ExecStats) -> Option<Vec<NodeRankingRow>> {
+        // The regions about to be priced are priced by constants, so the
+        // constants have to know about this run first.
+        if self.dup_cost_model == SubtreeCostMethod::LearnedCost {
+            self.learn_from(dag, stats);
+        }
+
+        // A snapshot rather than the live model: the loop below awaits an
+        // EXPLAIN per candidate, and a `MutexGuard` cannot be held across an
+        // await -- nor should a lock be held for the length of a database round
+        // trip. Nothing learns during the loop, so a snapshot taken now prices
+        // every candidate by the same constants, which is also what makes the
+        // ranking a comparison rather than a drift.
+        let snapshot = self.learned.lock().ok()?.clone();
+        let coster = self.dup_cost_model.coster(&snapshot);
+
+        let mut rows: Vec<NodeRankingRow> = Vec::new();
+        let mut measured = 0usize;
+        for node in dag.nodes.nodes() {
+            if node.materialize != MaterializeMode::View {
+                continue;
+            }
+            // The same gate every other method applies: only a branch point has
+            // work that materializing could deduplicate.
+            if dag.nodes.out_degree(&node.id) <= 1 || dag.nodes.paths_to_sinks(&node.id) <= 1 {
+                continue;
+            }
+            let Some(plan_str) = stats
+                .node_stats
+                .get(&node.id)
+                .and_then(|s| s.plan.as_ref())
+            else {
+                continue;
+            };
+            let Some(view_plan) = self.conn.parse_plan(plan_str) else {
+                continue;
+            };
+
+            let Some(attributed) =
+                duplicate_cost(self.conn.as_ref(), dag, &node.id, &view_plan, coster.as_ref())
+                    .await
+            else {
+                continue;
+            };
+            measured += 1;
+
+            let cardinality = view_plan.first().and_then(|p| p.rows());
+            let ranking_score = match (self.normalize_with_cardinality, cardinality) {
+                (true, Some(c)) if c > 0.0 => attributed.duplicate / c,
+                _ => attributed.duplicate,
+            };
+            // What was matched, so a ranking can be checked against the plans
+            // it came from rather than taken on faith -- the same role these
+            // play under leaf-set matching.
+            let matched = attributed
+                .per_consumer
+                .iter()
+                .map(|(consumer, cost)| format!("{consumer} ({cost:.4})"))
+                .collect();
+            rows.push(NodeRankingRow {
+                rank: 0,
+                node: node.id.clone(),
+                total_cpu_time_s: attributed.duplicate,
+                cardinality,
+                ranking_score,
+                leaves: Vec::new(),
+                matched,
+            });
+        }
+
+        if measured == 0 {
+            return None;
+        }
+        rows.retain(|r| r.ranking_score > 0.0);
+        if rows.is_empty() {
+            // Measured, and every candidate came out at nothing. That is an
+            // answer -- this DAG has no duplication worth removing -- and
+            // falling back to a method that would invent some is worse than
+            // reporting it.
+            debug!(
+                "HMPPass: duplicate attribution measured {measured} candidate(s) and found no \
+                 duplication in any of them"
+            );
+            return Some(rows);
+        }
+        rows.sort_by(|a, b| {
+            b.ranking_score
+                .partial_cmp(&a.ranking_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.node.cmp(&b.node))
+        });
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.rank = i + 1;
+        }
+        Some(rows)
+    }
+
     /// The ranking a run's plans imply, as `(node, score)`.
     ///
     /// Public so a costing method can be scored offline against ground truth
     /// measured by materializing the Views it ranks.
-    pub fn ranking_for(&self, dag: &Dag, stats: &ExecStats) -> Vec<NodeRankingRow> {
+    pub async fn ranking_for(&self, dag: &Dag, stats: &ExecStats) -> Vec<NodeRankingRow> {
         if self.cost_method == HmpCostMethod::NodeTime {
             return Self::ranking_from_node_times(dag, stats);
+        }
+        if self.cost_method == HmpCostMethod::DupAttribution {
+            match self.ranking_dup(dag, stats).await {
+                Some(rows) => return rows,
+                None => warn!(
+                    "HMPPass: duplicate attribution could not measure a single candidate -- \
+                     the engine answered no EXPLAIN, or no consumer's plan kept the View's \
+                     materialized CTE; falling back to leaf-set matching"
+                ),
+            }
         }
         if self.cost_method == HmpCostMethod::LearnedCost {
             match self.ranking_learned(dag, stats) {
@@ -1343,7 +1516,7 @@ where
         }
         if matches!(
             self.cost_method,
-            HmpCostMethod::Leafset | HmpCostMethod::LearnedCost
+            HmpCostMethod::Leafset | HmpCostMethod::LearnedCost | HmpCostMethod::DupAttribution
         ) {
             match self.ranking_leafset(dag, stats) {
                 Some(rows) => return rows,
@@ -1807,19 +1980,18 @@ where
             state.baseline_ms = runtime_ms;
             state.best_ms = runtime_ms;
             state.runs_used = 1;
-            state.iterations.push(IterationStat {
-                iteration: 1,
-                runtime_ms,
-                combo: Vec::new(),
-                outcome: Some("baseline".to_string()),
-                system_samples: if self.profile_iterations {
-                    stats.system_samples.clone()
-                } else {
-                    Vec::new()
-                },
-            });
+            state.iterations.push(
+                IterationStat::new(1, runtime_ms)
+                    .with_outcome("baseline")
+                    .with_run_cost(ctx)
+                    .with_samples(if self.profile_iterations {
+                        stats.system_samples.clone()
+                    } else {
+                        Vec::new()
+                    }),
+            );
 
-            let mut ranking = self.ranking_for(ctx.dag, stats);
+            let mut ranking = self.ranking_for(ctx.dag, stats).await;
             if ranking.is_empty() {
                 debug!("HMPPass: no plan-derived ranking; falling back to node times");
                 ranking = Self::ranking_from_node_times(ctx.dag, stats);
@@ -1860,17 +2032,17 @@ where
         };
 
         state.runs_used += 1;
-        state.iterations.push(IterationStat {
-            iteration: state.iterations.len() + 1,
-            runtime_ms,
-            combo: in_flight.combo.clone(),
-            outcome: Some("ok".to_string()),
-            system_samples: if self.profile_iterations {
-                stats.system_samples.clone()
-            } else {
-                Vec::new()
-            },
-        });
+        state.iterations.push(
+            IterationStat::new(state.iterations.len() + 1, runtime_ms)
+                .with_combo(in_flight.combo.clone())
+                .with_outcome("ok")
+                .with_run_cost(ctx)
+                .with_samples(if self.profile_iterations {
+                    stats.system_samples.clone()
+                } else {
+                    Vec::new()
+                }),
+        );
         state.tried_combos.insert(in_flight.sig, runtime_ms);
         state.proposals.push(BeamState {
             combo: in_flight.combo.clone(),
@@ -1879,7 +2051,7 @@ where
 
         // Accumulate the ranking this trial implies, for the reordering the
         // breadth search does between combination sizes.
-        for row in self.ranking_for(ctx.dag, stats) {
+        for row in self.ranking_for(ctx.dag, stats).await {
             *state.round_score_sums.entry(row.node.clone()).or_insert(0.0) += row.ranking_score;
             *state.round_score_counts.entry(row.node).or_insert(0) += 1;
         }
@@ -1942,13 +2114,16 @@ where
             "combo {:?} produced no usable measurement; rejecting as censored (>= {censored_ms}ms)",
             in_flight.combo
         );
-        state.iterations.push(IterationStat {
-            iteration: state.iterations.len() + 1,
-            runtime_ms: censored_ms,
-            combo: in_flight.combo.clone(),
-            outcome: Some("cancelled".to_string()),
-            system_samples: Vec::new(),
-        });
+        // `runtime_ms` is the censoring level, not a measurement. What the
+        // iteration really cost -- the cut-short trial, the optimizer working
+        // out what to keep, and the incumbent finishing the job -- comes off
+        // the run itself, and only this path has all three.
+        state.iterations.push(
+            IterationStat::new(state.iterations.len() + 1, censored_ms)
+                .with_combo(in_flight.combo.clone())
+                .with_outcome("cancelled")
+                .with_run_cost(ctx),
+        );
         state.tried_combos.insert(in_flight.sig, censored_ms);
         state.proposals.push(BeamState {
             combo: in_flight.combo,
@@ -2417,6 +2592,7 @@ mod tests {
             // The existing tests fabricate operator-signature plans, which is
             // what this method reads.
             HmpCostMethod::Signature,
+            SubtreeCostMethod::default(),
             false,
             beam_width,
             false,
@@ -2776,6 +2952,154 @@ mod tests {
         assert!((rows[0].total_cpu_time_s - 9.0).abs() < 1e-9);
     }
 
+    // ---------------------------------------------------------------------
+    // DupAttribution
+    // ---------------------------------------------------------------------
+
+    /// A DAG with a branch-point View both of whose consumers compute all of
+    /// it, ranked against a live engine. `Cardinality` rather than the default
+    /// `LearnedCost` for the region cost model, so the ranking is a function of
+    /// the plans alone and does not depend on what the fixture happened to
+    /// measure.
+    #[tokio::test]
+    async fn dup_attribution_ranks_a_branch_point_by_what_its_copies_cost() {
+        let conn = in_memory_conn().await;
+        conn.execute(
+            "CREATE TABLE raw AS SELECT i AS id, i % 7 AS g, i * 1.5 AS amt \
+             FROM range(1000) t(i)"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(SimpleEngine::new(Arc::clone(&conn)).unwrap());
+        let mut pass: HMPPass<DuckDBConnection, SimpleEngine<DuckDBConnection>> = HMPPass::new(
+            Arc::clone(&conn),
+            engine,
+            false,
+            1,
+            1.0,
+            None,
+            None,
+            false,
+            HMPStrategy::Breadth,
+            HmpCostMethod::DupAttribution,
+            SubtreeCostMethod::Cardinality,
+            false,
+            2,
+            false,
+            true,
+            crate::opt::common::DEFAULT_BUDGET_EPS,
+            Default::default(),
+        );
+        pass.cost_method = HmpCostMethod::DupAttribution;
+
+        let shared = "SELECT g, sum(amt) AS total FROM raw GROUP BY g";
+        // `lonely` is a View too, and an expensive one, but only one node
+        // reads it -- so it must not appear in a ranking of duplication.
+        let lonely = "SELECT id, amt * 2 AS doubled FROM raw";
+        let dag = make_dag(vec![
+            node("shared", shared, MaterializeMode::View, &[]),
+            node("lonely", lonely, MaterializeMode::View, &[]),
+            node(
+                "out_a",
+                "SELECT count(*) AS n FROM shared",
+                MaterializeMode::Table,
+                &["shared"],
+            ),
+            node(
+                "out_b",
+                "SELECT max(total) AS biggest FROM shared",
+                MaterializeMode::Table,
+                &["shared"],
+            ),
+            node(
+                "out_c",
+                "SELECT sum(doubled) AS s FROM lonely",
+                MaterializeMode::Table,
+                &["lonely"],
+            ),
+        ]);
+
+        // What the run would have collected: each View's own EXPLAIN plan.
+        let mut stats_map = HashMap::new();
+        for (id, sql) in [("shared", shared), ("lonely", lonely)] {
+            let plan = conn.explain(sql).await.unwrap().unwrap();
+            stats_map.insert(id.to_string(), node_stats(Some(plan)));
+        }
+        let now = Utc::now();
+        let stats = ExecStats {
+            start: now,
+            finish: now,
+            duration: chrono::TimeDelta::zero(),
+            node_stats: stats_map,
+            system_samples: Vec::new(),
+        };
+
+        let rows = pass
+            .ranking_dup(&dag, &stats)
+            .await
+            .expect("the engine planned both consumers of `shared`");
+
+        assert_eq!(
+            rows.iter().map(|r| r.node.as_str()).collect::<Vec<_>>(),
+            vec!["shared"],
+            "a View with one consumer duplicates nothing and must not be ranked"
+        );
+        assert!(rows[0].total_cpu_time_s > 0.0, "{:?}", rows[0]);
+        // The per-consumer breakdown reaches the report, because a ranking
+        // nobody can check against the plans behind it is a ranking taken on
+        // faith.
+        assert_eq!(rows[0].matched.len(), 2, "{:?}", rows[0].matched);
+        assert!(
+            rows[0].matched.iter().any(|m| m.starts_with("out_a"))
+                && rows[0].matched.iter().any(|m| m.starts_with("out_b")),
+            "{:?}",
+            rows[0].matched
+        );
+    }
+
+    /// No plans at all: nothing to attribute, and `ranking_for` must fall
+    /// through rather than report that this DAG duplicates nothing.
+    #[tokio::test]
+    async fn dup_attribution_declines_when_the_run_carried_no_plans() {
+        let mut pass = test_pass(2).await;
+        pass.cost_method = HmpCostMethod::DupAttribution;
+        pass.dup_cost_model = SubtreeCostMethod::Cardinality;
+
+        let dag = make_dag(vec![
+            node("v", "SELECT 1 AS x", MaterializeMode::View, &[]),
+            node("a", "SELECT x FROM v", MaterializeMode::Table, &["v"]),
+            node("b", "SELECT x FROM v", MaterializeMode::Table, &["v"]),
+        ]);
+        let now = Utc::now();
+        let stats = ExecStats {
+            start: now,
+            finish: now,
+            duration: chrono::TimeDelta::zero(),
+            node_stats: HashMap::new(),
+            system_samples: Vec::new(),
+        };
+
+        assert!(pass.ranking_dup(&dag, &stats).await.is_none());
+        // And the dispatcher falls back rather than propagating the `None`.
+        let _ = pass.ranking_for(&dag, &stats).await;
+    }
+
+    /// The learned constants are a cost model `DupAttribution` uses too, so a
+    /// pass configured that way must read and write them like `LearnedCost`
+    /// does -- and must not when it is pricing regions some other way.
+    #[tokio::test]
+    async fn dup_attribution_shares_the_learned_constants_only_when_it_prices_with_them() {
+        let mut pass = test_pass(2).await;
+        pass.cost_method = HmpCostMethod::DupAttribution;
+
+        pass.dup_cost_model = SubtreeCostMethod::LearnedCost;
+        assert!(pass.uses_learned_constants());
+
+        pass.dup_cost_model = SubtreeCostMethod::Cardinality;
+        assert!(!pass.uses_learned_constants());
+    }
+
     #[tokio::test]
     async fn learned_cost_declines_rather_than_ranking_nothing_when_it_has_learned_nothing() {
         let mut pass = test_pass(2).await;
@@ -2800,7 +3124,7 @@ mod tests {
         assert!(pass.ranking_learned(&dag, &stats).is_none());
         // And `ranking_for` falls through to leaf-set matching rather than
         // returning a ranking of nothing.
-        let _ = pass.ranking_for(&dag, &stats);
+        let _ = pass.ranking_for(&dag, &stats).await;
     }
 
     #[tokio::test]
@@ -2821,7 +3145,7 @@ mod tests {
         }
         assert!(pass.ranking_leafset(&dag, &stats).is_none());
         // And `ranking_for` takes the fallback rather than returning nothing.
-        let _ = pass.ranking_for(&dag, &stats);
+        let _ = pass.ranking_for(&dag, &stats).await;
     }
 
     // "shelf" is a materialized Table whose EXPLAIN plan roots two operators:
@@ -2878,7 +3202,7 @@ mod tests {
         // observation is that trial's ranking folded into the round's sums.
         let mut sums: HashMap<String, f64> = HashMap::new();
         let mut counts: HashMap<String, usize> = HashMap::new();
-        for row in pass.ranking_for(&dag, &exec_stats) {
+        for row in pass.ranking_for(&dag, &exec_stats).await {
             *sums.entry(row.node.clone()).or_insert(0.0) += row.ranking_score;
             *counts.entry(row.node).or_insert(0) += 1;
         }
@@ -3037,6 +3361,7 @@ mod tests {
                 rep_index: 0,
                 // A measured run with no stats: cancelled at its budget.
                 stats: None,
+                resumed: None,
             }),
         };
         let outcome = pass.step(&mut ctx).await.unwrap();
@@ -3061,6 +3386,162 @@ mod tests {
             after.iterations.last().unwrap().outcome.as_deref(),
             Some("cancelled")
         );
+    }
+
+    /// A cancelled iteration must carry what it actually cost, in parts.
+    ///
+    /// `runtime_ms` there is the censoring level -- "at least this slow" --
+    /// and reporting it as the iteration's cost understates a cancelled run by
+    /// exactly the resume nobody counted.
+    #[tokio::test]
+    async fn a_cancelled_iteration_records_the_trial_the_overhead_and_the_resume() {
+        let store = MemoryStore::open("hmp").unwrap();
+        let mut pass = test_pass(2).await;
+        let dag = make_dag(vec![
+            node("v", "SELECT 1 AS x", MaterializeMode::View, &[]),
+            node("a", "SELECT x FROM v", MaterializeMode::Table, &["v"]),
+            node("b", "SELECT x FROM v", MaterializeMode::Table, &["v"]),
+        ]);
+        pass.register(&RegisterContext {
+            store: &store,
+            dag_id: "dag-1",
+            dag_name: "pipeline",
+        })
+        .await
+        .unwrap();
+
+        // A search already past its baseline, with a candidate in flight.
+        let mut state = pass.load_state(&store, "dag-1").await.unwrap().unwrap();
+        state.phase = "searching".to_string();
+        state.baseline_ms = 1000;
+        state.best_ms = 1000;
+        state.working_set = vec!["v".to_string()];
+        state.working_order = vec!["v".to_string()];
+        state.runs_used = 1;
+        state.in_flight = Some(InFlight {
+            combo: vec!["v".to_string()],
+            sig: "sig-1".to_string(),
+        });
+        pass.save_state(&store, "dag-1", &state).await.unwrap();
+
+        let mut working = dag.clone();
+        let mut ctx = StepContext {
+            store: &store,
+            conn: Arc::clone(&pass.conn),
+            engine: Arc::clone(&pass.engine),
+            dag: &mut working,
+            dag_id: "dag-1",
+            dag_name: "pipeline",
+            dag_version: 1,
+            side: StepPhase::After,
+            run: Some(crate::opt::RunContext {
+                run_id: "r1".into(),
+                run_group_id: "g1".into(),
+                run_phase: crate::opt::run_phase::MEASURE.into(),
+                rep_index: 0,
+                // Cancelled: no stats, so no measurement...
+                stats: None,
+                // ...but the run still happened, in three parts.
+                resumed: Some(crate::opt::ResumeTiming {
+                    trial_ms: 1000,
+                    overhead_ms: 120,
+                    resume_ms: 800,
+                    trial_node_time_ms: 2400,
+                    resume_node_time_ms: 1500,
+                }),
+            }),
+        };
+        pass.step(&mut ctx).await.unwrap();
+
+        let after = pass.load_state(&store, "dag-1").await.unwrap().unwrap();
+        let it = after
+            .iterations
+            .last()
+            .expect("the cancelled trial was filed");
+        assert_eq!(it.outcome.as_deref(), Some("cancelled"));
+        assert_eq!(it.trial_ms, Some(1000));
+        assert_eq!(it.resume_overhead_ms, Some(120));
+        assert_eq!(it.resume_ms, Some(800));
+        // What it cost, against what the search is allowed to believe about
+        // the candidate's speed. The two are different numbers and the
+        // distinction is the whole point of keeping both.
+        assert_eq!(it.total_ms(), 1920);
+        assert_eq!(it.runtime_ms, 1000);
+        // Both halves of the run did database work, and both are charged.
+        assert_eq!(it.node_time_ms, Some(3900));
+    }
+
+    /// An iteration that finished reports the database time of its own run and
+    /// no resume breakdown -- there was no resume to break down.
+    #[tokio::test]
+    async fn a_completed_iteration_records_node_time_and_no_resume() {
+        let store = MemoryStore::open("hmp").unwrap();
+        let mut pass = test_pass(2).await;
+        let dag = make_dag(vec![
+            node("v", "SELECT 1 AS x", MaterializeMode::View, &[]),
+            node("a", "SELECT x FROM v", MaterializeMode::Table, &["v"]),
+            node("b", "SELECT x FROM v", MaterializeMode::Table, &["v"]),
+        ]);
+        pass.register(&RegisterContext {
+            store: &store,
+            dag_id: "dag-1",
+            dag_name: "pipeline",
+        })
+        .await
+        .unwrap();
+
+        let now = Utc::now();
+        let mut node_stats_map = HashMap::new();
+        for (id, ms) in [("a", 700i64), ("b", 500i64)] {
+            node_stats_map.insert(
+                id.to_string(),
+                crate::executor::NodeStats {
+                    start: now,
+                    finish: now,
+                    duration: chrono::TimeDelta::milliseconds(ms),
+                    plan: None,
+                    rows_produced: None,
+                },
+            );
+        }
+        let stats = ExecStats {
+            start: now,
+            finish: now,
+            duration: chrono::TimeDelta::milliseconds(900),
+            node_stats: node_stats_map,
+            system_samples: Vec::new(),
+        };
+
+        let mut working = dag.clone();
+        let mut ctx = StepContext {
+            store: &store,
+            conn: Arc::clone(&pass.conn),
+            engine: Arc::clone(&pass.engine),
+            dag: &mut working,
+            dag_id: "dag-1",
+            dag_name: "pipeline",
+            dag_version: 1,
+            side: StepPhase::After,
+            run: Some(crate::opt::RunContext {
+                run_id: "r1".into(),
+                run_group_id: "g1".into(),
+                run_phase: crate::opt::run_phase::MEASURE.into(),
+                rep_index: 0,
+                stats: Some(stats),
+                resumed: None,
+            }),
+        };
+        pass.step(&mut ctx).await.unwrap();
+
+        let after = pass.load_state(&store, "dag-1").await.unwrap().unwrap();
+        let it = after.iterations.last().expect("the baseline was filed");
+        // 700 + 500 of node time inside a 900ms wall clock: the two nodes ran
+        // concurrently, which is exactly why both numbers are kept.
+        assert_eq!(it.node_time_ms, Some(1200));
+        assert_eq!(it.runtime_ms, 900);
+        assert_eq!(it.total_ms(), 900);
+        assert_eq!(it.trial_ms, None);
+        assert_eq!(it.resume_ms, None);
     }
 
     #[tokio::test]
@@ -3096,6 +3577,7 @@ mod tests {
                 run_phase: crate::opt::run_phase::MEASURE.into(),
                 rep_index: 0,
                 stats: None,
+                resumed: None,
             }),
         };
         pass.step(&mut ctx).await.unwrap();

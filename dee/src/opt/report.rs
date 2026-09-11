@@ -33,6 +33,33 @@ pub struct IterationStat {
     /// `"ok"`, `"cancelled"`, `"skipped"`, or `"baseline"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    /// Total time the database spent executing this iteration's queries: every
+    /// node's own duration, summed, across the trial and any resume that
+    /// finished it.
+    ///
+    /// Not the wall clock, and the difference is the point. Nodes run
+    /// concurrently, so scheduling can hide removed work from `runtime_ms`
+    /// entirely; this counts the work itself. A materialization that
+    /// deduplicates computation must move this, whether or not the clock
+    /// notices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_time_ms: Option<i64>,
+    /// Wall time the candidate itself ran before being cancelled. `None` on an
+    /// iteration that was not cancelled --- there `runtime_ms` is the whole of
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_ms: Option<i64>,
+    /// Wall time between the cancellation and the incumbent picking the run
+    /// back up: planning the resume and dropping what it cannot reuse.
+    ///
+    /// The only one of the three parts that buys nothing. It is what
+    /// cancelling costs over and above the two runs, and the number to watch
+    /// if early stopping ever stops paying for itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_overhead_ms: Option<i64>,
+    /// Wall time of the run that finished under the incumbent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_ms: Option<i64>,
     /// CPU/memory/disk timeseries sampled during this iteration's run. Only
     /// populated when `profile_iterations` is enabled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -61,6 +88,37 @@ impl IterationStat {
     pub fn with_samples(mut self, samples: Vec<SystemUsageSample>) -> Self {
         self.system_samples = samples;
         self
+    }
+
+    /// Record what the database did, and --- when the iteration was cancelled
+    /// and finished under the incumbent --- what each part of that cost.
+    ///
+    /// Reads both off the run the step is attached to, so a pass records the
+    /// breakdown by calling this rather than by knowing how a resume works.
+    pub fn with_run_cost<C, E>(mut self, ctx: &crate::opt::StepContext<'_, C, E>) -> Self
+    where
+        C: crate::connectors::Connector + Send + Sync + 'static,
+        E: crate::executor::Executor<C> + Send + Sync,
+    {
+        self.node_time_ms = ctx.node_time_ms();
+        if let Some(resumed) = ctx.run.as_ref().and_then(|r| r.resumed.as_ref()) {
+            self.trial_ms = Some(resumed.trial_ms);
+            self.resume_overhead_ms = Some(resumed.overhead_ms);
+            self.resume_ms = Some(resumed.resume_ms);
+        }
+        self
+    }
+
+    /// Everything this iteration cost end to end: the three parts of a
+    /// cancelled-and-resumed run, or the plain runtime of one that finished.
+    ///
+    /// `runtime_ms` on a cancelled iteration is the censoring level --- "at
+    /// least this slow" --- and is not what anyone paid. This is.
+    pub fn total_ms(&self) -> i64 {
+        match (self.trial_ms, self.resume_overhead_ms, self.resume_ms) {
+            (Some(trial), overhead, Some(resume)) => trial + overhead.unwrap_or(0) + resume,
+            _ => self.runtime_ms,
+        }
     }
 }
 

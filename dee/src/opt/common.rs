@@ -209,6 +209,79 @@ pub(crate) fn inline_view_ast(
     polyglot_sql::generate(&rewritten, dialect).ok()
 }
 
+/// Whether `dialect` understands the `AS MATERIALIZED` CTE hint.
+///
+/// It is a hint everywhere it exists and an error everywhere it does not, and
+/// the two engines dee reads plans from both have it (Postgres since 12,
+/// DuckDB always). Elsewhere the CTE is emitted plain, and whether the engine
+/// materializes it is the engine's decision.
+fn supports_materialized_hint(dialect: DialectType) -> bool {
+    matches!(dialect, DialectType::DuckDB | DialectType::PostgreSQL)
+}
+
+/// Wrap `consumer_sql` in a `WITH <cte_name> AS MATERIALIZED (<body_sql>)`
+/// clause, at the AST level.
+///
+/// `MATERIALIZED` asks the engine to plan the body as one shared computation
+/// rather than folding a copy of it into each reference, which is what gives
+/// the resulting plan a single named region that *is* the body. It is not a
+/// full optimizer barrier --- DuckDB still pushes the enclosing query's
+/// predicates and projections into it --- and [`crate::opt::dup`], the caller
+/// this exists for, relies on exactly that: it wants what the body costs
+/// *inside this consumer*, not in the abstract.
+///
+/// A consumer that already has a `WITH` clause keeps it; the new CTE goes in
+/// front, where nothing can already depend on the name.
+///
+/// Returns `None` when either side does not parse, when the consumer is not a
+/// query that can carry a `WITH` clause, or when the result cannot be
+/// regenerated.
+pub(crate) fn wrap_in_materialized_cte(
+    consumer_sql: &str,
+    cte_name: &str,
+    body_sql: &str,
+    dialect: DialectType,
+) -> Option<String> {
+    use polyglot_sql::expressions::{Cte, Identifier, With};
+
+    let mut consumer = polyglot_sql::parse_one(consumer_sql, dialect).ok()?;
+    let body = polyglot_sql::parse_one(body_sql, dialect).ok()?;
+
+    let cte = Cte {
+        alias: Identifier::new(cte_name.to_string()),
+        this: body,
+        columns: Vec::new(),
+        materialized: supports_materialized_hint(dialect).then_some(true),
+        key_expressions: Vec::new(),
+        alias_first: false,
+        comments: Vec::new(),
+    };
+
+    let slot: &mut Option<With> = match &mut consumer {
+        Expression::Select(s) => &mut s.with,
+        Expression::Union(u) => &mut u.with,
+        Expression::Intersect(i) => &mut i.with,
+        Expression::Except(e) => &mut e.with,
+        // An INSERT or an UPDATE can carry a WITH too, but a DAG node's query
+        // text is the SELECT that defines a relation, never a statement that
+        // writes one -- the materialization is the executor's business.
+        _ => return None,
+    };
+    match slot {
+        Some(with) => with.ctes.insert(0, cte),
+        None => {
+            *slot = Some(With {
+                ctes: vec![cte],
+                recursive: false,
+                leading_comments: Vec::new(),
+                search: None,
+            })
+        }
+    }
+
+    polyglot_sql::generate(&consumer, dialect).ok()
+}
+
 // ---------------------------------------------------------------------------
 // make_temp
 // ---------------------------------------------------------------------------
@@ -272,77 +345,12 @@ pub fn make_temp(dag: &mut Dag, view_name: &str) -> Result<String, OptimizerErro
         schema: None,
     });
 
-    // 3–5. For each frontier node m, inline intermediate views then rebase onto lp.
+    // 3. Contract every intermediate View between view_name and the frontier
+    //    into the frontier node itself, so each m reads view_name directly.
+    contract_intermediate_views(dag, view_name, &frontier)?;
+
+    // 4–5. Rebase each frontier node onto the landing pad.
     for m_id in &frontier {
-        // Iteratively inline any direct View dependency of m that has
-        // view_name as a transitive dependency (i.e., sits between view_name
-        // and m on the data-flow path).
-        loop {
-            let view_dep: Option<String> = dag.nodes.get(m_id.clone()).and_then(|m_node| {
-                m_node
-                    .depends_on
-                    .iter()
-                    .find(|dep| {
-                        if *dep == view_name {
-                            return false; // handled in step 4–5
-                        }
-                        let is_view = dag
-                            .nodes
-                            .get((*dep).clone())
-                            .map(|d| matches!(d.materialize, MaterializeMode::View))
-                            .unwrap_or(false);
-                        is_view && is_transitive_dep(dag, dep, view_name)
-                    })
-                    .cloned()
-            });
-
-            match view_dep {
-                None => break,
-                Some(v_id) => {
-                    let view_sql = dag
-                        .nodes
-                        .get(v_id.clone())
-                        .ok_or_else(|| {
-                            OptimizerError::Exec(format!(
-                                "make_temp: intermediate view '{v_id}' not found"
-                            ))
-                        })?
-                        .query_text
-                        .clone();
-
-                    let view_deps: Vec<String> = dag
-                        .nodes
-                        .get(v_id.clone())
-                        .map(|v| v.depends_on.iter().cloned().collect())
-                        .unwrap_or_default();
-
-                    let m_node = dag.nodes.get_mut(m_id.clone()).ok_or_else(|| {
-                        OptimizerError::Exec(format!("make_temp: node '{m_id}' not found"))
-                    })?;
-
-                    // Substitute the view name with an inline subquery, on the
-                    // AST. A plain `str::replace` here corrupts a name that
-                    // occurs inside a string literal, a column alias, or a
-                    // longer identifier, and drops the alias the subquery needs
-                    // for qualified column references to keep resolving.
-                    match inline_view_ast(&m_node.query_text, &v_id, &view_sql, dialect) {
-                        Some(rewritten) => m_node.query_text = rewritten,
-                        None => {
-                            return Err(OptimizerError::Exec(format!(
-                                "make_temp: could not inline view '{v_id}' into '{m_id}' at the \
-                                 AST level; refusing to fall back to text substitution, which \
-                                 would silently change what the query means"
-                            )));
-                        }
-                    }
-                    m_node.depends_on.remove(&v_id);
-                    for dep in view_deps {
-                        m_node.depends_on.insert(dep);
-                    }
-                }
-            }
-        }
-
         // 4 & 5. Replace view_name with lp and rebase the dependency.
         let m_node = dag
             .nodes
@@ -366,6 +374,101 @@ pub fn make_temp(dag: &mut Dag, view_name: &str) -> Result<String, OptimizerErro
     }
 
     Ok(lp_name)
+}
+
+/// Contract the graph minor around `view_name`: inline every intermediate
+/// View that sits between it and `frontier` into the frontier node itself, so
+/// that each frontier node's query reads `view_name` directly.
+///
+/// Edge contraction on the data-flow graph. A View between `view_name` and a
+/// materialized consumer is not a relation the engine will ever build --- it is
+/// text the consumer's query is expanded with --- so the DAG that describes
+/// what the engine actually runs is the one where it has been substituted in.
+/// Every path from `view_name` to `m` collapses onto the single edge
+/// `view_name -> m`.
+///
+/// Each frontier node's `depends_on` is updated to match: the inlined View is
+/// dropped and its own dependencies take its place. `view_name` itself is left
+/// alone --- it is the node whose edge is being contracted *to*, and what the
+/// caller does with that edge is the caller's business: [`make_temp`] repoints
+/// it at a landing pad, while [`crate::opt::dup`] wraps it in a materialized
+/// CTE.
+///
+/// Errors if a View cannot be inlined at the AST level. Falling back to text
+/// substitution is not an option: it silently changes what the query means.
+pub(crate) fn contract_intermediate_views(
+    dag: &mut Dag,
+    view_name: &str,
+    frontier: &HashSet<String>,
+) -> Result<(), OptimizerError> {
+    let dialect = dialect_for_db(&dag.db);
+    for m_id in frontier {
+        // Iteratively inline any direct View dependency of m that has
+        // view_name as a transitive dependency (i.e., sits between view_name
+        // and m on the data-flow path).
+        loop {
+            let view_dep: Option<String> = dag.nodes.get(m_id.clone()).and_then(|m_node| {
+                m_node
+                    .depends_on
+                    .iter()
+                    .find(|dep| {
+                        if *dep == view_name {
+                            return false; // the contracted edge itself
+                        }
+                        let is_view = dag
+                            .nodes
+                            .get((*dep).clone())
+                            .map(|d| matches!(d.materialize, MaterializeMode::View))
+                            .unwrap_or(false);
+                        is_view && is_transitive_dep(dag, dep, view_name)
+                    })
+                    .cloned()
+            });
+
+            let Some(v_id) = view_dep else { break };
+
+            let view_sql = dag
+                .nodes
+                .get(v_id.clone())
+                .ok_or_else(|| {
+                    OptimizerError::Exec(format!("intermediate view '{v_id}' not found"))
+                })?
+                .query_text
+                .clone();
+
+            let view_deps: Vec<String> = dag
+                .nodes
+                .get(v_id.clone())
+                .map(|v| v.depends_on.iter().cloned().collect())
+                .unwrap_or_default();
+
+            let m_node = dag
+                .nodes
+                .get_mut(m_id.clone())
+                .ok_or_else(|| OptimizerError::Exec(format!("node '{m_id}' not found")))?;
+
+            // Substitute the view name with an inline subquery, on the AST. A
+            // plain `str::replace` here corrupts a name that occurs inside a
+            // string literal, a column alias, or a longer identifier, and drops
+            // the alias the subquery needs for qualified column references to
+            // keep resolving.
+            match inline_view_ast(&m_node.query_text, &v_id, &view_sql, dialect) {
+                Some(rewritten) => m_node.query_text = rewritten,
+                None => {
+                    return Err(OptimizerError::Exec(format!(
+                        "could not inline view '{v_id}' into '{m_id}' at the AST level; \
+                         refusing to fall back to text substitution, which would silently \
+                         change what the query means"
+                    )));
+                }
+            }
+            m_node.depends_on.remove(&v_id);
+            for dep in view_deps {
+                m_node.depends_on.insert(dep);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The landing-pad node ID for `node_id`: the same schema prefix, with the

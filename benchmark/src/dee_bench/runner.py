@@ -359,6 +359,20 @@ class CellRunner:
                     "runtime_ms": it.get("runtime_ms"),
                     "combo": it.get("combo") or [],
                     "outcome": it.get("outcome"),
+                    "node_time_ms": it.get("node_time_ms"),
+                    "trial_ms": it.get("trial_ms"),
+                    "resume_overhead_ms": it.get("resume_overhead_ms"),
+                    "resume_ms": it.get("resume_ms"),
+                    # A cancelled iteration's `runtime_ms` is the censoring
+                    # level, not what anyone paid. Summed here so a chart of
+                    # what the search cost does not have to know that.
+                    "total_ms": (
+                        (it.get("trial_ms") or 0)
+                        + (it.get("resume_overhead_ms") or 0)
+                        + (it.get("resume_ms") or 0)
+                        if it.get("trial_ms") is not None
+                        else it.get("runtime_ms")
+                    ),
                     "cpu_seconds": agg.get("cpu_seconds"),
                     "peak_rss_bytes": agg.get("peak_rss_bytes"),
                 })

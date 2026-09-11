@@ -92,7 +92,7 @@ def load(backend):
 
         est = {}
         for key in ("leafset", "signature", "leafset_dup", "signature_dup",
-                    "learned_cost", "learned_cost_dup"):
+                    "learned_cost", "learned_cost_dup", "dup_attribution"):
             per = {}
             for rep in r.get(key, []):
                 for x in rep:
@@ -155,6 +155,9 @@ MODELS = [
     ("signature, downstream", "signature_dup"),
     ("learned cost", "learned_cost"),
     ("learned cost, downstream", "learned_cost_dup"),
+    # Already a duplicate cost: the CTE regions of every consumer's plan, less
+    # one standalone build. No "downstream" variant, because that is all it is.
+    ("dup attribution (measured CTE regions)", "dup_attribution"),
     ("priced (own plan, calibrated)", "priced"),
     ("pg Total Cost (uncalibrated)", "pg_cost"),
     ("penalty only (-rows)", "penalty_only"),

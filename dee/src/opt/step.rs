@@ -140,6 +140,50 @@ pub struct RunContext {
     /// What the execution cost. Populated on an `After` step; `None` on a
     /// `Before` step, where the run has not happened yet.
     pub stats: Option<ExecStats>,
+    /// How a cancelled trial was finished, when this run was one.
+    ///
+    /// A cancelled trial reports no `stats` -- that absence is what tells a
+    /// search its candidate was censored, and it must stay an absence. But the
+    /// run still happened: the candidate executed until it was cut, the
+    /// optimizer then spent time working out what of it could be kept, and the
+    /// incumbent finished the job. Somebody paid for all three, and without
+    /// this the only trace of that is a wall clock nobody can attribute.
+    pub resumed: Option<ResumeTiming>,
+}
+
+/// What a cancelled trial actually cost, in three parts.
+///
+/// The parts are separate because they are paid for different reasons and only
+/// one of them is avoidable. `trial_ms` is the measurement the search wanted
+/// and bounded deliberately. `resume_ms` is the work the pipeline needed done
+/// regardless. `overhead_ms` is neither: it is the optimizer deciding what to
+/// keep and dropping what it cannot, and it is pure tax on cancelling.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResumeTiming {
+    /// Wall time the candidate ran before being cut at its budget.
+    pub trial_ms: i64,
+    /// Wall time between the trial stopping and the resumed run starting:
+    /// planning the resume and dropping the relations it cannot reuse.
+    pub overhead_ms: i64,
+    /// Wall time of the run that finished under the incumbent.
+    pub resume_ms: i64,
+    /// Node time the cancelled candidate spent before it was cut.
+    pub trial_node_time_ms: i64,
+    /// Node time the resumed run spent. Smaller than a whole run's, because
+    /// the resume skips whatever the cancelled trial had already finished.
+    pub resume_node_time_ms: i64,
+}
+
+impl ResumeTiming {
+    /// Everything the iteration cost end to end.
+    pub fn total_ms(&self) -> i64 {
+        self.trial_ms + self.overhead_ms + self.resume_ms
+    }
+
+    /// Database processing time across both halves.
+    pub fn node_time_ms(&self) -> i64 {
+        self.trial_node_time_ms + self.resume_node_time_ms
+    }
 }
 
 /// The phases a run can be in.
@@ -201,6 +245,17 @@ where
     /// Measured wall time of the run that just finished, in milliseconds.
     pub fn measured_ms(&self) -> Option<i64> {
         self.stats().map(|s| s.duration.num_milliseconds())
+    }
+
+    /// Total time the database spent executing this run's queries, whether the
+    /// run completed or was cancelled and finished under the incumbent.
+    pub fn node_time_ms(&self) -> Option<i64> {
+        let run = self.run.as_ref()?;
+        match (&run.stats, &run.resumed) {
+            (Some(stats), _) => Some(stats.node_time_ms()),
+            (None, Some(resumed)) => Some(resumed.node_time_ms()),
+            (None, None) => None,
+        }
     }
 }
 
@@ -303,6 +358,7 @@ mod tests {
             run_phase: phase.into(),
             rep_index: 0,
             stats: None,
+            resumed: None,
         };
         assert!(context(run_phase::MEASURE).is_measured());
         assert!(!context(run_phase::WARMUP).is_measured());

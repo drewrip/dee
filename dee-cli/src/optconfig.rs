@@ -63,6 +63,23 @@ pub enum CliHmpCostMethod {
     /// EXPLAIN ANALYZE plans of every CREATE TABLE run so far.
     #[value(name = "learned_cost", alias = "learned-cost")]
     LearnedCost,
+    /// Inline a view into each consumer as a materialized CTE, EXPLAIN them,
+    /// and charge the view every copy of itself but one. Costs one EXPLAIN per
+    /// consumer per candidate.
+    #[value(name = "dup_attribution", alias = "dup-attribution")]
+    DupAttribution,
+}
+
+/// What `--hmp-cost-method dup_attribution` prices a plan region with.
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum CliSubtreeCostMethod {
+    /// Seconds, from seconds-per-byte constants fitted to executed plans.
+    #[value(name = "learned_cost", alias = "learned-cost")]
+    LearnedCost,
+    /// Estimated output rows, summed over every operator in the region.
+    Cardinality,
+    /// Operators in the region, counted. A control, not a cost model.
+    Operators,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -110,6 +127,9 @@ pub struct OptimizerArgs {
     /// HMP: how to read a View's cost off a run's plans.
     #[arg(long)]
     pub hmp_cost_method: Option<CliHmpCostMethod>,
+    /// HMP: what the dup_attribution cost method prices a plan region with.
+    #[arg(long)]
+    pub hmp_dup_cost_model: Option<CliSubtreeCostMethod>,
     /// HMP: hypotheses the greedy strategy's beam search keeps alive.
     #[arg(long)]
     pub hmp_beam_width: Option<usize>,
@@ -251,6 +271,15 @@ impl OptimizerArgs {
                 CliHmpCostMethod::Signature => json!("signature"),
                 CliHmpCostMethod::NodeTime => json!("node_time"),
                 CliHmpCostMethod::LearnedCost => json!("learned_cost"),
+                CliHmpCostMethod::DupAttribution => json!("dup_attribution"),
+            }),
+        );
+        set(
+            "hmp_dup_cost_model",
+            self.hmp_dup_cost_model.as_ref().map(|m| match m {
+                CliSubtreeCostMethod::LearnedCost => json!("learned_cost"),
+                CliSubtreeCostMethod::Cardinality => json!("cardinality"),
+                CliSubtreeCostMethod::Operators => json!("operators"),
             }),
         );
         set("hmp_beam_width", self.hmp_beam_width.map(|v| json!(v)));

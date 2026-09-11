@@ -1,0 +1,58 @@
+# Does the `dup_attribution` cost method drive a real HMP search?
+#
+# One cell: DuckDB at sf=1 on p05_hr, twelve DAG runs of budget. Deliberately
+# the same shape as `learned-cost.yaml`'s p05 cell -- same project, scale,
+# backend, budget, strategy and working-set cut -- because the question is not
+# "does HMP work" but "does ranking by measured duplication pick different, and
+# better, candidates than ranking by a View's own priced plan".
+#
+# `dup_attribution` inlines each candidate View into every materialized
+# consumer as a materialized CTE, EXPLAINs them, and charges the View every
+# copy of itself but one. `hmp_dup_cost_model` is what those plan regions are
+# priced with; `learned_cost` (the default) gives seconds, from the same
+# seconds-per-byte constants the `learned_cost` method ranks by -- so the two
+# runs differ in the attribution and not in the units.
+#
+# Run with `RUST_LOG=dee::opt::hmp=debug,dee::opt::dup=debug` to get the
+# per-consumer breakdown and the ranking into `server.log`.
+#
+#   dee-bench run -c configs/dup-attribution.yaml
+name: dup-attribution
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/dup-attribution
+verbosity: detailed
+
+matrix:
+  project: [p05_hr]
+  backend: [duckdb]
+  sf: [1]
+  variant: [dup_attribution]
+
+variants:
+  dup_attribution: {passes: [hmp], hmp_cost_method: dup_attribution}
+
+dee_opt:
+  hmp_max_runs: 12
+  hmp_strategy: breadth
+  hmp_dup_cost_model: learned_cost
+  # The whole ranking in the working set, as in the learned-cost run: a
+  # narrower cut admits one node and the search exhausts long before the
+  # twelve-run budget this is about.
+  hmp_top_cpu_time: 1.0
+  hmp_use_pushdown: false
+  # Measure every candidate to completion. Cancelling one at the incumbent's
+  # time records a lower bound, and a trace of lower bounds is not a runtime
+  # curve.
+  trial_resume: false
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 1
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

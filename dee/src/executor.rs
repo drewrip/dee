@@ -758,6 +758,23 @@ pub struct ExecStats {
     pub system_samples: Vec<SystemUsageSample>,
 }
 
+impl ExecStats {
+    /// Total time the engine spent executing this run's node queries: every
+    /// node's own duration, summed.
+    ///
+    /// Not the wall clock. Nodes run concurrently, so this exceeds
+    /// `duration` on any DAG with width -- which is the point of having both.
+    /// Wall clock says how long the pipeline took; this says how much work the
+    /// database did, and an optimization that removes duplicated computation
+    /// should move this even where scheduling hides it from the clock.
+    pub fn node_time_ms(&self) -> i64 {
+        self.node_stats
+            .values()
+            .map(|n| n.duration.num_milliseconds())
+            .sum()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeStats {
     pub start: DateTime<Utc>,

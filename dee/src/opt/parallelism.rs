@@ -720,13 +720,12 @@ where
         };
 
         state.runs_used += 1;
-        state.iterations.push(IterationStat {
-            iteration: state.iterations.len() + 1,
-            runtime_ms: cost as i64,
-            outcome: Some(in_flight.stage.clone()),
-            system_samples: samples,
-            ..Default::default()
-        });
+        state.iterations.push(
+            IterationStat::new(state.iterations.len() + 1, cost as i64)
+                .with_outcome(in_flight.stage.clone())
+                .with_run_cost(ctx)
+                .with_samples(samples),
+        );
 
         let is_control = in_flight.stage == "control";
         if is_control {
@@ -1013,13 +1012,12 @@ where
         state.observed_in_flight = state.observed_in_flight.max(observed_in_flight);
         state.seed_remaining = state.seed_remaining.saturating_sub(1);
         state.runs_used += 1;
-        state.iterations.push(IterationStat {
-            iteration: state.iterations.len() + 1,
-            runtime_ms: cost as i64,
-            outcome: Some("baseline".to_string()),
-            system_samples: samples,
-            ..Default::default()
-        });
+        state.iterations.push(
+            IterationStat::new(state.iterations.len() + 1, cost as i64)
+                .with_outcome("baseline")
+                .with_run_cost(ctx)
+                .with_samples(samples),
+        );
         self.record_trial(
             ctx.store,
             ctx.dag_id,
@@ -1753,6 +1751,7 @@ mod tests {
                     run_phase: run_phase::MEASURE.to_string(),
                     rep_index: self.run_seq as i32,
                     stats: ms.map(stats_of),
+                    resumed: None,
                 }),
             };
             let outcome = self.pass.step(&mut ctx).await.expect("after step");
@@ -1782,6 +1781,7 @@ mod tests {
                     run_phase: run_phase::MEASURE.to_string(),
                     rep_index: self.run_seq as i32,
                     stats: Some(stats),
+                    resumed: None,
                 }),
             };
             let outcome = self.pass.step(&mut ctx).await.expect("after step");
@@ -2655,6 +2655,7 @@ mod tests {
                 run_phase: run_phase::WARMUP.to_string(),
                 rep_index: 0,
                 stats: Some(stats_of(9999)),
+                resumed: None,
             }),
         };
         h.pass.step(&mut ctx).await.expect("after step");

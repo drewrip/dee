@@ -309,6 +309,7 @@ mod tests {
             row_width_bytes: None,
             aggregates: Vec::new(),
             relation: Some(relation.into()),
+            subplan: None,
             children: Vec::new(),
         }
     }
@@ -322,6 +323,7 @@ mod tests {
             row_width_bytes: None,
             aggregates: Vec::new(),
             relation: None,
+            subplan: None,
             children,
         }
     }

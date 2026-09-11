@@ -79,7 +79,7 @@ fn dag_file(
 }
 
 /// The per-View ranking one costing method reads off `stats`.
-fn costs<C>(
+async fn costs<C>(
     conn: Arc<C>,
     engine: Arc<SimpleEngine<C>>,
     dag: &Dag,
@@ -99,6 +99,7 @@ where
     };
     let pass: HMPPass<C, SimpleEngine<C>> = HMPPass::from_config(conn, engine, &cfg);
     pass.ranking_for(dag, stats)
+        .await
         .into_iter()
         .map(|r| {
             json!({
@@ -196,6 +197,10 @@ where
         let mut signature_dup: Vec<Vec<Value>> = Vec::new();
         let mut learned: Vec<Vec<Value>> = Vec::new();
         let mut learned_dup: Vec<Vec<Value>> = Vec::new();
+        // `dup_attribution` reports a duplicate cost by construction, so it is
+        // swept once rather than in both flavours: the `downstream` flag it
+        // would be swept over does not reach it.
+        let mut dup_attribution: Vec<Vec<Value>> = Vec::new();
         let mut last: Option<ExecStats> = None;
         for _ in 0..reps {
             let s = run_once(&engine, &base).await;
@@ -209,15 +214,11 @@ where
                 (&mut signature_dup, HmpCostMethod::Signature, true),
                 (&mut learned, HmpCostMethod::LearnedCost, false),
                 (&mut learned_dup, HmpCostMethod::LearnedCost, true),
+                (&mut dup_attribution, HmpCostMethod::DupAttribution, false),
             ] {
-                sink.push(costs(
-                    conn.clone(),
-                    engine.clone(),
-                    &base,
-                    &s,
-                    method,
-                    downstream,
-                ));
+                sink.push(
+                    costs(conn.clone(), engine.clone(), &base, &s, method, downstream).await,
+                );
             }
             last = Some(s);
         }
@@ -327,6 +328,7 @@ where
             "signature_dup": signature_dup,
             "learned_cost": learned,
             "learned_cost_dup": learned_dup,
+            "dup_attribution": dup_attribution,
             "truth": truth,
         }));
         std::fs::write(out_path, serde_json::to_string_pretty(&results).unwrap()).unwrap();

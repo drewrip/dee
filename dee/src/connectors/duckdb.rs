@@ -603,6 +603,32 @@ impl Connector for DuckDBConnection {
         Ok(Some(result))
     }
 
+    async fn explain(&self, query_text: &str) -> Result<Option<String>, ConnectorError> {
+        let explain_query = format!("EXPLAIN (FORMAT JSON) {}", query_text);
+        self.blocking(move |conn| {
+            let mut stmt = conn.prepare(&explain_query).map_err(|e| {
+                ConnectorError::Execute(format!("Failed to prepare explain: {e}"))
+            })?;
+            // Two columns (`explain_key`, `explain_value`) in every version
+            // that prints a header; one in those that do not.
+            let json_str: String = stmt
+                .query_row([], |row| {
+                    if row.as_ref().column_count() >= 2 {
+                        row.get(1)
+                    } else {
+                        row.get(0)
+                    }
+                })
+                .map_err(|e| {
+                    ConnectorError::Execute(format!(
+                        "Failed to execute explain: {e} - query_text:\n{explain_query}"
+                    ))
+                })?;
+            Ok(Some(json_str))
+        })
+        .await
+    }
+
     fn parse_plan(&self, json: &str) -> Option<Vec<crate::plan::PlanNode>> {
         crate::plan::parse_duckdb_plan(json)
     }

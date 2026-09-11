@@ -104,6 +104,20 @@ pub trait Connector {
         Ok(None)
     }
 
+    /// The plan this backend would use for `query_text`, in the backend's own
+    /// JSON, without executing it.
+    ///
+    /// A plain EXPLAIN, never an ANALYZE: the caller is asking what a query
+    /// *would* do, and the query may be an expensive one it has no intention of
+    /// running. The text is whatever [`Connector::parse_plan`] on the same
+    /// connector accepts.
+    ///
+    /// `Ok(None)` when the connector cannot answer, which a caller must treat
+    /// as "unknown" rather than "no plan".
+    async fn explain(&self, _query_text: &str) -> Result<Option<String>, ConnectorError> {
+        Ok(None)
+    }
+
     /// Parse this backend's plan JSON into the optimizer's neutral plan form.
     ///
     /// Returns `None` when the text is not a plan this backend recognizes.

@@ -1,0 +1,69 @@
+# `dup_attribution` again, this time paying for its search the way a real
+# pipeline would.
+#
+# Two things change from `dup-attribution.yaml`, and neither touches the cost
+# method:
+#
+#  * **Early stopping.** `trial_resume` cancels a candidate the moment it has
+#    overrun the best configuration found so far, and finishes the run under
+#    that incumbent instead. The search gets a censored observation -- "at
+#    least this slow" -- which is all it needed from a losing candidate anyway,
+#    and the pipeline stops paying for the tail of runs it has already
+#    rejected. `trial_budget_eps` is left at its default of 0: a trial is cut
+#    the moment it can no longer win.
+#  * **Thread tuning.** The `parallelism` pass sweeps a ladder of node
+#    concurrency caps and keeps the best. `parallelism_after_materialization`
+#    puts it *after* HMP, because the authored DAG is one dominant query
+#    surrounded by views and has nothing to schedule until HMP has split it
+#    into materialized tables.
+#
+# Everything else is held at the first run's settings so the traces compare:
+# p05_hr, DuckDB sf=1, twelve HMP runs, breadth, whole ranking in the working
+# set, no pushdown.
+#
+#   dee-bench run -c configs/dup-attribution-tuned.yaml
+name: dup-attribution-tuned2
+dag_bench: ${DAG_BENCH}
+dee_bin: ../../target/release/dee
+output_dir: ../results/dup-attribution-tuned2
+verbosity: detailed
+
+matrix:
+  project: [p05_hr]
+  backend: [duckdb]
+  sf: [1]
+  variant: [dup_tuned]
+
+variants:
+  dup_tuned:
+    passes: [hmp, parallelism]
+    hmp_cost_method: dup_attribution
+
+dee_opt:
+  hmp_max_runs: 12
+  hmp_strategy: breadth
+  hmp_dup_cost_model: learned_cost
+  hmp_top_cpu_time: 1.0
+  hmp_use_pushdown: false
+
+  # Early stopping for bad candidates.
+  trial_resume: true
+  trial_reuse: equivalent
+
+  # Thread tuning. Nested in a list so the ladder is one value rather than
+  # four cells -- any bare list under `dee_opt` sweeps.
+  parallelism_ladder: [[1, 2, 4, 8]]
+  parallelism_seed_repeats: 2
+  parallelism_confirm_runs: 1
+  parallelism_after_materialization: true
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 1
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

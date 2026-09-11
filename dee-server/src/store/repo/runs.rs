@@ -830,11 +830,7 @@ pub async fn record_success(
     plan_time_basis: String,
     cleanup_ms: i64,
 ) -> Result<(), StoreError> {
-    let node_time_ms: i64 = stats
-        .node_stats
-        .values()
-        .map(|n| n.duration.num_milliseconds())
-        .sum();
+    let node_time_ms: i64 = stats.node_time_ms();
     let node_count = stats.node_stats.len() as i32;
     let rows_produced: Option<i64> = {
         let total: i64 = stats

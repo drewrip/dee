@@ -1,4 +1,5 @@
 pub mod common;
+pub mod dup;
 pub mod explain;
 pub mod hmp;
 pub mod leafset;
@@ -26,6 +27,7 @@ use crate::{
     dag::Dag,
     executor::{Executor, ExecutorError, RunOptions, StopReason},
     opt::{
+        dup::SubtreeCostMethod,
         hmp::{HMPStrategy, HmpCostMethod},
         omp::OMPCentrality,
         resume::ReusePolicy,
@@ -45,7 +47,8 @@ pub use crate::opt::report::{
     PassDetail, PassOutcome, PassReport, PushdownDetail, PushdownOutcome, RungResult,
 };
 pub use crate::opt::step::{
-    OptimizationType, RegisterContext, RunContext, StepContext, StepOutcome, StepPhase, run_phase,
+    OptimizationType, RegisterContext, ResumeTiming, RunContext, StepContext, StepOutcome,
+    StepPhase, run_phase,
 };
 pub use crate::opt::store::{OptStore, OptStoreError, Registration};
 
@@ -492,6 +495,8 @@ where
             dag_runs_used += 1;
             last_run = Some(working.clone());
 
+            // What a cancelled iteration cost, filled in on the path below.
+            let mut resumed: Option<ResumeTiming> = None;
             let stats = match outcome.stopped {
                 None => Some(outcome.stats),
                 Some(StopReason::Cancelled) => return Err(OptimizerError::Exec(
@@ -515,6 +520,11 @@ where
                         self.config.trial_reuse,
                     );
                     resume::drop_relations(self.conn.as_ref(), &plan.to_drop).await;
+                    // Everything from here back to the trial's last moment is
+                    // the price of having cancelled: planning the resume and
+                    // dropping what it cannot keep. The resumed run stamps its
+                    // own start, so the gap is measured rather than inferred.
+                    let trial_stats = outcome.stats;
                     // The incumbent with the cancelled run's usable pads wired
                     // back in, so its remaining nodes read what that run already
                     // materialized instead of recomputing it.
@@ -543,6 +553,15 @@ where
                              run could not be finished under the incumbent either ({reason:?})"
                         )));
                     }
+                    resumed = Some(ResumeTiming {
+                        trial_ms: trial_stats.duration.num_milliseconds(),
+                        overhead_ms: (delivered.stats.start - trial_stats.finish)
+                            .num_milliseconds()
+                            .max(0),
+                        resume_ms: delivered.stats.duration.num_milliseconds(),
+                        trial_node_time_ms: trial_stats.node_time_ms(),
+                        resume_node_time_ms: delivered.stats.node_time_ms(),
+                    });
                     // The pads are scaffolding, not part of the incumbent:
                     // drop them now that the run has consumed them.
                     let spent: Vec<String> =
@@ -582,6 +601,7 @@ where
                         run_phase: run_phase::MEASURE.to_string(),
                         rep_index: iteration as i32,
                         stats,
+                        resumed,
                     }),
                 };
                 let outcome = optimization.step(&mut ctx).await?;
@@ -695,8 +715,13 @@ pub struct OptimizerConfig {
     /// still contained in the View's own; `signature` is the older method that
     /// matches operators between plans by name and estimated cardinality;
     /// `learned_cost` prices the View's own plan with per-operator
-    /// seconds-per-byte constants fitted to executed plans.
+    /// seconds-per-byte constants fitted to executed plans;
+    /// `dup_attribution` inlines the View into each consumer as a materialized
+    /// CTE, EXPLAINs them, and charges it every copy but one.
     pub hmp_cost_method: HmpCostMethod,
+    /// HMP: what the `dup_attribution` cost method prices a plan region with.
+    /// Ignored by every other method, none of which has a notion of a region.
+    pub hmp_dup_cost_model: SubtreeCostMethod,
     pub hmp_use_pushdown: bool,
     /// HMP: number of hypotheses the `Greedy` strategy's beam search keeps
     /// alive at each step. Unused by the `Breadth` strategy.
@@ -831,6 +856,7 @@ impl Default for OptimizerConfig {
             hmp_normalize_with_cardinality: false,
             hmp_strategy: HMPStrategy::default(),
             hmp_cost_method: HmpCostMethod::default(),
+            hmp_dup_cost_model: SubtreeCostMethod::default(),
             hmp_use_pushdown: true,
             hmp_beam_width: 2,
             profile_iterations: false,
@@ -998,6 +1024,12 @@ impl OptimizerConfig {
 
     pub fn with_hmp_normalize_with_cardinality(mut self, normalize_with_cardinality: bool) -> Self {
         self.hmp_normalize_with_cardinality = normalize_with_cardinality;
+        self
+    }
+
+    /// What the `dup_attribution` cost method prices a plan region with.
+    pub fn with_hmp_dup_cost_model(mut self, model: SubtreeCostMethod) -> Self {
+        self.hmp_dup_cost_model = model;
         self
     }
 

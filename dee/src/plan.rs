@@ -72,6 +72,23 @@ pub struct PlanNode {
     /// relation (see [`is_pseudo_scan`]).
     #[serde(default)]
     pub relation: Option<String>,
+    /// The name of the CTE whose *definition* this subtree is, when the engine
+    /// reported one.
+    ///
+    /// Set only on the root of a CTE body, never on the operators inside it and
+    /// never on the scans that read the CTE back. Both backends say which part
+    /// of a plan computes a CTE, and both say it differently --- DuckDB hangs
+    /// the body off a `CTE` operator carrying `CTE Name`, Postgres marks the
+    /// body's own root with `Subplan Name: "CTE <n>"` --- so each parser
+    /// normalizes its own spelling into this one field and
+    /// [`PlanNode::find_subplan`] can then be written once.
+    ///
+    /// This is what lets a caller ask an EXPLAIN "which of these operators are
+    /// the CTE I put there", which is how duplicate-computation attribution
+    /// isolates an inlined View inside its consumer's plan. See
+    /// [`crate::opt::dup`].
+    #[serde(default)]
+    pub subplan: Option<String>,
     pub children: Vec<PlanNode>,
 }
 
@@ -169,6 +186,27 @@ impl PlanNode {
     pub fn is_aggregate_boundary(&self) -> bool {
         is_aggregate_boundary(&self.operator)
     }
+
+    /// The subtree that computes the CTE named `name`, searched for anywhere
+    /// in this plan.
+    ///
+    /// Case-insensitive: the name goes into the SQL as written and comes back
+    /// out of the plan folded however the engine folds identifiers.
+    pub fn find_subplan(&self, name: &str) -> Option<&PlanNode> {
+        if self
+            .subplan
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(name))
+        {
+            return Some(self);
+        }
+        self.children.iter().find_map(|c| c.find_subplan(name))
+    }
+}
+
+/// The subtree of `roots` that computes the CTE named `name`.
+pub fn find_subplan<'a>(roots: &'a [PlanNode], name: &str) -> Option<&'a PlanNode> {
+    roots.iter().find_map(|r| r.find_subplan(name))
 }
 
 /// Strip a plan's catalog/schema qualification and quoting down to the bare
@@ -366,6 +404,22 @@ impl DuckDBPlan {
         let Some(operator) = name else {
             return children;
         };
+        // DuckDB puts a materialized CTE's body under a `CTE` operator that
+        // names it, with the body first and the query that reads it second.
+        // Tagging the body's own root -- rather than the `CTE` node, which also
+        // covers the consumer -- is what makes the tag mean "these operators
+        // are the CTE and nothing else".
+        let mut children = children;
+        if operator.eq_ignore_ascii_case("CTE")
+            && let Some(cte_name) = self
+                .extra_info
+                .get("CTE Name")
+                .and_then(|v| v.as_str())
+                .filter(|n| !n.is_empty())
+            && let Some(body) = children.first_mut()
+        {
+            body.subplan = Some(cte_name.to_string());
+        }
         let estimated = self
             .extra_info
             .get("Estimated Cardinality")
@@ -411,6 +465,7 @@ impl DuckDBPlan {
             row_width_bytes,
             aggregates,
             relation,
+            subplan: None,
             children,
         }]
     }
@@ -478,6 +533,10 @@ struct PgPlan {
     /// rule on both backends.
     #[serde(rename = "Relation Name", default)]
     relation_name: Option<String>,
+    /// `"CTE <name>"` on the root of a CTE's body, `"InitPlan N"` /
+    /// `"SubPlan N"` elsewhere. Only the CTE spelling is read.
+    #[serde(rename = "Subplan Name", default)]
+    subplan_name: Option<String>,
     #[serde(rename = "Plans", default)]
     plans: Vec<PgPlan>,
 }
@@ -550,6 +609,15 @@ impl PgPlan {
         } else {
             Vec::new()
         };
+        // Postgres names a CTE's body on the body itself, as `CTE <name>`.
+        // The other `Subplan Name` spellings (`InitPlan 1`, `SubPlan 2`) are
+        // not CTEs and must not answer to one.
+        let subplan = self
+            .subplan_name
+            .as_deref()
+            .and_then(|s| s.strip_prefix("CTE "))
+            .map(|n| n.trim().trim_matches('"').to_string())
+            .filter(|n| !n.is_empty());
         PlanNode {
             operator: self.node_type,
             exclusive_time_s: exclusive,
@@ -558,6 +626,7 @@ impl PgPlan {
             row_width_bytes: self.plan_width,
             aggregates,
             relation,
+            subplan,
             children: self
                 .plans
                 .into_iter()

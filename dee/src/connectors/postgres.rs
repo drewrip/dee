@@ -483,6 +483,15 @@ impl Connector for PostgresConnection {
         Ok(Some(out))
     }
 
+    async fn explain(&self, query_text: &str) -> Result<Option<String>, ConnectorError> {
+        // VERBOSE for the same reason the node plans ask for it: without it
+        // there is no `Output`, and an aggregate cannot be told apart from
+        // another aggregate computing something else entirely.
+        self.explain_json(&format!("EXPLAIN (VERBOSE, FORMAT JSON) {query_text}"))
+            .await
+            .map(Some)
+    }
+
     fn parse_plan(&self, json: &str) -> Option<Vec<PlanNode>> {
         parse_postgres_plan(json)
     }

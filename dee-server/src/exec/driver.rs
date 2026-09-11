@@ -217,6 +217,7 @@ where
                 run_phase: run.phase.clone(),
                 rep_index: run.rep_index,
                 stats: None,
+                resumed: None,
             }),
         )
         .await;
@@ -395,6 +396,13 @@ where
                         // slow as the cap". Every continuous pass reads it as a
                         // rejection and moves its search on.
                         stats: None,
+                        // The resume has not happened yet -- here the `After`
+                        // step deliberately runs first, so the verdict comes
+                        // from the censored run rather than from a delivery it
+                        // had no part in. The batch driver resumes before
+                        // stepping and can report the breakdown; this one
+                        // cannot, and inventing a zero would misreport it.
+                        resumed: None,
                     }),
                 )
                 .await;
@@ -537,6 +545,7 @@ where
                         run_phase: run.phase.clone(),
                         rep_index: run.rep_index,
                         stats: Some(stats.clone()),
+                        resumed: None,
                     }),
                 )
                 .await;
