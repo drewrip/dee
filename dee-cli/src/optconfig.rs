@@ -59,6 +59,10 @@ pub enum CliHmpCostMethod {
     // usual convention is not turned away.
     #[value(name = "node_time", alias = "node-time")]
     NodeTime,
+    /// Price a view's own plan with seconds-per-byte constants fitted to the
+    /// EXPLAIN ANALYZE plans of every CREATE TABLE run so far.
+    #[value(name = "learned_cost", alias = "learned-cost")]
+    LearnedCost,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -246,6 +250,7 @@ impl OptimizerArgs {
                 CliHmpCostMethod::Leafset => json!("leafset"),
                 CliHmpCostMethod::Signature => json!("signature"),
                 CliHmpCostMethod::NodeTime => json!("node_time"),
+                CliHmpCostMethod::LearnedCost => json!("learned_cost"),
             }),
         );
         set("hmp_beam_width", self.hmp_beam_width.map(|v| json!(v)));

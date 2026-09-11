@@ -194,6 +194,8 @@ where
         // both are recorded and scored.
         let mut leafset_dup: Vec<Vec<Value>> = Vec::new();
         let mut signature_dup: Vec<Vec<Value>> = Vec::new();
+        let mut learned: Vec<Vec<Value>> = Vec::new();
+        let mut learned_dup: Vec<Vec<Value>> = Vec::new();
         let mut last: Option<ExecStats> = None;
         for _ in 0..reps {
             let s = run_once(&engine, &base).await;
@@ -205,6 +207,8 @@ where
                 (&mut signature, HmpCostMethod::Signature, false),
                 (&mut leafset_dup, HmpCostMethod::Leafset, true),
                 (&mut signature_dup, HmpCostMethod::Signature, true),
+                (&mut learned, HmpCostMethod::LearnedCost, false),
+                (&mut learned_dup, HmpCostMethod::LearnedCost, true),
             ] {
                 sink.push(costs(
                     conn.clone(),
@@ -321,6 +325,8 @@ where
             "signature": signature,
             "leafset_dup": leafset_dup,
             "signature_dup": signature_dup,
+            "learned_cost": learned,
+            "learned_cost_dup": learned_dup,
             "truth": truth,
         }));
         std::fs::write(out_path, serde_json::to_string_pretty(&results).unwrap()).unwrap();

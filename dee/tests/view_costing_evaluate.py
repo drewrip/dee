@@ -91,7 +91,8 @@ def load(backend):
                             "write_s": max(write_s, 0.0) if write_s is not None else None})
 
         est = {}
-        for key in ("leafset", "signature", "leafset_dup", "signature_dup"):
+        for key in ("leafset", "signature", "leafset_dup", "signature_dup",
+                    "learned_cost", "learned_cost_dup"):
             per = {}
             for rep in r.get(key, []):
                 for x in rep:
@@ -152,6 +153,8 @@ MODELS = [
     ("signature", "signature"),
     ("leafset, downstream", "leafset_dup"),
     ("signature, downstream", "signature_dup"),
+    ("learned cost", "learned_cost"),
+    ("learned cost, downstream", "learned_cost_dup"),
     ("priced (own plan, calibrated)", "priced"),
     ("pg Total Cost (uncalibrated)", "pg_cost"),
     ("penalty only (-rows)", "penalty_only"),

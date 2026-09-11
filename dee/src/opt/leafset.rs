@@ -306,6 +306,8 @@ mod tests {
             exclusive_time_s: Some(time),
             cardinality: Some(100),
             estimated_cardinality: Some(100.0),
+            row_width_bytes: None,
+            aggregates: Vec::new(),
             relation: Some(relation.into()),
             children: Vec::new(),
         }
@@ -317,6 +319,8 @@ mod tests {
             exclusive_time_s: Some(time),
             cardinality: Some(rows),
             estimated_cardinality: Some(rows as f64),
+            row_width_bytes: None,
+            aggregates: Vec::new(),
             relation: None,
             children,
         }

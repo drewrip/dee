@@ -1,0 +1,46 @@
+# Quick check that the `learned_cost` method drives a real HMP search.
+#
+# One cell: DuckDB, p03_ecommerce at sf=1, twelve DAG runs of budget. The point
+# is the search trace -- does the runtime actually come down as HMP spends its
+# budget on the candidates the learned seconds-per-byte constants ranked first.
+#
+#   dee-bench run -c configs/learned-cost-p03.yaml
+name: learned-cost-p03
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/learned-cost-p03
+verbosity: detailed
+
+matrix:
+  project: [p03_ecommerce]
+  backend: [duckdb]
+  sf: [1]
+  variant: [learned_cost]
+
+variants:
+  learned_cost: {passes: [hmp], hmp_cost_method: learned_cost}
+
+dee_opt:
+  hmp_max_runs: 12
+  hmp_strategy: breadth
+  # The learned ranking is very top-heavy -- the leading candidate takes almost
+  # all the ranked mass -- so a 0.8 cut admits one node and the search exhausts
+  # after two runs. 1.0 puts the whole ranking in the working set, which is what
+  # spends the twelve-run budget the test is about.
+  hmp_top_cpu_time: 1.0
+  hmp_use_pushdown: false
+  # Measure every candidate to completion. Cancelling one at the incumbent's
+  # time records a lower bound, and a trace of lower bounds is not a runtime
+  # curve.
+  trial_resume: false
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 1
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

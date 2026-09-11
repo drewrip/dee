@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     marker::PhantomData,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -18,6 +18,7 @@ use crate::{
         Dag, Optimization, OptimizerError, OptimizerConfig,
         common::{dialect_for_db, make_temp},
         leafset::{PlanArena, ViewRegionRequest, attribute_chain, has_top_level_group_by},
+        learned::LearnedCostModel,
         explain::{render_bar_row, render_card_grid, render_ranked_table},
         pushdown::PushdownPass,
         resume::node_signature,
@@ -64,6 +65,14 @@ pub enum HmpCostMethod {
     /// Rank Views by their own measured node time. Also the automatic fallback
     /// when a run carried no plans at all.
     NodeTime,
+    /// Price a View's own plan with seconds-per-byte constants fitted to the
+    /// EXPLAIN ANALYZE plans of every `CREATE TABLE` the engine has run. See
+    /// [`crate::opt::learned`].
+    ///
+    /// Unlike the other three this carries knowledge between runs: the
+    /// constants are a property of the engine and the machine, so what one DAG
+    /// learns prices every other DAG's Views.
+    LearnedCost,
 }
 
 impl HmpCostMethod {
@@ -72,6 +81,7 @@ impl HmpCostMethod {
             HmpCostMethod::Leafset => "leafset",
             HmpCostMethod::Signature => "signature",
             HmpCostMethod::NodeTime => "node_time",
+            HmpCostMethod::LearnedCost => "learned_cost",
         }
     }
 }
@@ -84,8 +94,10 @@ impl std::str::FromStr for HmpCostMethod {
             "leafset" => Ok(HmpCostMethod::Leafset),
             "signature" => Ok(HmpCostMethod::Signature),
             "node_time" | "nodetime" => Ok(HmpCostMethod::NodeTime),
+            "learned_cost" | "learnedcost" => Ok(HmpCostMethod::LearnedCost),
             other => Err(format!(
-                "unknown hmp cost method '{other}'; expected leafset, signature or node_time"
+                "unknown hmp cost method '{other}'; expected leafset, signature, \
+                 node_time or learned_cost"
             )),
         }
     }
@@ -250,6 +262,14 @@ where
     node_rows: Vec<NodeRankingRow>,
     /// Data collected during the last `step()`, used by `explain`.
     explain_data: Option<HMPExplainData>,
+    /// The seconds-per-byte constants `LearnedCost` prices plans with.
+    ///
+    /// Behind a lock because `ranking_for` takes `&self` --- it is called from
+    /// the offline benchmark as a pure function of a run --- while every run it
+    /// sees teaches it something more. Loaded from and written back to the
+    /// metadata store around each step, which is what makes the learning
+    /// survive the process.
+    learned: Arc<Mutex<LearnedCostModel>>,
     _phantom: PhantomData<E>,
 }
 
@@ -373,6 +393,7 @@ where
             operator_rows: Vec::new(),
             node_rows: Vec::new(),
             explain_data: None,
+            learned: Arc::new(Mutex::new(LearnedCostModel::new())),
             _phantom: PhantomData,
         }
     }
@@ -781,6 +802,13 @@ fn combinations(items: &[String], k: usize) -> Vec<Vec<String>> {
 
 const STATE_TABLE: &str = "opt_hmp_state";
 const TRIALS_TABLE: &str = "opt_hmp_trials";
+/// The `LearnedCost` method's seconds-per-byte constants.
+///
+/// One row for the whole engine rather than one per DAG: a hash join's cost per
+/// output byte is a property of the engine and the machine, not of the pipeline
+/// that happened to contain it, so what one DAG measures should price the next
+/// one's Views on its very first run.
+const LEARNED_TABLE: &str = "opt_hmp_learned_cost";
 
 impl<C, E> HMPPass<C, E>
 where
@@ -860,6 +888,99 @@ where
             )
             .await?;
         Ok(())
+    }
+
+    /// The seconds-per-byte constants recorded by every run so far.
+    ///
+    /// A missing table is an empty model, not an error: the pass is asked to
+    /// rank before it has ever been registered in tests and benchmarks, and a
+    /// model that has learned nothing is exactly what it should have then.
+    async fn load_learned(&self, store: &dyn OptStore) -> LearnedCostModel {
+        let rows = match store
+            .query(&format!("SELECT model FROM {LEARNED_TABLE}"), &[])
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                if !crate::opt::store::is_missing_table(&e) {
+                    warn!("HMPPass: could not read the learned cost model: {e}");
+                }
+                return LearnedCostModel::new();
+            }
+        };
+        rows.first()
+            .and_then(|r| r.get("model"))
+            .and_then(|v| v.as_str())
+            .and_then(|raw| match serde_json::from_str(raw) {
+                Ok(model) => Some(model),
+                Err(e) => {
+                    warn!("HMPPass: discarding an undecodable learned cost model: {e}");
+                    None
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    /// Write the constants back, replacing the single stored row.
+    ///
+    /// The whole model goes out each time rather than a delta, because it is
+    /// the merge of what was read and what this run observed --- writing a delta
+    /// would double-count everything already in the row.
+    async fn save_learned(
+        &self,
+        store: &dyn OptStore,
+        model: &LearnedCostModel,
+    ) -> Result<(), OptimizerError> {
+        let encoded = serde_json::to_string(model)
+            .map_err(|e| OptimizerError::Store(crate::opt::OptStoreError::Decode(e.to_string())))?;
+        store
+            .execute(&format!("DELETE FROM {LEARNED_TABLE}"), &[])
+            .await?;
+        store
+            .execute(
+                &format!("INSERT INTO {LEARNED_TABLE} (model, updated_at) VALUES (?, now())"),
+                &[json!(encoded)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Fold what earlier runs learned into this pass's in-memory model, so the
+    /// ranking about to be computed is priced by everything known so far.
+    ///
+    /// Only for `LearnedCost`: the other methods never read the model, and
+    /// every other DAG registered on this store pays for the query otherwise.
+    async fn adopt_learned(&self, store: &dyn OptStore) {
+        if self.cost_method != HmpCostMethod::LearnedCost {
+            return;
+        }
+        let stored = self.load_learned(store).await;
+        if let Ok(mut model) = self.learned.lock() {
+            model.merge(&stored);
+        }
+    }
+
+    /// Persist what the ranking just learned, so the next run starts from it.
+    async fn publish_learned(&self, store: &dyn OptStore) {
+        if self.cost_method != HmpCostMethod::LearnedCost {
+            return;
+        }
+        let snapshot = match self.learned.lock() {
+            Ok(model) => model.clone(),
+            Err(_) => return,
+        };
+        if snapshot.is_empty() {
+            return;
+        }
+        if let Err(e) = self.save_learned(store, &snapshot).await {
+            warn!("HMPPass: could not persist the learned cost model: {e}");
+        }
+        // The stored row is now everything this pass knows, so keeping the
+        // same observations in memory too would double them into the next
+        // write. Start empty; the next `adopt_learned` reads them back.
+        if let Ok(mut model) = self.learned.lock() {
+            *model = LearnedCostModel::new();
+        }
     }
 
     /// Rank candidate Views by leaf-set matching against every persisted
@@ -1047,6 +1168,151 @@ where
         Some(rows)
     }
 
+    /// Rank candidate Views by pricing each View's own plan with
+    /// seconds-per-byte constants fitted to the run's executed plans.
+    ///
+    /// Two halves. First it *learns*: every `CREATE TABLE` in this run came
+    /// back with an EXPLAIN ANALYZE plan, and every operator in one of those
+    /// carries a timing, a row count and a tuple width, which is a
+    /// seconds-per-byte observation for that operator's type. Those fold into
+    /// whatever the model already knew. Then it *prices*: a candidate View's
+    /// own plan, which was never executed and has no timings at all, is costed
+    /// operator by operator as output bytes times the constant for its type.
+    ///
+    /// That second half is the reason this method exists. Leaf-set matching can
+    /// only price a View the DAG actually inlined somewhere measurable this
+    /// run; a constant fitted to bytes prices any plan the engine will show,
+    /// including one for a View whose consumers all went a different way.
+    ///
+    /// Returns `None` when nothing has been learned yet, or when no candidate
+    /// could be priced --- the caller falls back rather than reporting a ranking
+    /// of nothing.
+    fn ranking_learned(&self, dag: &Dag, stats: &ExecStats) -> Option<Vec<NodeRankingRow>> {
+        let mut model = self.learned.lock().ok()?;
+
+        // Learn from what ran. Only TABLE/TEMP_TABLE nodes: they are the ones
+        // whose plan is an EXPLAIN ANALYZE with real timings behind it, and a
+        // constant fitted to an estimate is not fitted to anything.
+        for node in dag.nodes.nodes() {
+            if !matches!(
+                node.materialize,
+                MaterializeMode::Table | MaterializeMode::TempTable
+            ) {
+                continue;
+            }
+            if let Some(node_stat) = stats.node_stats.get(&node.id)
+                && let Some(plan_str) = &node_stat.plan
+                && let Some(plans) = self.conn.parse_plan(plan_str)
+            {
+                model.observe(&plans);
+            }
+        }
+        if model.is_empty() {
+            return None;
+        }
+        // The constants themselves, dearest first. A single outlier here
+        // explains an otherwise inexplicable ranking, and reading it off a plan
+        // by hand is not practical.
+        if log::log_enabled!(log::Level::Debug) {
+            let mut consts: Vec<(&String, f64, f64, u64)> = model
+                .operators()
+                .filter_map(|(k, o)| {
+                    Some((k, o.seconds_per_byte()?, o.bytes_per_tuple()?, o.seconds_per_byte_n))
+                })
+                .collect();
+            consts.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            debug!(
+                "HMPPass learned constants (mean {:.4e} s/byte):",
+                model.mean_seconds_per_byte().unwrap_or(0.0)
+            );
+            for (key, spb, bytes_per_tuple, n) in &consts {
+                debug!("  {key:<48} {spb:>11.4e} s/byte  {bytes_per_tuple:>8.1} bytes/tuple  n={n}");
+            }
+        }
+
+        let mut rows: Vec<NodeRankingRow> = Vec::new();
+        for node in dag.nodes.nodes() {
+            if node.materialize != MaterializeMode::View {
+                continue;
+            }
+            // The same gate every other method applies: only a branch point has
+            // work that materializing could deduplicate.
+            if dag.nodes.out_degree(&node.id) <= 1 || dag.nodes.paths_to_sinks(&node.id) <= 1 {
+                continue;
+            }
+            let Some(node_stat) = stats.node_stats.get(&node.id) else {
+                continue;
+            };
+            let Some(plan_str) = &node_stat.plan else {
+                continue;
+            };
+            let Some(plans) = self.conn.parse_plan(plan_str) else {
+                continue;
+            };
+            let Some(once) = model.cost(&plans) else {
+                continue;
+            };
+
+            // What one build costs, or what the duplication costs: the View is
+            // inlined into each materialized consumer on its frontier and paid
+            // for once per consumer, so all but one of those copies is what
+            // materializing it would remove.
+            let copies = dag.nodes.frontier_materializes(&node.id).len().max(1);
+            let total_cpu_time_s = if self.downstream_cost {
+                once * (copies - 1) as f64
+            } else {
+                once
+            };
+
+            let cardinality = plans.first().and_then(|p| p.rows());
+            let ranking_score = match (self.normalize_with_cardinality, cardinality) {
+                (true, Some(c)) if c > 0.0 => total_cpu_time_s / c,
+                _ => total_cpu_time_s,
+            };
+            rows.push(NodeRankingRow {
+                rank: 0,
+                node: node.id.clone(),
+                total_cpu_time_s,
+                cardinality,
+                ranking_score,
+                leaves: Vec::new(),
+                matched: Vec::new(),
+            });
+        }
+
+        rows.retain(|r| r.ranking_score > 0.0);
+        if rows.is_empty() {
+            return None;
+        }
+        rows.sort_by(|a, b| {
+            b.ranking_score
+                .partial_cmp(&a.ranking_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.node.cmp(&b.node))
+        });
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.rank = i + 1;
+        }
+        // The cumulative share is what `top_cpu_time` cuts the working set at,
+        // so a ranking whose leader takes 99.9% of it explains a search that
+        // considered one candidate and stopped.
+        if log::log_enabled!(log::Level::Debug) {
+            let total: f64 = rows.iter().map(|r| r.ranking_score).sum();
+            let mut cumulative = 0.0;
+            debug!("HMPPass learned ranking ({} candidates):", rows.len());
+            for row in &rows {
+                cumulative += row.ranking_score;
+                debug!(
+                    "  {:<48} {:>11.4}s  {:>6.2}% cumulative",
+                    row.node,
+                    row.ranking_score,
+                    if total > 0.0 { cumulative / total * 100.0 } else { 0.0 }
+                );
+            }
+        }
+        Some(rows)
+    }
+
     /// The ranking a run's plans imply, as `(node, score)`.
     ///
     /// Public so a costing method can be scored offline against ground truth
@@ -1055,7 +1321,20 @@ where
         if self.cost_method == HmpCostMethod::NodeTime {
             return Self::ranking_from_node_times(dag, stats);
         }
-        if self.cost_method == HmpCostMethod::Leafset {
+        if self.cost_method == HmpCostMethod::LearnedCost {
+            match self.ranking_learned(dag, stats) {
+                Some(rows) => return rows,
+                None => warn!(
+                    "HMPPass: the learned cost model has priced nothing in this run -- no \
+                     executed plan carried operator timings and widths to fit it to; \
+                     falling back to leaf-set matching"
+                ),
+            }
+        }
+        if matches!(
+            self.cost_method,
+            HmpCostMethod::Leafset | HmpCostMethod::LearnedCost
+        ) {
             match self.ranking_leafset(dag, stats) {
                 Some(rows) => return rows,
                 None => warn!(
@@ -1389,7 +1668,16 @@ where
                     };
 
                     let mut trial = ctx.dag.clone();
-                    self.build_trial(&mut trial, &combo).await?;
+                    // A combination that cannot be rewritten is not a failed
+                    // search, it is a candidate that does not exist: `make_temp`
+                    // declines to inline a View it cannot rebuild at the AST
+                    // level rather than corrupt the query. Skipping it costs one
+                    // rewrite; propagating it abandons the whole optimization
+                    // over a candidate that was never going to be measured.
+                    if let Err(e) = self.build_trial(&mut trial, &combo).await {
+                        warn!("HMPPass: combo {combo:?} cannot be built, skipping it: {e}");
+                        continue;
+                    }
                     let sig = dag_signature(&trial);
                     let fallback = self.incumbent_dag(ctx.dag, &state).await;
 
@@ -1502,6 +1790,9 @@ where
 
         let runtime_ms = stats.duration.num_milliseconds();
 
+        // Everything earlier runs measured, before anything is priced by it.
+        self.adopt_learned(ctx.store).await;
+
         if state.phase == "baseline" {
             state.baseline_ms = runtime_ms;
             state.best_ms = runtime_ms;
@@ -1546,6 +1837,7 @@ where
             self.record_trial(ctx.store, ctx.dag_id, &run.run_id, &state, runtime_ms, true)
                 .await?;
             self.save_state(ctx.store, ctx.dag_id, &state).await?;
+            self.publish_learned(ctx.store).await;
             self.remember_explain(&state);
             return Ok(StepOutcome::Idle);
         }
@@ -1607,6 +1899,7 @@ where
         )
         .await?;
         self.save_state(ctx.store, ctx.dag_id, &state).await?;
+        self.publish_learned(ctx.store).await;
         self.remember_explain(&state);
         Ok(StepOutcome::Idle)
     }
@@ -1760,6 +2053,18 @@ where
             )
             .await?;
 
+        ctx.store
+            .execute(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {LEARNED_TABLE} (
+                         model      VARCHAR NOT NULL,
+                         updated_at TIMESTAMPTZ NOT NULL
+                     )"
+                ),
+                &[],
+            )
+            .await?;
+
         // Registering is idempotent -- a server restart re-registers what a
         // DAG already had -- so an existing search is left exactly where it
         // was rather than restarted from its baseline.
@@ -1768,7 +2073,11 @@ where
                 .await?;
         }
 
-        Ok(Some(Registration::new([STATE_TABLE, TRIALS_TABLE])))
+        Ok(Some(Registration::new([
+            STATE_TABLE,
+            TRIALS_TABLE,
+            LEARNED_TABLE,
+        ])))
     }
 
     async fn deregister(
@@ -1797,13 +2106,20 @@ where
             .map(|n| n == 0)
             .unwrap_or(false);
         if empty {
-            for table in [STATE_TABLE, TRIALS_TABLE] {
+            // The learned constants have no `dag_id` to delete by -- they
+            // describe the engine, not any one DAG -- so they go when the last
+            // registration does, with everything else.
+            for table in [STATE_TABLE, TRIALS_TABLE, LEARNED_TABLE] {
                 ctx.store
                     .execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
                     .await?;
             }
         }
-        Ok(Some(Registration::new([STATE_TABLE, TRIALS_TABLE])))
+        Ok(Some(Registration::new([
+            STATE_TABLE,
+            TRIALS_TABLE,
+            LEARNED_TABLE,
+        ])))
     }
 
     async fn step(
@@ -2222,6 +2538,261 @@ mod tests {
         );
     }
 
+    // ---- LearnedCost -----------------------------------------------------
+
+    /// A profiled consumer plan: every operator carries a timing, a row count
+    /// and a `result_set_size`, which is what a seconds-per-byte constant is
+    /// fitted to.
+    ///
+    ///   SEQ_SCAN raw_a  1.0s / 1000 rows / 24000 bytes -> 1/24000 s/byte
+    ///   SEQ_SCAN raw_b  2.0s / 1000 rows / 24000 bytes -> 2/24000 s/byte
+    ///   HASH_JOIN       6.0s / 1000 rows / 32000 bytes -> 6/32000 s/byte
+    ///   HASH_GROUP_BY   1.0s /   10 rows /   400 bytes -> 1/400   s/byte
+    fn profiled_consumer_plan() -> String {
+        let scan = |table: &str, time: f64| {
+            format!(
+                r#"{{"operator_name":"SEQ_SCAN","operator_timing":{time},
+                     "operator_cardinality":1000,"result_set_size":24000,
+                     "extra_info":{{"Table":"{table}","Estimated Cardinality":1000}},
+                     "children":[]}}"#
+            )
+        };
+        format!(
+            r#"{{"operator_name":"HASH_GROUP_BY","operator_timing":1.0,
+                 "operator_cardinality":10,"result_set_size":400,
+                 "extra_info":{{"Aggregates":["count_star()"],"Estimated Cardinality":10}},
+                 "children":[
+                   {{"operator_name":"HASH_JOIN","operator_timing":6.0,
+                     "operator_cardinality":1000,"result_set_size":32000,
+                     "extra_info":{{"Estimated Cardinality":1000}},
+                     "children":[{}, {}]}}]}}"#,
+            scan("raw_a", 1.0),
+            scan("raw_b", 2.0)
+        )
+    }
+
+    /// The View's own plan: a plain `EXPLAIN (FORMAT JSON)`, so estimates and
+    /// nothing else -- no timings, no sizes. Pricing this is the whole point.
+    fn unexecuted_view_plan() -> String {
+        let scan = |table: &str| {
+            format!(
+                r#"{{"name":"SEQ_SCAN",
+                     "extra_info":{{"Table":"{table}","Estimated Cardinality":1000}},
+                     "children":[]}}"#
+            )
+        };
+        format!(
+            r#"[{{"name":"HASH_JOIN","extra_info":{{"Estimated Cardinality":1000}},
+                  "children":[{}, {}]}}]"#,
+            scan("raw_a"),
+            scan("raw_b")
+        )
+    }
+
+    /// `leafset_dag`, but with the View's own plan attached and the consumers'
+    /// plans profiled.
+    fn learned_stats(consumers: &[&str]) -> ExecStats {
+        let now = Utc::now();
+        let mut node_stats_map = HashMap::new();
+        for id in consumers {
+            node_stats_map.insert(id.to_string(), node_stats(Some(profiled_consumer_plan())));
+        }
+        node_stats_map.insert("joined".to_string(), node_stats(Some(unexecuted_view_plan())));
+        ExecStats {
+            start: now,
+            finish: now,
+            duration: chrono::TimeDelta::milliseconds(1000),
+            node_stats: node_stats_map,
+            system_samples: Vec::new(),
+        }
+    }
+
+    fn learned_dag(consumers: &[&str]) -> Dag {
+        let mut nodes = vec![node(
+            "joined",
+            "SELECT k, v FROM raw_a JOIN raw_b USING (k)",
+            MaterializeMode::View,
+            &[],
+        )];
+        for id in consumers {
+            nodes.push(node(
+                id,
+                "SELECT k, count(*) FROM joined GROUP BY k",
+                MaterializeMode::Table,
+                &["joined"],
+            ));
+        }
+        let mut dag = make_dag(nodes);
+        dag.sources = ["raw_a", "raw_b"]
+            .iter()
+            .map(|name| crate::dag::SourceNode {
+                name: name.to_string(),
+                schema: std::sync::Arc::new(duckdb::arrow::datatypes::Schema::empty()),
+            })
+            .collect();
+        dag
+    }
+
+    #[tokio::test]
+    async fn learned_cost_prices_a_views_own_plan_from_what_the_tables_measured() {
+        let mut pass = test_pass(2).await;
+        pass.cost_method = HmpCostMethod::LearnedCost;
+
+        let rows = pass
+            .ranking_learned(&learned_dag(&["out_a", "out_b"]), &learned_stats(&["out_a", "out_b"]))
+            .expect("the executed plans carry timings and widths");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node, "joined");
+        // HASH_JOIN:  1000 rows x 32 bytes x 6/32000 s/byte  = 6.0
+        // SEQ_SCAN:   1000 rows x 24 bytes x 1.5/24000 s/byte = 1.5, twice.
+        //
+        // The View's plan carries no widths at all -- DuckDB reports none
+        // without profiling -- so both came from what the same operator types
+        // measured on the consumers.
+        assert!(
+            (rows[0].total_cpu_time_s - 9.0).abs() < 1e-9,
+            "cost was {}",
+            rows[0].total_cpu_time_s
+        );
+        assert_eq!(rows[0].cardinality, Some(1000.0));
+    }
+
+    #[tokio::test]
+    async fn learned_cost_downstream_charges_every_copy_but_the_one_that_would_remain() {
+        let mut pass = test_pass(2).await;
+        pass.cost_method = HmpCostMethod::LearnedCost;
+        pass.downstream_cost = true;
+
+        let consumers = ["out_a", "out_b", "out_c"];
+        let rows = pass
+            .ranking_learned(&learned_dag(&consumers), &learned_stats(&consumers))
+            .expect("the executed plans carry timings and widths");
+
+        // Inlined into three consumers and paid for three times; materializing
+        // it leaves one, so two builds' worth is what would vanish.
+        assert!(
+            (rows[0].total_cpu_time_s - 18.0).abs() < 1e-9,
+            "cost was {}",
+            rows[0].total_cpu_time_s
+        );
+    }
+
+    #[tokio::test]
+    async fn learned_cost_keeps_a_separate_constant_per_aggregate_function() {
+        // Same operator, same bytes, different function and a very different
+        // time. One constant fitted to both would price each at the mean.
+        let plan = |func: &str, seconds: f64| {
+            format!(
+                r#"{{"operator_name":"HASH_GROUP_BY","operator_timing":{seconds},
+                     "operator_cardinality":100,"result_set_size":1000,
+                     "extra_info":{{"Aggregates":["{func}"],"Estimated Cardinality":100}},
+                     "children":[]}}"#
+            )
+        };
+        let now = Utc::now();
+        let dag = learned_dag(&["out_a", "out_b"]);
+        let mut node_stats_map = HashMap::new();
+        node_stats_map.insert("out_a".to_string(), node_stats(Some(plan("count_star()", 1.0))));
+        node_stats_map.insert("out_b".to_string(), node_stats(Some(plan("string_agg(#1)", 9.0))));
+        node_stats_map.insert("joined".to_string(), node_stats(None));
+        let stats = ExecStats {
+            start: now,
+            finish: now,
+            duration: chrono::TimeDelta::milliseconds(1000),
+            node_stats: node_stats_map,
+            system_samples: Vec::new(),
+        };
+
+        let mut pass = test_pass(2).await;
+        pass.cost_method = HmpCostMethod::LearnedCost;
+        // No View plan to rank, but the learning half still runs.
+        let _ = pass.ranking_learned(&dag, &stats);
+
+        let model = pass.learned.lock().unwrap();
+        let cheap = model.seconds_per_byte("HASH_GROUP_BY[count_star]").unwrap();
+        let dear = model.seconds_per_byte("HASH_GROUP_BY[string_agg]").unwrap();
+        assert!((cheap - 1.0 / 1000.0).abs() < 1e-12);
+        assert!((dear - 9.0 / 1000.0).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn learned_constants_outlive_the_pass_that_measured_them() {
+        let store = MemoryStore::open("hmp").unwrap();
+        let consumers = ["out_a", "out_b"];
+
+        // One pass learns from a run and writes what it learned away.
+        let mut first = test_pass(2).await;
+        first.cost_method = HmpCostMethod::LearnedCost;
+        store
+            .execute(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {LEARNED_TABLE} \
+                     (model VARCHAR NOT NULL, updated_at TIMESTAMPTZ NOT NULL)"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        first
+            .ranking_learned(&learned_dag(&consumers), &learned_stats(&consumers))
+            .expect("learned something");
+        first.publish_learned(&store).await;
+
+        // A second pass, which has measured nothing itself, prices the same
+        // View identically -- and does it from a run in which no consumer
+        // carried a plan at all.
+        let mut second = test_pass(2).await;
+        second.cost_method = HmpCostMethod::LearnedCost;
+        second.adopt_learned(&store).await;
+
+        let now = Utc::now();
+        let bare = ExecStats {
+            start: now,
+            finish: now,
+            duration: chrono::TimeDelta::milliseconds(1000),
+            node_stats: [
+                ("out_a".to_string(), node_stats(None)),
+                ("out_b".to_string(), node_stats(None)),
+                ("joined".to_string(), node_stats(Some(unexecuted_view_plan()))),
+            ]
+            .into_iter()
+            .collect(),
+            system_samples: Vec::new(),
+        };
+        let rows = second
+            .ranking_learned(&learned_dag(&consumers), &bare)
+            .expect("the stored constants are enough on their own");
+        assert!((rows[0].total_cpu_time_s - 9.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn learned_cost_declines_rather_than_ranking_nothing_when_it_has_learned_nothing() {
+        let mut pass = test_pass(2).await;
+        pass.cost_method = HmpCostMethod::LearnedCost;
+        // Consumers with no plans at all: nothing to fit a constant to.
+        let dag = learned_dag(&["out_a", "out_b"]);
+        let now = Utc::now();
+        let stats = ExecStats {
+            start: now,
+            finish: now,
+            duration: chrono::TimeDelta::milliseconds(1000),
+            node_stats: [
+                ("out_a".to_string(), node_stats(None)),
+                ("out_b".to_string(), node_stats(None)),
+                ("joined".to_string(), node_stats(Some(unexecuted_view_plan()))),
+            ]
+            .into_iter()
+            .collect(),
+            system_samples: Vec::new(),
+        };
+
+        assert!(pass.ranking_learned(&dag, &stats).is_none());
+        // And `ranking_for` falls through to leaf-set matching rather than
+        // returning a ranking of nothing.
+        let _ = pass.ranking_for(&dag, &stats);
+    }
+
     #[tokio::test]
     async fn leafset_declines_rather_than_ranking_nothing_when_plans_name_no_relation() {
         // A plan format that does not carry relation names must fall back, not
@@ -2564,7 +3135,11 @@ mod tests {
         let registration = pass.register(&ctx).await.unwrap();
         assert_eq!(
             registration.map(|r| r.tables),
-            Some(vec!["opt_hmp_state".to_string(), "opt_hmp_trials".to_string()]),
+            Some(vec![
+                "opt_hmp_state".to_string(),
+                "opt_hmp_trials".to_string(),
+                "opt_hmp_learned_cost".to_string(),
+            ]),
             "HMP keeps state, so it must say which tables hold it"
         );
 

@@ -2,6 +2,7 @@ pub mod common;
 pub mod explain;
 pub mod hmp;
 pub mod leafset;
+pub mod learned;
 pub mod omp;
 pub mod parallelism;
 pub mod pushdown;
@@ -692,7 +693,9 @@ pub struct OptimizerConfig {
     /// HMP: how a View's cost is read off a run's plans. `leafset` attributes a
     /// View to the region of a consumer's plan whose scanned base relations are
     /// still contained in the View's own; `signature` is the older method that
-    /// matches operators between plans by name and estimated cardinality.
+    /// matches operators between plans by name and estimated cardinality;
+    /// `learned_cost` prices the View's own plan with per-operator
+    /// seconds-per-byte constants fitted to executed plans.
     pub hmp_cost_method: HmpCostMethod,
     pub hmp_use_pushdown: bool,
     /// HMP: number of hypotheses the `Greedy` strategy's beam search keeps
@@ -1366,6 +1369,7 @@ mod tests {
             HmpCostMethod::Leafset,
             HmpCostMethod::Signature,
             HmpCostMethod::NodeTime,
+            HmpCostMethod::LearnedCost,
         ] {
             assert_eq!(method.as_str().parse::<HmpCostMethod>().unwrap(), method);
             assert_eq!(

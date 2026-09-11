@@ -49,6 +49,23 @@ pub struct PlanNode {
     pub cardinality: Option<u64>,
     /// Rows the planner estimated this operator would emit.
     pub estimated_cardinality: Option<f64>,
+    /// Bytes one output tuple of this operator occupies.
+    ///
+    /// Postgres reports it directly as `Plan Width`; DuckDB reports the whole
+    /// `result_set_size` and this is that divided by the cardinality. Both are
+    /// the operator's *output* schema, which is what makes
+    /// `cardinality * row_width_bytes` the bytes the operator produced --- the
+    /// denominator the learned cost model divides a timing by.
+    #[serde(default)]
+    pub row_width_bytes: Option<f64>,
+    /// The aggregate functions this operator computes, lowercased, sorted and
+    /// deduplicated. Empty for everything that is not an aggregate.
+    ///
+    /// A `HASH_GROUP_BY` computing `count(*)` and one computing
+    /// `string_agg(...)` cost wildly different amounts per output byte, so the
+    /// learned model keys them apart --- see [`PlanNode::cost_key`].
+    #[serde(default)]
+    pub aggregates: Vec<String>,
     /// The base relation this operator scans, normalized by
     /// [`normalize_relation`]. `None` for everything that is not a real scan
     /// -- including the pseudo-scans that read an intermediate rather than a
@@ -72,6 +89,45 @@ impl PlanNode {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "0".to_string()),
         }
+    }
+
+    /// The operator type the learned cost model keys a `SecondsPerByte`
+    /// constant by.
+    ///
+    /// The bare operator name, except for aggregates, which carry the
+    /// functions they compute: `HASH_GROUP_BY[count_star,sum]`. The time an
+    /// aggregate spends per output byte is a property of the aggregate
+    /// function far more than of the grouping strategy, so folding
+    /// `count(*)` and `string_agg` into one constant learns the average of two
+    /// unrelated numbers.
+    pub fn cost_key(&self) -> String {
+        if self.aggregates.is_empty() {
+            return self.operator.to_ascii_uppercase();
+        }
+        format!(
+            "{}[{}]",
+            self.operator.to_ascii_uppercase(),
+            self.aggregates.join(",")
+        )
+    }
+
+    /// Bytes this operator actually emitted: its measured row count times the
+    /// width of one of its output tuples.
+    ///
+    /// `None` unless the plan was executed *and* the backend reported a width,
+    /// because a learned constant may only be fitted to something measured.
+    pub fn output_bytes(&self) -> Option<f64> {
+        let rows = self.cardinality? as f64;
+        let width = self.row_width_bytes?;
+        Some(rows * width)
+    }
+
+    /// The rows this operator is expected to emit: the measured count where the
+    /// plan was executed, the planner's estimate where it was not.
+    pub fn rows(&self) -> Option<f64> {
+        self.cardinality
+            .map(|c| c as f64)
+            .or(self.estimated_cardinality)
     }
 
     /// Total exclusive time per unique operator, plus how often each appears.
@@ -157,6 +213,36 @@ pub fn is_pseudo_scan(operator: &str) -> bool {
     )
 }
 
+/// Operators that write a relation rather than compute one.
+///
+/// Their cost is proportional to what they *wrote*, which the plan reports
+/// nowhere, while the rows they emit are a one-row count of it: DuckDB gives
+/// `CREATE_TABLE_AS` an `operator_cardinality` of 1 and a `result_set_size` of
+/// 8 bytes however large the table. Seconds divided by those 8 bytes is not a
+/// seconds-per-byte constant for anything --- measured on p03 it came out at
+/// 1.6e-2, seven orders of magnitude above a hash join's 5.6e-10, and dragged
+/// the whole model's mean with it. So the learned model does not fit one, and
+/// no plan it prices contains one: a VIEW's plan is a `SELECT`.
+///
+/// The same fact `rows_written_from_plan` is built on, applied to cost.
+pub fn is_write_operator(operator: &str) -> bool {
+    matches!(
+        operator.to_ascii_uppercase().as_str(),
+        // DuckDB
+        "CREATE_TABLE_AS"
+            | "BATCH_CREATE_TABLE_AS"
+            | "INSERT"
+            | "BATCH_INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "COPY_TO_FILE"
+            | "BATCH_COPY_TO_FILE"
+            // Postgres
+            | "MODIFYTABLE"
+            | "INSERT ON CONFLICT"
+    )
+}
+
 /// Whether an operator collapses cardinality, and so ends the region a view
 /// with a top-level `GROUP BY` occupies.
 ///
@@ -180,6 +266,57 @@ pub fn is_aggregate_boundary(operator: &str) -> bool {
     )
 }
 
+/// The aggregate functions named in `exprs`, lowercased, sorted, deduplicated.
+///
+/// Both backends describe an aggregate operator by the expressions it
+/// computes --- DuckDB in `extra_info["Aggregates"]` (`"sum(#1)"`), Postgres in
+/// the aggregate node's `Output` (`"count(*)"`) --- so the function is the head
+/// of a call inside a string, and is read back out the same way for both.
+///
+/// `group_keys` are dropped: Postgres lists the grouping columns in `Output`
+/// alongside the aggregates, and a group key that happens to be an expression
+/// (`date_trunc('day', ts)`) would otherwise be mistaken for an aggregate and
+/// split one operator type into several.
+pub fn aggregate_functions(exprs: &[String], group_keys: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = exprs
+        .iter()
+        .filter(|e| !group_keys.iter().any(|g| g == *e))
+        .filter_map(|e| function_head(e))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The name of the first function call in `expr`, lowercased, or `None` if it
+/// contains none.
+///
+/// A deliberately syntactic reading rather than a parse: the strings come from
+/// a plan's own rendering of an expression and are not SQL the dialects agree
+/// on, so anything that does not look like `name(` is simply not a call.
+fn function_head(expr: &str) -> Option<String> {
+    let mut start: Option<usize> = None;
+    for (i, c) in expr.char_indices() {
+        if c.is_alphanumeric() || c == '_' {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if c == '(' {
+            if let Some(s) = start {
+                let name = &expr[s..i];
+                // `#1(` is not a call, and neither is `2(`.
+                if !name.starts_with(|c: char| c.is_ascii_digit()) {
+                    return Some(name.to_lowercase());
+                }
+            }
+            start = None;
+        } else {
+            start = None;
+        }
+    }
+    None
+}
+
 /// A plan operator's identity: its name and its estimated output size.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub struct OpKey {
@@ -200,6 +337,11 @@ struct DuckDBPlan {
     operator_timing: Option<f64>,
     #[serde(default)]
     operator_cardinality: Option<u64>,
+    /// Bytes this operator emitted in total, reported only by profiling
+    /// output. A plain `EXPLAIN (FORMAT JSON)` carries no such field, which is
+    /// why the learned model has to fall back to a learned width there.
+    #[serde(default)]
+    result_set_size: Option<f64>,
     #[serde(default)]
     extra_info: std::collections::HashMap<String, serde_json::Value>,
     #[serde(default)]
@@ -240,12 +382,34 @@ impl DuckDBPlan {
                 .and_then(|v| v.as_str())
                 .map(normalize_relation)
         };
+        // DuckDB reports the operator's whole output size rather than a per-row
+        // width, so the width is that divided by the rows it came from. Guarded
+        // on a nonzero cardinality: an operator that emitted nothing has no
+        // observable tuple width, and 0/0 would record one of zero bytes.
+        let row_width_bytes = match (self.result_set_size, self.operator_cardinality) {
+            (Some(bytes), Some(rows)) if rows > 0 => Some(bytes / rows as f64),
+            _ => None,
+        };
+        let aggregates = self
+            .extra_info
+            .get("Aggregates")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                let exprs: Vec<String> = items
+                    .iter()
+                    .filter_map(|i| i.as_str().map(str::to_string))
+                    .collect();
+                aggregate_functions(&exprs, &[])
+            })
+            .unwrap_or_default();
         vec![PlanNode {
             operator,
             // DuckDB's operator_timing is already this operator's own time.
             exclusive_time_s: self.operator_timing,
             cardinality: self.operator_cardinality,
             estimated_cardinality: estimated,
+            row_width_bytes,
+            aggregates,
             relation,
             children,
         }]
@@ -297,6 +461,17 @@ struct PgPlan {
     actual_loops: Option<f64>,
     #[serde(rename = "Plan Rows", default)]
     plan_rows: Option<f64>,
+    /// The planner's estimate of one output row's width in bytes. Present with
+    /// or without ANALYZE, which is what lets a View's un-executed plan be
+    /// costed on Postgres without a learned width standing in.
+    #[serde(rename = "Plan Width", default)]
+    plan_width: Option<f64>,
+    /// The expressions this node emits, present under `EXPLAIN (VERBOSE)`.
+    /// Read only on aggregate nodes, to name the aggregate functions.
+    #[serde(rename = "Output", default)]
+    output: Vec<String>,
+    #[serde(rename = "Group Key", default)]
+    group_key: Vec<String>,
     /// Emitted by every real scan node -- `Seq Scan`, `Index Scan`, `Index Only
     /// Scan`, `Bitmap Heap Scan` -- and already unqualified. The pseudo-scans
     /// do not carry it at all, but they are filtered anyway so the rule is one
@@ -368,11 +543,20 @@ impl PgPlan {
         } else {
             self.relation_name.as_deref().map(normalize_relation)
         };
+        // Only on an aggregate node: elsewhere `Output` is full of ordinary
+        // function calls that say nothing about what the operator costs.
+        let aggregates = if is_aggregate_boundary(&self.node_type) {
+            aggregate_functions(&self.output, &self.group_key)
+        } else {
+            Vec::new()
+        };
         PlanNode {
             operator: self.node_type,
             exclusive_time_s: exclusive,
             cardinality: self.actual_rows.map(|r| (r * loops).round() as u64),
             estimated_cardinality: self.plan_rows,
+            row_width_bytes: self.plan_width,
+            aggregates,
             relation,
             children: self
                 .plans
