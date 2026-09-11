@@ -34,7 +34,6 @@ variants:
 
 dee_opt:
   hmp_max_runs: 12
-  hmp_strategy: breadth
   hmp_dup_cost_model: learned_cost
   # The whole ranking in the working set, as in the learned-cost run: a
   # narrower cut admits one node and the search exhausts long before the

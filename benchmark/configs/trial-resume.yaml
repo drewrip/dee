@@ -36,7 +36,6 @@ variants:
 
 dee_opt:
   hmp_max_runs: 8
-  hmp_strategy: breadth
   hmp_top_cpu_time: 0.8
   hmp_use_pushdown: false
   trial_budget_eps: 0.25

@@ -24,7 +24,6 @@ variants:
 
 dee_opt:
   hmp_max_runs: 4
-  hmp_strategy: breadth
   parallelism_ladder: [[1, 2, 4, 8]]
   parallelism_seed_repeats: 2
   parallelism_confirm_runs: 1

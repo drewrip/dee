@@ -1,0 +1,40 @@
+# HMP alone against p05_hr on DuckDB at sf=1, with a twelve-run budget.
+#
+# One cell, so the traces are directly comparable run to run: what the
+# optimizer does to makespan (`runtime_ms`) and to total query time
+# (`node_time_ms`) as it works through the candidates it priced.
+#
+#   dee-bench run -c configs/p05-hmp-budget.yaml
+name: p05-hmp-budget
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/p05-hmp-budget
+verbosity: detailed
+
+matrix:
+  project: [p05_hr]
+  backend: [duckdb]
+  sf: [1]
+  variant: [hmp]
+
+variants:
+  hmp:
+    passes: [hmp]
+    hmp_cost_method: dup_attribution
+
+dee_opt:
+  hmp_max_runs: 12
+  hmp_dup_cost_model: learned_cost
+  hmp_top_cpu_time: 1.0
+  hmp_use_pushdown: false
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 1
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

@@ -5,7 +5,7 @@ The expansion has three steps, and the middle one matters most:
 1. **Cross product** every ``matrix`` key with every list-valued ``dee_opt``,
    and with every configuration the cell's backend is swept over.
 2. **Prune** dee options the cell's enabled passes never read. Without this,
-   sweeping ``hmp_strategy: [breadth, greedy]`` would double the number of
+   sweeping ``hmp_search_budget: [8, 32]`` would double the number of
    ``unopt`` and ``omp`` cells even though the option changes nothing about
    them — inflating runtime and, worse, silently double-counting identical
    experiments in every aggregate.

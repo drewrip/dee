@@ -119,9 +119,6 @@ pub async fn optimizer_options() -> Json<Vec<OptimizerOption>> {
             flag: "--hmp-normalize-with-cardinality", kind: "bool", passes: &["hmp"],
             choices: None, default: json!(d.hmp_normalize_with_cardinality),
             doc: "Divide candidate cost by estimated cardinality." },
-        OptimizerOption { name: "hmp_strategy", flag: "--hmp-strategy", kind: "str",
-            passes: &["hmp"], choices: Some(&["breadth", "greedy"]),
-            default: json!(d.hmp_strategy), doc: "HMP's search strategy over the candidate ranking." },
         OptimizerOption { name: "hmp_cost_method", flag: "--hmp-cost-method", kind: "str",
             passes: &["hmp"],
             choices: Some(&["leafset", "signature", "node_time", "learned_cost",
@@ -143,9 +140,10 @@ pub async fn optimizer_options() -> Json<Vec<OptimizerOption>> {
                   `learned_cost` gives seconds, from constants fitted to executed plans; \
                   `cardinality` sums the region's estimated output rows; `operators` counts \
                   its operators. Ignored by every other cost method." },
-        OptimizerOption { name: "hmp_beam_width", flag: "--hmp-beam-width", kind: "int",
-            passes: &["hmp"], choices: None, default: json!(d.hmp_beam_width),
-            doc: "Beam width for the greedy HMP strategy. Ignored by breadth." },
+        OptimizerOption { name: "hmp_search_budget", flag: "--hmp-search-budget", kind: "int",
+            passes: &["hmp"], choices: None, default: json!(d.hmp_search_budget),
+            doc: "Candidate combinations HMP prices before it spends any DAG run on them. \
+                  Bounds costing, which is EXPLAIN-only; `hmp_max_runs` bounds executions." },
         OptimizerOption { name: "hmp_use_pushdown", flag: "--hmp-no-pushdown", kind: "bool",
             passes: &["hmp"], choices: None, default: json!(d.hmp_use_pushdown),
             doc: "Run pushdown before evaluating each HMP candidate. The CLI flag is the negation." },

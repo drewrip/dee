@@ -25,12 +25,6 @@ pub enum CliOMPCentrality {
     Paths,
 }
 
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum CliHMPStrategy {
-    Breadth,
-    Greedy,
-}
-
 // A doc comment on a variant is what `--help` prints for that value, so these
 // are written for whoever is reading the help rather than for whoever is
 // reading the source.
@@ -121,18 +115,15 @@ pub struct OptimizerArgs {
     /// HMP: divide a view's CPU time by its estimated cardinality when ranking.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
     pub hmp_normalize_with_cardinality: Option<bool>,
-    /// HMP: how to search the node ranking.
-    #[arg(long)]
-    pub hmp_strategy: Option<CliHMPStrategy>,
     /// HMP: how to read a View's cost off a run's plans.
     #[arg(long)]
     pub hmp_cost_method: Option<CliHmpCostMethod>,
     /// HMP: what the dup_attribution cost method prices a plan region with.
     #[arg(long)]
     pub hmp_dup_cost_model: Option<CliSubtreeCostMethod>,
-    /// HMP: hypotheses the greedy strategy's beam search keeps alive.
+    /// HMP: candidate combinations to price before spending any DAG run.
     #[arg(long)]
-    pub hmp_beam_width: Option<usize>,
+    pub hmp_search_budget: Option<usize>,
     /// HMP: do not run pushdown before each candidate evaluation.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
     pub hmp_no_pushdown: Option<bool>,
@@ -258,13 +249,6 @@ impl OptimizerArgs {
             self.hmp_normalize_with_cardinality.map(|v| json!(v)),
         );
         set(
-            "hmp_strategy",
-            self.hmp_strategy.as_ref().map(|s| match s {
-                CliHMPStrategy::Breadth => json!("breadth"),
-                CliHMPStrategy::Greedy => json!("greedy"),
-            }),
-        );
-        set(
             "hmp_cost_method",
             self.hmp_cost_method.as_ref().map(|m| match m {
                 CliHmpCostMethod::Leafset => json!("leafset"),
@@ -282,7 +266,7 @@ impl OptimizerArgs {
                 CliSubtreeCostMethod::Operators => json!("operators"),
             }),
         );
-        set("hmp_beam_width", self.hmp_beam_width.map(|v| json!(v)));
+        set("hmp_search_budget", self.hmp_search_budget.map(|v| json!(v)));
         set("parallelism_ladder", self.parallelism_ladder.as_ref().map(|v| json!(v)));
         set(
             "parallelism_seed_repeats",

@@ -18,7 +18,7 @@
 #    into materialized tables.
 #
 # Everything else is held at the first run's settings so the traces compare:
-# p05_hr, DuckDB sf=1, twelve HMP runs, breadth, whole ranking in the working
+# p05_hr, DuckDB sf=1, twelve HMP runs, whole ranking in the working
 # set, no pushdown.
 #
 #   dee-bench run -c configs/dup-attribution-tuned.yaml
@@ -41,7 +41,6 @@ variants:
 
 dee_opt:
   hmp_max_runs: 12
-  hmp_strategy: breadth
   hmp_dup_cost_model: learned_cost
   hmp_top_cpu_time: 1.0
   hmp_use_pushdown: false

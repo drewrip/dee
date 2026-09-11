@@ -71,7 +71,7 @@
 //! it is still the only costing method here that talks to the database at all,
 //! which is why it is not the default.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
@@ -81,7 +81,7 @@ use crate::{
     dag::Dag,
     opt::{
         common::{
-            bare_table_name, contract_intermediate_views, dialect_for_db, rewrite_node_refs,
+            contract_intermediate_views_set, dialect_for_db, rewrite_node_refs,
             wrap_in_materialized_cte,
         },
         learned::LearnedCostModel,
@@ -217,7 +217,7 @@ impl SubtreeCost for OperatorCountSubtreeCost {
     }
 }
 
-/// What one View's duplication came to, and the numbers behind it.
+/// What a *set* of Views duplicates between them, and the numbers behind it.
 ///
 /// The components are kept rather than just the difference because the
 /// difference alone cannot be sanity-checked: a `duplicate` of zero means
@@ -225,143 +225,298 @@ impl SubtreeCost for OperatorCountSubtreeCost {
 /// planned every copy away" when there are four.
 #[derive(Debug, Clone)]
 pub struct DuplicateCost {
-    pub view: String,
-    /// What computing the View once costs, from its own EXPLAIN plan.
-    pub own: f64,
-    /// `(consumer node, what the View's CTE region of its plan costs)`, sorted
-    /// by consumer for a stable report.
+    /// The members priced, consumer-most first.
+    pub views: Vec<String>,
+    /// What building every member exactly once costs, with each member reading
+    /// the materialized form of its in-set ancestors rather than recomputing
+    /// them.
+    ///
+    /// Not the sum of the members' standalone plans. On a chain -- and HMP's
+    /// candidates are routinely all on one -- an upstream member's body is
+    /// nested inside a downstream member's, so summing standalone plans counts
+    /// the shared work once per member. See [`build_once_cost`].
+    pub build_once: f64,
+    /// `(consumer node, what that consumer's plan spends on every member it can
+    /// see)`, sorted by consumer for a stable report.
     pub per_consumer: Vec<(String, f64)>,
-    /// `sum(per_consumer) - own`: the computation that would stop happening if
-    /// the View were built once.
+    /// `sum(per_consumer) - build_once`: the computation that would stop
+    /// happening if every member were built once.
     ///
     /// Can come out negative, and that is a finding rather than a bug: it says
-    /// the engine plans the View more cheaply inside its consumers --- pushing
-    /// their predicates and projections into it --- than it would standing
-    /// alone, so materializing it would *add* work.
+    /// the engine plans the members more cheaply inside their consumers ---
+    /// pushing their predicates and projections into them --- than it would
+    /// standing alone, so materializing them would *add* work.
     pub duplicate: f64,
 }
 
 /// The CTE name a View is inlined under.
 ///
 /// Prefixed so it cannot collide with a CTE the consumer already defines, and
-/// derived from the View so two candidates in one query are still distinct.
+/// derived from the *fully qualified* node id so that two members of one set
+/// cannot collide with each other. The bare name is not enough: a set holding
+/// `"wh"."main"."orders"` and `"wh"."staging"."orders"` would emit two CTEs
+/// under one alias, repoint both members' references at it, and then attribute
+/// whichever region `find_subplan` reached first to both -- silently, with a
+/// plausible-looking number.
 fn cte_name(view_id: &str) -> String {
-    format!("dee_dup_{}", bare_table_name(view_id))
-}
-
-/// The consumer query with `view` inlined into it as a materialized CTE, one
-/// per materialized consumer on `view`'s frontier.
-///
-/// `dag` must already be the contracted minor around `view` --- every consumer
-/// here refers to `view` directly.
-fn consumer_queries(dag: &Dag, view: &str, frontier: &[String]) -> Vec<(String, String)> {
-    let dialect = dialect_for_db(&dag.db);
-    let cte = cte_name(view);
-    let Some(body) = dag.nodes.get(view.to_string()).map(|v| v.query_text.clone()) else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    for consumer in frontier {
-        let Some(node) = dag.nodes.get(consumer.clone()) else {
+    let mut out = String::from("dee_dup");
+    for segment in view_id.split('.') {
+        let segment = segment.trim_matches('"');
+        if segment.is_empty() {
             continue;
-        };
-        // Repoint the consumer's references at the CTE. On the AST, like every
-        // other rewrite here: a textual one would rename the View's name
-        // wherever it appears as a string literal or a column alias.
-        let mapping = std::collections::HashMap::from([(view.to_string(), cte.clone())]);
-        let Some(repointed) = rewrite_node_refs(&node.query_text, &mapping, dialect) else {
-            warn!(
-                "dup: could not repoint '{consumer}' at a CTE for '{view}'; \
-                 skipping this consumer"
-            );
-            continue;
-        };
-        match wrap_in_materialized_cte(&repointed, &cte, &body, dialect) {
-            Some(sql) => out.push((consumer.clone(), sql)),
-            None => warn!(
-                "dup: could not wrap '{view}' into '{consumer}' as a CTE; \
-                 skipping this consumer"
-            ),
         }
+        out.push('_');
+        out.push_str(segment);
     }
     out
 }
 
-/// Attribute `view`'s duplicate computation, by planning each of its consumers
-/// with it inlined as a materialized CTE.
+/// The consumer query with every member of `visible` inlined into it as its own
+/// materialized CTE, intra-set references repointed at CTE names.
 ///
-/// `view_plan` is the View's own EXPLAIN plan, already collected by the run
-/// being analyzed --- it is the `cost(V)` term, and re-EXPLAINing to get it
-/// would only ask the engine something it has already answered.
+/// `dag` must already be the contracted minor around the set --- every member
+/// here is referenced directly by the consumer or by another member's body.
 ///
-/// Returns `None` when nothing could be measured: the View has no materialized
-/// consumer, no consumer's plan could be obtained, or the cost model declined
-/// to price what came back. The caller must treat that as "unknown" and fall
-/// back, never as a duplication of zero.
-pub async fn duplicate_cost<C>(
+/// `visible` must be ordered consumer-most first. That is not cosmetic:
+/// [`wrap_in_materialized_cte`] *prepends*, so wrapping in this order leaves the
+/// CTEs defined producer-first, which is the only order in which a CTE that
+/// references another one is legal SQL.
+fn consumer_query(
+    dag: &Dag,
+    consumer: &str,
+    visible: &[String],
+    bodies: &HashMap<String, String>,
+    dialect: polyglot_sql::dialects::DialectType,
+) -> Option<String> {
+    let node = dag.nodes.get(consumer.to_string())?;
+
+    // One rewrite for every member the consumer names directly.
+    let mapping: HashMap<String, String> = visible
+        .iter()
+        .map(|v| (v.clone(), cte_name(v)))
+        .collect();
+    let mut sql = rewrite_node_refs(&node.query_text, &mapping, dialect).or_else(|| {
+        warn!("dup: could not repoint '{consumer}' at the candidate CTEs; skipping it");
+        None
+    })?;
+
+    for v in visible {
+        let body = bodies.get(v)?;
+        sql = wrap_in_materialized_cte(&sql, &cte_name(v), body, dialect).or_else(|| {
+            warn!("dup: could not wrap '{v}' into '{consumer}' as a CTE; skipping it");
+            None
+        })?;
+    }
+    Some(sql)
+}
+
+/// Each member's body as it stands in the contracted minor, with references to
+/// its in-set ancestors repointed at their CTE names.
+///
+/// This is what stops a downstream member from being charged for an upstream
+/// one: its body reads `dee_dup_<ancestor>` instead of containing the
+/// ancestor's computation, so the two plan regions are disjoint.
+fn member_bodies(
+    dag: &Dag,
+    set: &HashSet<String>,
+    dialect: polyglot_sql::dialects::DialectType,
+) -> Option<HashMap<String, String>> {
+    let mapping: HashMap<String, String> =
+        set.iter().map(|v| (v.clone(), cte_name(v))).collect();
+    let mut out = HashMap::new();
+    for v in set {
+        let body = dag.nodes.get(v.clone())?.query_text.clone();
+        // A member with no in-set ancestor comes back unchanged, which is what
+        // `rewrite_node_refs` does when nothing matches.
+        let rewritten = rewrite_node_refs(&body, &mapping, dialect).or_else(|| {
+            warn!("dup: could not repoint '{v}'s body at the candidate CTEs");
+            None
+        })?;
+        out.insert(v.clone(), rewritten);
+    }
+    Some(out)
+}
+
+/// What building every member once costs: one probe query, one EXPLAIN.
+///
+/// The probe defines every member as a materialized CTE and then reads each one
+/// exactly once. Reading each one is the part that cannot be skipped --- an
+/// unreferenced `MATERIALIZED` CTE is pruned outright, and a probe that only
+/// read the last member would come back missing its ancestors' regions, which
+/// would quietly inflate every `duplicate` on a chain.
+///
+/// The `count(*)` wrappers sit outside the tagged region (the tag is the CTE's
+/// own root), so they cost nothing here.
+async fn build_once_cost<C>(
+    conn: &C,
+    order: &[String],
+    bodies: &HashMap<String, String>,
+    coster: &dyn SubtreeCost,
+    dialect: polyglot_sql::dialects::DialectType,
+) -> Option<f64>
+where
+    C: Connector + Send + Sync,
+{
+    let probes: Vec<String> = order
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("(SELECT count(*) FROM {}) AS c{i}", cte_name(v)))
+        .collect();
+    let mut sql = format!("SELECT {}", probes.join(", "));
+    for v in order {
+        let body = bodies.get(v)?;
+        sql = wrap_in_materialized_cte(&sql, &cte_name(v), body, dialect)?;
+    }
+
+    let plan_json = match conn.explain(&sql).await {
+        Ok(Some(json)) => json,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!("dup: EXPLAIN of the build-once probe failed: {e}");
+            return None;
+        }
+    };
+    let plans = conn.parse_plan(&plan_json)?;
+
+    let mut total = 0.0;
+    for v in order {
+        let region = find_subplan(&plans, &cte_name(v))?;
+        total += coster.cost(std::slice::from_ref(region))?;
+    }
+    Some(total)
+}
+
+/// Attribute the duplicate computation of a *set* of Views, by planning each of
+/// their consumers with every member inlined as its own materialized CTE.
+///
+/// Returns `None` when nothing could be measured: no member has a materialized
+/// consumer, no consumer's plan could be obtained, or the cost model declined to
+/// price what came back. The caller must treat that as "unknown" and fall back,
+/// never as a duplication of zero.
+pub async fn duplicate_cost_set<C>(
     conn: &C,
     dag: &Dag,
-    view: &str,
-    view_plan: &[PlanNode],
+    views: &[String],
     coster: &dyn SubtreeCost,
 ) -> Option<DuplicateCost>
 where
     C: Connector + Send + Sync,
 {
-    let frontier: HashSet<String> = dag.nodes.frontier_materializes(view);
-    if frontier.is_empty() {
+    if views.is_empty() {
         return None;
     }
-    let mut frontier: Vec<String> = frontier.into_iter().collect();
-    frontier.sort();
+    let dialect = dialect_for_db(&dag.db);
 
-    // The graph minor: everything between the View and its materialized
-    // consumers folded into the consumers, on a copy, because this is a
+    // Consumer-most first, node id as the tiebreak: the order the CTEs have to
+    // be wrapped in, and a total order so the report is stable.
+    let heights = dag.nodes.heights();
+    let mut order: Vec<String> = {
+        let mut seen = HashSet::new();
+        views.iter().filter(|v| seen.insert((*v).clone())).cloned().collect()
+    };
+    order.sort_by(|a, b| {
+        heights
+            .get(a)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&heights.get(b).copied().unwrap_or(0))
+            .then_with(|| a.cmp(b))
+    });
+    let set: HashSet<String> = order.iter().cloned().collect();
+
+    // Two members whose CTE names collide would be measured as one. The name is
+    // built from the qualified id precisely so this cannot happen; checked
+    // anyway, because the failure is silent rather than loud.
+    let mut names = HashSet::new();
+    for v in &order {
+        if !names.insert(cte_name(v)) {
+            warn!("dup: two members of {order:?} share a CTE name; refusing to guess");
+            return None;
+        }
+    }
+
+    // Which consumers pay for which members. `c` is in a member's frontier
+    // exactly when that member's body is inlined into the query the engine runs
+    // for `c`, which is the definition of "c pays for it".
+    let mut visible: HashMap<String, Vec<String>> = HashMap::new();
+    for v in &order {
+        for c in dag.nodes.frontier_materializes(v) {
+            visible.entry(c).or_default().push(v.clone());
+        }
+    }
+    if visible.is_empty() {
+        return None;
+    }
+    // Keep each consumer's member list in the global wrap order.
+    for members in visible.values_mut() {
+        members.sort_by_key(|m| order.iter().position(|o| o == m).unwrap_or(usize::MAX));
+    }
+
+    // The graph minor around the whole set, on a copy, because this is a
     // question about the DAG and not a change to it.
     let mut minor = dag.clone();
-    if let Err(e) = contract_intermediate_views(&mut minor, view, &frontier.iter().cloned().collect())
-    {
-        warn!("dup: could not contract the graph minor around '{view}': {e}");
+    let frontier: HashSet<String> = visible.keys().cloned().collect();
+    if let Err(e) = contract_intermediate_views_set(&mut minor, &set, &frontier) {
+        warn!("dup: could not contract the graph minor around {order:?}: {e}");
         return None;
     }
 
-    let own = coster.cost(view_plan)?;
+    let bodies = member_bodies(&minor, &set, dialect)?;
+    let build_once = build_once_cost(conn, &order, &bodies, coster, dialect).await?;
+
+    let mut consumers: Vec<String> = frontier.into_iter().collect();
+    consumers.sort();
 
     let mut per_consumer: Vec<(String, f64)> = Vec::new();
-    for (consumer, sql) in consumer_queries(&minor, view, &frontier) {
+    for consumer in consumers {
+        let members = match visible.get(&consumer) {
+            Some(m) => m.clone(),
+            None => continue,
+        };
+        let Some(sql) = consumer_query(&minor, &consumer, &members, &bodies, dialect) else {
+            continue;
+        };
         let plan_json = match conn.explain(&sql).await {
             Ok(Some(json)) => json,
             Ok(None) => {
-                debug!("dup: this connector cannot EXPLAIN, so '{view}' cannot be attributed");
+                debug!("dup: this connector cannot EXPLAIN, so {order:?} cannot be attributed");
                 return None;
             }
             Err(e) => {
-                warn!("dup: EXPLAIN of '{consumer}' with '{view}' inlined failed: {e}");
+                warn!("dup: EXPLAIN of '{consumer}' with {order:?} inlined failed: {e}");
                 continue;
             }
         };
         let Some(plans) = conn.parse_plan(&plan_json) else {
-            warn!("dup: could not parse the plan of '{consumer}' with '{view}' inlined");
+            warn!("dup: could not parse the plan of '{consumer}' with {order:?} inlined");
             continue;
         };
-        // No region for the CTE means the engine did not keep it as one ---
-        // an older server that ignores the hint, or a consumer whose reference
-        // to the View the rewrite did not reach. Either way this consumer's
-        // copy is not measurable, and charging it zero would understate the
-        // duplication rather than admit to not knowing.
-        let Some(region) = find_subplan(&plans, &cte_name(view)) else {
-            warn!(
-                "dup: the plan of '{consumer}' has no region for '{view}'s materialized CTE; \
-                 skipping this consumer"
-            );
-            continue;
-        };
-        let Some(cost) = coster.cost(std::slice::from_ref(region)) else {
-            debug!("dup: the cost model declined to price '{view}' inside '{consumer}'");
-            continue;
-        };
-        per_consumer.push((consumer, cost));
+
+        // Every member this consumer can see has to be found, or the number
+        // would be a partial sum masquerading as a total. No region means the
+        // engine did not keep the CTE as one; charging the consumer for the rest
+        // would understate what it pays rather than admit to not knowing.
+        let mut consumer_total = 0.0;
+        let mut complete = true;
+        for v in &members {
+            let Some(region) = find_subplan(&plans, &cte_name(v)) else {
+                warn!(
+                    "dup: the plan of '{consumer}' has no region for '{v}'s materialized \
+                     CTE; skipping this consumer"
+                );
+                complete = false;
+                break;
+            };
+            let Some(cost) = coster.cost(std::slice::from_ref(region)) else {
+                debug!("dup: the cost model declined to price '{v}' inside '{consumer}'");
+                complete = false;
+                break;
+            };
+            consumer_total += cost;
+        }
+        if complete {
+            per_consumer.push((consumer, consumer_total));
+        }
     }
 
     if per_consumer.is_empty() {
@@ -369,14 +524,14 @@ where
     }
 
     let total: f64 = per_consumer.iter().map(|(_, c)| c).sum();
-    let duplicate = total - own;
+    let duplicate = total - build_once;
     debug!(
-        "dup({view}) = {total:.4} - {own:.4} = {duplicate:.4} over {} consumer(s)",
+        "dup({order:?}) = {total:.4} - {build_once:.4} = {duplicate:.4} over {} consumer(s)",
         per_consumer.len()
     );
     Some(DuplicateCost {
-        view: view.to_string(),
-        own,
+        views: order,
+        build_once,
         per_consumer,
         duplicate,
     })
@@ -405,6 +560,16 @@ mod tests {
         }
     }
 
+    /// The single-member spelling of `consumer_query`, for the tests that
+    /// predate set costing and are kept as the `k = 1` regression suite.
+    fn one_consumer_query(dag: &Dag, view: &str, consumer: &str) -> String {
+        let dialect = dialect_for_db(&dag.db);
+        let set = HashSet::from([view.to_string()]);
+        let bodies = member_bodies(dag, &set, dialect).expect("body should rewrite");
+        consumer_query(dag, consumer, &[view.to_string()], &bodies, dialect)
+            .expect("consumer should rewrite")
+    }
+
     fn node(id: &str, mode: MaterializeMode, deps: &[&str], query: &str) -> TransformNode {
         TransformNode {
             id: id.to_string(),
@@ -430,7 +595,10 @@ mod tests {
             node("m1", MaterializeMode::Table, &["v"], "SELECT sum(amt) AS s FROM v"),
             node("m2", MaterializeMode::Table, &["v"], "SELECT count(*) AS n FROM v"),
         ]);
-        let queries = consumer_queries(&dag, "v", &["m1".into(), "m2".into()]);
+        let queries: Vec<(String, String)> = ["m1", "m2"]
+            .iter()
+            .map(|c| (c.to_string(), one_consumer_query(&dag, "v", c)))
+            .collect();
         assert_eq!(queries.len(), 2);
         for (consumer, sql) in &queries {
             let upper = sql.to_uppercase();
@@ -471,11 +639,9 @@ mod tests {
         ]);
         let frontier: HashSet<String> = dag.nodes.frontier_materializes("v");
         assert_eq!(frontier, HashSet::from(["m1".to_string()]));
-        contract_intermediate_views(&mut dag, "v", &frontier).unwrap();
+        contract_intermediate_views_set(&mut dag, &HashSet::from(["v".to_string()]), &frontier).unwrap();
 
-        let queries = consumer_queries(&dag, "v", &["m1".into()]);
-        assert_eq!(queries.len(), 1);
-        let sql = &queries[0].1;
+        let sql = &one_consumer_query(&dag, "v", "m1");
         assert!(sql.contains("dee_dup_v"), "the CTE did not reach m1: {sql}");
         assert!(
             sql.contains("amt > 10"),
@@ -495,7 +661,7 @@ mod tests {
                 "WITH mine AS (SELECT 1 AS x) SELECT count(*) AS n FROM v, mine",
             ),
         ]);
-        let sql = &consumer_queries(&dag, "v", &["m1".into()])[0].1;
+        let sql = &one_consumer_query(&dag, "v", "m1");
         assert!(sql.contains("mine"), "the consumer's own CTE was dropped: {sql}");
         assert!(sql.contains("dee_dup_v"), "the View's CTE was not added: {sql}");
     }
@@ -618,30 +784,319 @@ mod tests {
             ),
         ]);
 
-        let view_plan = conn
-            .parse_plan(&conn.explain(view_sql).await.unwrap().unwrap())
-            .unwrap();
-        let attributed = duplicate_cost(
+        let attributed = duplicate_cost_set(
             conn.as_ref(),
             &dag,
-            "v",
-            &view_plan,
+            &["v".to_string()],
             &CardinalitySubtreeCost,
         )
         .await
         .expect("the engine planned both consumers");
 
         assert_eq!(attributed.per_consumer.len(), 2, "{attributed:?}");
-        assert!(attributed.own > 0.0, "{attributed:?}");
+        assert!(attributed.build_once > 0.0, "{attributed:?}");
         // Two consumers that each aggregate the whole View: neither can push
         // anything into it worth speaking of, so the duplication is one build,
         // give or take the column pruning one of them affords. Not exactly one
         // build -- see the module docs on what `MATERIALIZED` does not do.
-        let ratio = attributed.duplicate / attributed.own;
+        let ratio = attributed.duplicate / attributed.build_once;
         assert!(
             (0.9..1.1).contains(&ratio),
             "two full copies should duplicate about one build, ratio was {ratio}: \
              {attributed:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Set-level attribution
+    // -----------------------------------------------------------------------
+
+    /// The p05 shape: `salary -> profile`, `profile` read by three tables and
+    /// `salary` by one more. Both are multi-consumer Views on one chain.
+    fn nested_dag() -> Dag {
+        dag_of(vec![
+            node("salary", MaterializeMode::View, &["raw"], "SELECT id, amt FROM raw WHERE amt > 0"),
+            node(
+                "profile",
+                MaterializeMode::View,
+                &["salary"],
+                "SELECT id, amt FROM salary WHERE amt > 10",
+            ),
+            node("t1", MaterializeMode::Table, &["profile"], "SELECT sum(amt) AS s FROM profile"),
+            node("t2", MaterializeMode::Table, &["profile"], "SELECT count(*) AS n FROM profile"),
+            node("t3", MaterializeMode::Table, &["profile"], "SELECT max(amt) AS x FROM profile"),
+            node("t4", MaterializeMode::Table, &["salary"], "SELECT min(amt) AS m FROM salary"),
+        ])
+    }
+
+    async fn realize(conn: &crate::connectors::duckdb::DuckDBConnection, dag: &Dag, views: &[&str]) {
+        for v in views {
+            let sql = dag.nodes.get(v.to_string()).unwrap().query_text.clone();
+            conn.execute(format!("CREATE VIEW {v} AS {sql}")).await.unwrap();
+        }
+    }
+
+    /// The claim the set version exists to make. Both members are on one chain,
+    /// so `profile`'s body contains `salary`'s; pricing them independently and
+    /// adding counts the shared scan twice.
+    #[tokio::test]
+    async fn a_nested_pair_is_not_charged_twice() {
+        let conn = engine_with_raw().await;
+        let dag = nested_dag();
+        realize(&conn, &dag, &["salary", "profile"]).await;
+
+        async fn one(
+            conn: &crate::connectors::duckdb::DuckDBConnection,
+            dag: &Dag,
+            v: &str,
+        ) -> f64 {
+            duplicate_cost_set(conn, dag, &[v.to_string()], &CardinalitySubtreeCost)
+                .await
+                .expect("singleton should price")
+                .duplicate
+        }
+        let salary = one(conn.as_ref(), &dag, "salary").await;
+        let profile = one(conn.as_ref(), &dag, "profile").await;
+
+        let pair = duplicate_cost_set(
+            conn.as_ref(),
+            &dag,
+            &["salary".to_string(), "profile".to_string()],
+            &CardinalitySubtreeCost,
+        )
+        .await
+        .expect("the pair should price");
+
+        assert!(
+            pair.duplicate < salary + profile,
+            "the members overlap, so the set must be worth less than their sum: \
+             pair={}, salary={salary}, profile={profile}",
+            pair.duplicate
+        );
+        assert_eq!(
+            pair.views,
+            vec!["profile".to_string(), "salary".to_string()],
+            "members come back consumer-most first"
+        );
+    }
+
+    /// The discount above has to come from overlap, not from the set machinery
+    /// shaving numbers in general.
+    #[tokio::test]
+    async fn an_independent_pair_is_about_additive() {
+        let conn = engine_with_raw().await;
+        let dag = dag_of(vec![
+            node("lo", MaterializeMode::View, &["raw"], "SELECT id, amt FROM raw WHERE amt < 10"),
+            node("hi", MaterializeMode::View, &["raw"], "SELECT id, amt FROM raw WHERE amt > 40"),
+            node("a1", MaterializeMode::Table, &["lo"], "SELECT sum(amt) AS s FROM lo"),
+            node("a2", MaterializeMode::Table, &["lo"], "SELECT count(*) AS n FROM lo"),
+            node("a3", MaterializeMode::Table, &["lo"], "SELECT max(amt) AS x FROM lo"),
+            node("b1", MaterializeMode::Table, &["hi"], "SELECT sum(amt) AS s FROM hi"),
+            node("b2", MaterializeMode::Table, &["hi"], "SELECT count(*) AS n FROM hi"),
+            node("b3", MaterializeMode::Table, &["hi"], "SELECT max(amt) AS x FROM hi"),
+        ]);
+        realize(&conn, &dag, &["lo", "hi"]).await;
+
+        async fn single(
+            conn: &crate::connectors::duckdb::DuckDBConnection,
+            dag: &Dag,
+            v: &str,
+        ) -> f64 {
+            duplicate_cost_set(conn, dag, &[v.to_string()], &CardinalitySubtreeCost)
+                .await
+                .expect("singleton should price")
+                .duplicate
+        }
+        let sum = single(conn.as_ref(), &dag, "lo").await
+            + single(conn.as_ref(), &dag, "hi").await;
+        let pair = duplicate_cost_set(
+            conn.as_ref(),
+            &dag,
+            &["lo".to_string(), "hi".to_string()],
+            &CardinalitySubtreeCost,
+        )
+        .await
+        .expect("the pair should price")
+        .duplicate;
+
+        let ratio = pair / sum;
+        assert!(
+            (0.95..1.05).contains(&ratio),
+            "nothing is shared between these two, so the set should be about the \
+             sum: pair={pair}, sum={sum}, ratio={ratio}"
+        );
+    }
+
+    /// Every member the consumer can see gets its own region, and the regions
+    /// are disjoint -- which is what makes summing them legitimate.
+    #[tokio::test]
+    async fn every_member_gets_its_own_disjoint_region() {
+        let conn = engine_with_raw().await;
+        let dag = nested_dag();
+        realize(&conn, &dag, &["salary", "profile"]).await;
+        let dialect = dialect_for_db(&dag.db);
+
+        let set = HashSet::from(["salary".to_string(), "profile".to_string()]);
+        let mut minor = dag.clone();
+        let frontier = HashSet::from(["t1".to_string()]);
+        contract_intermediate_views_set(&mut minor, &set, &frontier).unwrap();
+        let bodies = member_bodies(&minor, &set, dialect).unwrap();
+        let sql = consumer_query(
+            &minor,
+            "t1",
+            &["profile".to_string(), "salary".to_string()],
+            &bodies,
+            dialect,
+        )
+        .unwrap();
+
+        let plans = conn
+            .parse_plan(&conn.explain(&sql).await.unwrap().unwrap())
+            .unwrap();
+        let salary = find_subplan(&plans, &cte_name("salary")).expect("salary region");
+        let profile = find_subplan(&plans, &cte_name("profile")).expect("profile region");
+
+        // Disjoint: neither region contains the other.
+        assert!(
+            salary.find_subplan(&cte_name("profile")).is_none(),
+            "salary's region swallowed profile's, so summing would double-count"
+        );
+        assert!(
+            profile.find_subplan(&cte_name("salary")).is_none(),
+            "profile's region swallowed salary's, so summing would double-count"
+        );
+        // And the downstream member reads the CTE rather than the base table.
+        let mut ops = Vec::new();
+        fn collect(n: &PlanNode, out: &mut Vec<String>) {
+            out.push(n.operator.to_uppercase());
+            for c in &n.children {
+                collect(c, out);
+            }
+        }
+        collect(profile, &mut ops);
+        assert!(
+            ops.iter().any(|o| o.contains("CTE_SCAN")),
+            "profile's region should read salary's CTE, not recompute it: {ops:?}"
+        );
+    }
+
+    /// The CTE order is implicit in `wrap_in_materialized_cte` prepending, and
+    /// the engine rejects a forward reference -- so pin it.
+    #[tokio::test]
+    async fn ctes_are_emitted_in_dependency_order() {
+        let conn = engine_with_raw().await;
+        let dag = nested_dag();
+        realize(&conn, &dag, &["salary", "profile"]).await;
+        let dialect = dialect_for_db(&dag.db);
+
+        let set = HashSet::from(["salary".to_string(), "profile".to_string()]);
+        let bodies = member_bodies(&dag, &set, dialect).unwrap();
+        let sql = consumer_query(
+            &dag,
+            "t1",
+            &["profile".to_string(), "salary".to_string()],
+            &bodies,
+            dialect,
+        )
+        .unwrap();
+
+        let salary_at = sql.find(&cte_name("salary")).expect("salary CTE");
+        let profile_at = sql.find(&cte_name("profile")).expect("profile CTE");
+        assert!(
+            salary_at < profile_at,
+            "the ancestor's CTE must be defined first or this is a forward \
+             reference: {sql}"
+        );
+        assert!(
+            conn.explain(&sql).await.unwrap().is_some(),
+            "the engine should accept the generated SQL: {sql}"
+        );
+    }
+
+    /// An unreferenced MATERIALIZED CTE is pruned outright, so a probe that read
+    /// only its last member would silently lose every other member's build cost
+    /// and inflate the duplication by exactly that much.
+    ///
+    /// Two members that share nothing make this checkable: built once each,
+    /// their costs must add, and a pruned member would show up as a shortfall.
+    #[tokio::test]
+    async fn the_build_once_probe_prices_every_member() {
+        let conn = engine_with_raw().await;
+        let lo = "SELECT id, amt FROM raw WHERE amt < 10";
+        let hi = "SELECT id, amt FROM raw WHERE amt > 40";
+        let dialect = dialect_for_db("duckdb");
+        let bodies = HashMap::from([
+            ("lo".to_string(), lo.to_string()),
+            ("hi".to_string(), hi.to_string()),
+        ]);
+
+        let probe = |members: Vec<String>| {
+            let bodies = bodies.clone();
+            let conn = conn.clone();
+            async move {
+                build_once_cost(
+                    conn.as_ref(),
+                    &members,
+                    &bodies,
+                    &CardinalitySubtreeCost,
+                    dialect,
+                )
+                .await
+                .expect("the probe should price")
+            }
+        };
+
+        let both = probe(vec!["lo".to_string(), "hi".to_string()]).await;
+        let lo_only = probe(vec!["lo".to_string()]).await;
+        let hi_only = probe(vec!["hi".to_string()]).await;
+
+        assert!(
+            (both - (lo_only + hi_only)).abs() < 1e-6,
+            "both members must be priced, so an independent pair's build cost \
+             adds: both={both}, lo={lo_only}, hi={hi_only}"
+        );
+    }
+
+    /// The `count(*)` the probe wraps each member in must not enter its region.
+    #[tokio::test]
+    async fn the_probe_region_excludes_the_counting_wrapper() {
+        let conn = engine_with_raw().await;
+        let view_sql = "SELECT g, sum(amt) AS total FROM raw GROUP BY g";
+        let dag = dag_of(vec![node("v", MaterializeMode::View, &["raw"], view_sql)]);
+        let dialect = dialect_for_db(&dag.db);
+        let bodies = HashMap::from([("v".to_string(), view_sql.to_string())]);
+
+        let probed = build_once_cost(
+            conn.as_ref(),
+            &["v".to_string()],
+            &bodies,
+            &OperatorCountSubtreeCost,
+            dialect,
+        )
+        .await
+        .expect("the probe should price");
+
+        let standalone = OperatorCountSubtreeCost
+            .cost(
+                &conn
+                    .parse_plan(&conn.explain(view_sql).await.unwrap().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            probed, standalone,
+            "the probe region should be the view's own plan and nothing else"
+        );
+    }
+
+    /// Two members whose bare names collide must not be measured as one.
+    #[test]
+    fn members_in_different_schemas_get_distinct_cte_names() {
+        assert_ne!(
+            cte_name("\"wh\".\"main\".\"orders\""),
+            cte_name("\"wh\".\"staging\".\"orders\""),
+            "a bare-name CTE would make these one region and misattribute both"
         );
     }
 
@@ -655,11 +1110,8 @@ mod tests {
             node("v", MaterializeMode::View, &["raw"], view_sql),
             node("m1", MaterializeMode::Table, &["v"], "SELECT count(*) AS n FROM v"),
         ]);
-        let view_plan = conn
-            .parse_plan(&conn.explain(view_sql).await.unwrap().unwrap())
-            .unwrap();
         let attributed =
-            duplicate_cost(conn.as_ref(), &dag, "v", &view_plan, &CardinalitySubtreeCost)
+            duplicate_cost_set(conn.as_ref(), &dag, &["v".to_string()], &CardinalitySubtreeCost)
                 .await
                 .expect("the engine planned the one consumer");
 
@@ -686,11 +1138,8 @@ mod tests {
             ),
             node("m2", MaterializeMode::Table, &["v"], "SELECT count(*) AS n FROM v"),
         ]);
-        let view_plan = conn
-            .parse_plan(&conn.explain(view_sql).await.unwrap().unwrap())
-            .unwrap();
         let attributed =
-            duplicate_cost(conn.as_ref(), &dag, "v", &view_plan, &CardinalitySubtreeCost)
+            duplicate_cost_set(conn.as_ref(), &dag, &["v".to_string()], &CardinalitySubtreeCost)
                 .await
                 .expect("the engine planned both consumers");
 
@@ -729,11 +1178,8 @@ mod tests {
                 "SELECT sum(total) AS s FROM mid",
             ),
         ]);
-        let view_plan = conn
-            .parse_plan(&conn.explain(view_sql).await.unwrap().unwrap())
-            .unwrap();
         let attributed =
-            duplicate_cost(conn.as_ref(), &dag, "v", &view_plan, &CardinalitySubtreeCost)
+            duplicate_cost_set(conn.as_ref(), &dag, &["v".to_string()], &CardinalitySubtreeCost)
                 .await
                 .expect("the minor put v in reach of both consumers");
 
@@ -766,11 +1212,8 @@ mod tests {
                 "SELECT total FROM v WHERE g = 3",
             ),
         ]);
-        let view_plan = conn
-            .parse_plan(&conn.explain(view_sql).await.unwrap().unwrap())
-            .unwrap();
         let attributed =
-            duplicate_cost(conn.as_ref(), &dag, "v", &view_plan, &CardinalitySubtreeCost)
+            duplicate_cost_set(conn.as_ref(), &dag, &["v".to_string()], &CardinalitySubtreeCost)
                 .await
                 .unwrap();
 
@@ -808,11 +1251,8 @@ mod tests {
                 "SELECT total FROM v WHERE g = 5",
             ),
         ]);
-        let view_plan = conn
-            .parse_plan(&conn.explain(view_sql).await.unwrap().unwrap())
-            .unwrap();
         let attributed =
-            duplicate_cost(conn.as_ref(), &dag, "v", &view_plan, &CardinalitySubtreeCost)
+            duplicate_cost_set(conn.as_ref(), &dag, &["v".to_string()], &CardinalitySubtreeCost)
                 .await
                 .unwrap();
 

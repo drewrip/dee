@@ -401,26 +401,76 @@ pub(crate) fn contract_intermediate_views(
     view_name: &str,
     frontier: &HashSet<String>,
 ) -> Result<(), OptimizerError> {
+    let set = HashSet::from([view_name.to_string()]);
+    contract_intermediate_views_set(dag, &set, frontier)
+}
+
+/// Contract the graph minor around a *set* of Views.
+///
+/// The set generalization of [`contract_intermediate_views`], and the reason it
+/// has to exist: calling the single-view version once per member destroys the
+/// set. Its skip guard is `dep == view_name`, so contracting around an upstream
+/// member sees a downstream member as just another intermediate View and inlines
+/// its body into the consumer -- after which the downstream member is an
+/// anonymous subquery rather than a named reference, and nothing can repoint it
+/// at a CTE or find its region in a plan.
+///
+/// Here the guard is membership instead: every member stays a named reference in
+/// the consumer's SQL, and only non-member Views are folded in. What comes back
+/// is the graph the engine really runs, with one edge from each member to each
+/// consumer that pays for it.
+pub(crate) fn contract_intermediate_views_set(
+    dag: &mut Dag,
+    set: &HashSet<String>,
+    frontier: &HashSet<String>,
+) -> Result<(), OptimizerError> {
+    // The consumers first: fold every non-member View between the set and a
+    // consumer into that consumer.
+    contract_into(dag, frontier, set)?;
+    // Then the members themselves. A non-member View sitting *between* two
+    // members -- `salary -> w -> profile` -- is not a frontier node, so the pass
+    // above never touches it, and `profile`'s body still reads `w` rather than
+    // `salary`. For `profile`'s CTE to reference `salary`'s CTE, `w` has to be
+    // folded into `profile`'s own body.
+    contract_into(dag, set, set)?;
+    Ok(())
+}
+
+/// Inline into each of `hosts` every non-member View that sits between it and
+/// some member of `keep`.
+///
+/// References to a node in `keep` are preserved: those are the edges being
+/// contracted *to*, and what the caller does with them is the caller's
+/// business. Everything else on the path is text the engine would expand
+/// anyway, so it belongs in the host's query.
+fn contract_into(
+    dag: &mut Dag,
+    hosts: &HashSet<String>,
+    keep: &HashSet<String>,
+) -> Result<(), OptimizerError> {
     let dialect = dialect_for_db(&dag.db);
-    for m_id in frontier {
-        // Iteratively inline any direct View dependency of m that has
-        // view_name as a transitive dependency (i.e., sits between view_name
-        // and m on the data-flow path).
+    for m_id in hosts {
         loop {
             let view_dep: Option<String> = dag.nodes.get(m_id.clone()).and_then(|m_node| {
                 m_node
                     .depends_on
                     .iter()
                     .find(|dep| {
-                        if *dep == view_name {
-                            return false; // the contracted edge itself
+                        if keep.contains(*dep) {
+                            return false; // a contracted edge itself
                         }
                         let is_view = dag
                             .nodes
                             .get((*dep).clone())
                             .map(|d| matches!(d.materialize, MaterializeMode::View))
                             .unwrap_or(false);
-                        is_view && is_transitive_dep(dag, dep, view_name)
+                        // Only a View that actually sits between a kept node and
+                        // this host. One that does not is a dependency the host
+                        // has every right to read directly.
+                        is_view
+                            && keep
+                                .iter()
+                                .any(|member| member != *dep && is_transitive_dep(dag, dep, member))
                     })
                     .cloned()
             });
@@ -790,6 +840,87 @@ mod tests {
         let m2 = dag.nodes.get("m2".to_string()).unwrap();
         assert!(m2.depends_on.contains("lp_n"));
         assert!(!m2.depends_on.contains("n"));
+    }
+
+    /// The case the single-view contraction gets wrong. With `profile`
+    /// downstream of `salary`, contracting around `salary` alone sees `profile`
+    /// as just another intermediate View, inlines its body into the consumer,
+    /// and detaches it -- after which nothing can repoint `profile` at a CTE or
+    /// find its region in a plan. Contracting around the set must keep it named.
+    #[test]
+    fn set_contraction_keeps_every_member_named() {
+        let nodes = vec![
+            node("salary", MaterializeMode::View, &[], "SELECT id, amt FROM raw"),
+            node("profile", MaterializeMode::View, &["salary"], "SELECT id, amt FROM salary WHERE amt > 10"),
+            node("m1", MaterializeMode::Table, &["profile"], "SELECT sum(amt) AS s FROM profile"),
+        ];
+
+        // Single-view contraction around the upstream member: destroys the
+        // downstream one.
+        let mut single = make_dag(nodes.clone());
+        let frontier = HashSet::from(["m1".to_string()]);
+        contract_intermediate_views(&mut single, "salary", &frontier).unwrap();
+        // `inline_view_ast` keeps the view's name as the subquery's alias, so
+        // the text still says "profile"; what is gone is the *table reference*,
+        // and with it the edge. `rewrite_node_refs` only repoints tables, so an
+        // aliased subquery can never be pointed at a CTE.
+        let single_m1 = single.nodes.get("m1".to_string()).unwrap();
+        assert!(
+            !single_m1.depends_on.contains("profile"),
+            "precondition for this test: the single-view call is expected to \
+             inline 'profile' away and detach it, but the edge survived: {:?}",
+            single_m1.depends_on
+        );
+
+        // Set contraction: both members stay named.
+        let mut set_dag = make_dag(nodes);
+        let set = HashSet::from(["salary".to_string(), "profile".to_string()]);
+        contract_intermediate_views_set(&mut set_dag, &set, &frontier).unwrap();
+        let set_m1 = set_dag.nodes.get("m1".to_string()).unwrap();
+        assert!(
+            set_m1.depends_on.contains("profile"),
+            "'profile' must stay a named reference so it can be repointed at a \
+             CTE: {:?} / {}",
+            set_m1.depends_on,
+            set_m1.query_text
+        );
+        // And it really is still repointable.
+        let mapping = HashMap::from([("profile".to_string(), "dee_dup_profile".to_string())]);
+        let repointed =
+            rewrite_node_refs(&set_m1.query_text, &mapping, DialectType::DuckDB).unwrap();
+        assert!(
+            repointed.contains("dee_dup_profile"),
+            "the member should repoint at its CTE: {repointed}"
+        );
+    }
+
+    /// A non-member View between two members is not a frontier node, so the
+    /// consumer pass never sees it. It still has to be folded into the member's
+    /// own body, or that member's CTE cannot reference its ancestor's CTE.
+    #[test]
+    fn a_non_member_between_two_members_is_inlined_into_the_member() {
+        let mut dag = make_dag(vec![
+            node("salary", MaterializeMode::View, &[], "SELECT id, amt FROM raw"),
+            node("w", MaterializeMode::View, &["salary"], "SELECT id, amt FROM salary WHERE amt > 5"),
+            node("profile", MaterializeMode::View, &["w"], "SELECT id, amt FROM w WHERE amt > 10"),
+            node("m1", MaterializeMode::Table, &["profile"], "SELECT sum(amt) AS s FROM profile"),
+        ]);
+
+        let set = HashSet::from(["salary".to_string(), "profile".to_string()]);
+        contract_intermediate_views_set(&mut dag, &set, &HashSet::from(["m1".to_string()]))
+            .unwrap();
+
+        let body = dag.nodes.get("profile".to_string()).unwrap();
+        assert!(
+            body.query_text.contains("salary"),
+            "'w' should be folded into 'profile' so it reads 'salary' directly: {}",
+            body.query_text
+        );
+        assert!(
+            body.depends_on.contains("salary"),
+            "and the edge should follow the text: {:?}",
+            body.depends_on
+        );
     }
 
     #[test]

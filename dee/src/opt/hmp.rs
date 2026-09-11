@@ -16,8 +16,9 @@ use crate::{
     plan::OpKey,
     opt::{
         Dag, Optimization, OptimizerError, OptimizerConfig,
+        combo::{canonical_order, combinations, search_combos},
         common::{dialect_for_db, make_temp},
-        dup::{SubtreeCostMethod, duplicate_cost},
+        dup::{SubtreeCostMethod, duplicate_cost_set},
         leafset::{PlanArena, ViewRegionRequest, attribute_chain, has_top_level_group_by},
         learned::LearnedCostModel,
         explain::{render_bar_row, render_card_grid, render_ranked_table},
@@ -30,20 +31,6 @@ use crate::{
         store::{OptStore, Registration},
     },
 };
-
-/// Strategy HMP uses to search through the node ranking when deciding
-/// which VIEWs to materialize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum HMPStrategy {
-    /// Walk the node ranking, trying all k-sized combinations smallest-first
-    /// (singles, pairs, triples, ...). This is the default / original behavior.
-    #[default]
-    Breadth,
-    /// Walk the node ranking sequentially, committing each materialization
-    /// that improves performance before trying the next node down the ranking.
-    Greedy,
-}
 
 /// How HMP turns a run's plans into a per-View cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -126,7 +113,14 @@ impl std::str::FromStr for HmpCostMethod {
 /// left off has to survive in the metadata database. This struct is exactly
 /// that: what a `Before` step reads to decide what to try next, and what an
 /// `After` step writes once it knows how the trial went.
+/// Every field defaults, and the struct as a whole is `#[serde(default)]`, so a
+/// row written by an older build decodes rather than hard-failing: `load_state`
+/// turns a decode error into `OptimizerError::Store`, which would strand a
+/// search that was merely persisted by a previous version. Removing a field is
+/// already tolerated -- serde ignores unknown keys -- but adding one is not
+/// unless the struct carries this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct HmpState {
     /// `"baseline"` -- waiting for the first measurement, which is of the DAG
     /// as it stands. `"searching"` -- working through candidates.
@@ -137,48 +131,45 @@ struct HmpState {
     best_combo: Vec<String>,
     /// The ranked candidate Views the search will explore.
     working_set: Vec<String>,
-    /// Each candidate's score from the baseline run, the fallback for a node
-    /// no later trial observed.
+    /// Each candidate View's score from the baseline run, which seeds the
+    /// enumeration's priority queue.
     baseline_scores: HashMap<String, f64>,
-    /// `working_set` in the order the search is currently trying it, re-derived
-    /// between rounds from the freshest evidence.
-    working_order: Vec<String>,
     /// DAG executions this search has consumed, baseline included.
     runs_used: usize,
     iterations: Vec<IterationStat>,
     /// Signatures of trial DAGs already measured, so two combos that reduce to
     /// the same DAG are not paid for twice.
     tried_sigs: Vec<String>,
-
-    // --- Breadth cursor -------------------------------------------------
-    /// Combination size currently being enumerated.
-    k: usize,
-    /// Position within the size-`k` combinations of `working_order`.
-    combo_index: usize,
-    /// Ranking scores observed during this round, accumulated as trials are
-    /// measured. Replaces holding every trial's DAG and ExecStats: the
-    /// refinement only ever used them to derive these numbers, and deriving
-    /// each once as it arrives is both cheaper and the only version that
-    /// survives being written to a database.
-    round_score_sums: HashMap<String, f64>,
-    round_score_counts: HashMap<String, usize>,
-
-    // --- Greedy cursor --------------------------------------------------
-    beams: Vec<BeamState>,
-    /// Position in `working_order` -- the node currently being considered.
-    node_cursor: usize,
-    /// Which of `beams` is being expanded at `node_cursor`.
-    beam_cursor: usize,
-    /// Beams proposed so far at `node_cursor`, pruned to `beam_width` when the
-    /// node is finished.
-    proposals: Vec<BeamState>,
-    /// Measured runtime by trial-DAG signature, so a combo the beam search
-    /// re-proposes is scored from the existing measurement rather than re-run.
-    tried_combos: HashMap<String, i64>,
+    /// The combinations the search will trial, priced before any of them was
+    /// run and ordered by the duplicate computation each removes.
+    candidates: Vec<CandidateCombo>,
+    /// Position in `candidates`.
+    cursor: usize,
+    /// Whether `candidates` has been enumerated yet.
+    ///
+    /// Not the same question as `candidates.is_empty()`, and the difference
+    /// matters: a state row persisted by a build that predates the candidate
+    /// list decodes with an empty one, and without this flag a live search
+    /// would read that as "exhausted" and promote on its next step.
+    candidates_built: bool,
 
     /// The candidate a `Before` step rewrote the DAG into and an `After` step
     /// is expected to report on.
     in_flight: Option<InFlight>,
+}
+
+/// One priced combination of Views: what materializing all of it together is
+/// estimated to remove.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct CandidateCombo {
+    /// Members, consumer-most first -- the order they must be materialized in.
+    combo: Vec<String>,
+    /// Duplicate computation the combination removes, from the telescoping
+    /// chain in [`crate::opt::combo`].
+    cost: f64,
+    /// A member could not be priced and was charged zero, so `cost` is a floor.
+    #[serde(default)]
+    partial: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +180,12 @@ struct InFlight {
 
 impl HmpState {
     fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for HmpState {
+    fn default() -> Self {
         Self {
             phase: "baseline".to_string(),
             baseline_ms: 0,
@@ -196,19 +193,12 @@ impl HmpState {
             best_combo: Vec::new(),
             working_set: Vec::new(),
             baseline_scores: HashMap::new(),
-            working_order: Vec::new(),
             runs_used: 0,
             iterations: Vec::new(),
             tried_sigs: Vec::new(),
-            k: 1,
-            combo_index: 0,
-            round_score_sums: HashMap::new(),
-            round_score_counts: HashMap::new(),
-            beams: Vec::new(),
-            node_cursor: 0,
-            beam_cursor: 0,
-            proposals: Vec::new(),
-            tried_combos: HashMap::new(),
+            candidates: Vec::new(),
+            cursor: 0,
+            candidates_built: false,
             in_flight: None,
         }
     }
@@ -243,8 +233,6 @@ where
     /// View's estimated cardinality (from its EXPLAIN plan), instead of raw
     /// total CPU time.
     normalize_with_cardinality: bool,
-    /// Strategy for searching through the node ranking.
-    strategy: HMPStrategy,
     /// How a View's cost is read off the run's plans.
     cost_method: HmpCostMethod,
     /// What `DupAttribution` prices a plan region with. Unused by the other
@@ -259,12 +247,14 @@ where
     budget_eps: f64,
     /// How much of a cancelled trial the resume may keep.
     reuse_policy: crate::opt::resume::ReusePolicy,
+    /// Combinations the search may price before it starts spending DAG runs.
+    ///
+    /// Distinct from `max_runs`, which bounds executions: this one bounds how
+    /// much of the combination space is *costed*, which is EXPLAIN-only.
+    search_budget: usize,
     /// Run the PushdownPass before evaluating each candidate materialization
     /// combination, for more accurate cost measurements.
     use_pushdown: bool,
-    /// Number of hypotheses the `Greedy` strategy's beam search keeps alive
-    /// at each step. Unused by the `Breadth` strategy.
-    beam_width: usize,
     /// Capture each iteration's CPU/memory/disk timeseries (already sampled
     /// by the profiled engine used for measurement) into its `IterationStat`.
     profile_iterations: bool,
@@ -305,16 +295,8 @@ struct HMPExplainData {
     working_set: Vec<String>,
     best_combo: Vec<String>,
     iterations: Vec<IterationStat>,
-    strategy: HMPStrategy,
-    beam_width: usize,
-}
-
-/// A single hypothesis in the `Greedy` strategy's beam search: a
-/// materialization combo and the runtime it measured at.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BeamState {
-    combo: Vec<String>,
-    runtime_ms: i64,
+    search_budget: usize,
+    candidates_costed: usize,
 }
 
 /// One row of the `--hmp-show-operators` table.
@@ -369,11 +351,10 @@ where
         show_operators: Option<String>,
         show_nodes: Option<String>,
         normalize_with_cardinality: bool,
-        strategy: HMPStrategy,
         cost_method: HmpCostMethod,
         dup_cost_model: SubtreeCostMethod,
         use_pushdown: bool,
-        beam_width: usize,
+        search_budget: usize,
         profile_iterations: bool,
         resume_trials: bool,
         budget_eps: f64,
@@ -387,11 +368,10 @@ where
             show_operators,
             show_nodes,
             normalize_with_cardinality,
-            strategy,
             cost_method,
             dup_cost_model,
             use_pushdown,
-            beam_width: beam_width.max(1),
+            search_budget: search_budget.max(1),
             profile_iterations,
             resume_trials,
             reuse_policy,
@@ -781,30 +761,6 @@ fn dag_signature(dag: &Dag) -> String {
     node_sigs.sort_unstable();
     node_sigs.join("|")
 }
-
-/// All k-sized combinations of `items`, preserving relative order.
-fn combinations(items: &[String], k: usize) -> Vec<Vec<String>> {
-    fn helper(items: &[String], start: usize, k: usize, combo: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
-        if combo.len() == k {
-            out.push(combo.clone());
-            return;
-        }
-        for i in start..items.len() {
-            combo.push(items[i].clone());
-            helper(items, i + 1, k, combo, out);
-            combo.pop();
-        }
-    }
-
-    let mut out = Vec::new();
-    if k == 0 || k > items.len() {
-        return out;
-    }
-    let mut combo = Vec::with_capacity(k);
-    helper(items, 0, k, &mut combo, &mut out);
-    out
-}
-
 // ---------------------------------------------------------------------------
 // The step interface
 //
@@ -846,11 +802,10 @@ where
             config.hmp_show_operators.clone(),
             config.hmp_show_nodes.clone(),
             config.hmp_normalize_with_cardinality,
-            config.hmp_strategy,
             config.hmp_cost_method,
             config.hmp_dup_cost_model,
             config.hmp_use_pushdown,
-            config.hmp_beam_width,
+            config.hmp_search_budget,
             config.profile_iterations,
             config.trial_resume,
             config.trial_budget_eps,
@@ -1416,26 +1371,27 @@ where
             if dag.nodes.out_degree(&node.id) <= 1 || dag.nodes.paths_to_sinks(&node.id) <= 1 {
                 continue;
             }
-            let Some(plan_str) = stats
-                .node_stats
-                .get(&node.id)
-                .and_then(|s| s.plan.as_ref())
-            else {
-                continue;
-            };
-            let Some(view_plan) = self.conn.parse_plan(plan_str) else {
-                continue;
-            };
-
-            let Some(attributed) =
-                duplicate_cost(self.conn.as_ref(), dag, &node.id, &view_plan, coster.as_ref())
-                    .await
+            let Some(attributed) = duplicate_cost_set(
+                self.conn.as_ref(),
+                dag,
+                std::slice::from_ref(&node.id),
+                coster.as_ref(),
+            )
+            .await
             else {
                 continue;
             };
             measured += 1;
 
-            let cardinality = view_plan.first().and_then(|p| p.rows());
+            // Only for the cardinality normalization, and optional: the set
+            // coster EXPLAINs what it needs, so a run that collected no plans
+            // no longer blocks the ranking -- it just cannot normalize it.
+            let cardinality = stats
+                .node_stats
+                .get(&node.id)
+                .and_then(|s| s.plan.as_ref())
+                .and_then(|p| self.conn.parse_plan(p))
+                .and_then(|plan| plan.first().and_then(|p| p.rows()));
             let ranking_score = match (self.normalize_with_cardinality, cardinality) {
                 (true, Some(c)) if c > 0.0 => attributed.duplicate / c,
                 _ => attributed.duplicate,
@@ -1580,6 +1536,97 @@ where
         rows
     }
 
+    /// Price the combinations this search will spend its run budget on.
+    ///
+    /// Returns them ordered by the duplicate computation each removes, most
+    /// first. This is the whole reason the pass no longer needs a strategy: the
+    /// order candidates are tried in is decided by costing them, not by
+    /// guessing from singleton scores and finding out one DAG run at a time.
+    ///
+    /// Costing always goes through
+    /// [`duplicate_cost_set`](crate::opt::dup::duplicate_cost_set), whatever
+    /// `cost_method` is set to. `cost_method` decides the *ranking* -- and so
+    /// which Views make the working set -- but a Leafset or node-time score is
+    /// not a quantity of duplicated work, and mixing one into a set's dup cost
+    /// would be adding incommensurable units. When `cost_method` is not
+    /// `DupAttribution` this costs one extra singleton pass; that is the price of
+    /// a coherent objective.
+    async fn build_candidates(
+        &self,
+        dag: &Dag,
+        working_set: &[String],
+    ) -> Vec<CandidateCombo> {
+        if working_set.is_empty() {
+            return Vec::new();
+        }
+
+        // Same snapshot-then-build dance as `ranking_dup`: the model cannot be
+        // held across an await.
+        let model = match self.learned.lock() {
+            Ok(m) => m.clone(),
+            Err(_) => LearnedCostModel::new(),
+        };
+        let coster = self.dup_cost_model.coster(&model);
+
+        let singletons: HashMap<String, f64> = self
+            .node_rows
+            .iter()
+            .map(|r| (r.node.clone(), r.ranking_score))
+            .collect();
+
+        let ordered = canonical_order(dag, working_set);
+        let costed = search_combos(
+            self.conn.as_ref(),
+            dag,
+            &ordered,
+            &singletons,
+            coster.as_ref(),
+            self.search_budget,
+        )
+        .await;
+
+        if !costed.is_empty() {
+            debug!(
+                "HMPPass: {} candidate combination(s) priced, best {:.4}",
+                costed.len(),
+                costed.first().map(|c| c.cost).unwrap_or(0.0)
+            );
+            return costed
+                .into_iter()
+                .map(|c| CandidateCombo {
+                    combo: c.combo,
+                    cost: c.cost,
+                    partial: false,
+                })
+                .collect();
+        }
+
+        // Nothing could be priced: the connector cannot EXPLAIN, or no plan was
+        // priceable. An empty list here would read as "nothing worth doing" and
+        // promote on the next step, which would quietly turn the pass off. Fall
+        // back to the unpriced enumeration -- smallest combinations first, in
+        // ranking order -- so the run budget is still spent on something.
+        warn!(
+            "HMPPass: no candidate combination could be costed; falling back to \
+             trying them smallest-first in ranking order"
+        );
+        let cap = self.search_budget.max(self.max_runs);
+        let mut out = Vec::new();
+        for k in 1..=working_set.len() {
+            for combo in combinations(working_set, k) {
+                if out.len() >= cap {
+                    return out;
+                }
+                out.push(CandidateCombo {
+                    combo,
+                    cost: 0.0,
+                    partial: true,
+                });
+            }
+        }
+        out
+    }
+
     /// The prefix of `ranking` whose cumulative score covers `top_cpu_time` of
     /// the total -- the candidates worth searching.
     fn working_set_from(&self, ranking: &[NodeRankingRow]) -> Vec<String> {
@@ -1598,36 +1645,6 @@ where
         }
         set
     }
-
-    /// Reorder `nodes` by the scores accumulated during the round that just
-    /// finished, falling back to the baseline score for a node no trial saw.
-    ///
-    /// The same refinement the breadth search always did between combination
-    /// sizes; it reads accumulated sums rather than replaying stored
-    /// observations, because the sums are what it computed from them anyway.
-    fn reorder_by(
-        nodes: &[String],
-        sums: &HashMap<String, f64>,
-        counts: &HashMap<String, usize>,
-        baseline_scores: &HashMap<String, f64>,
-    ) -> Vec<String> {
-        let mut ordered = nodes.to_vec();
-        ordered.sort_by(|a, b| {
-            let score_of = |n: &String| -> f64 {
-                match counts.get(n) {
-                    Some(&count) if count > 0 => {
-                        sums.get(n).copied().unwrap_or(0.0) / count as f64
-                    }
-                    _ => baseline_scores.get(n).copied().unwrap_or(0.0),
-                }
-            };
-            score_of(b)
-                .partial_cmp(&score_of(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        ordered
-    }
-
     /// Apply `combo` to `dag`, then optionally push predicates into it.
     async fn build_trial(&self, dag: &mut Dag, combo: &[String]) -> Result<(), OptimizerError> {
         for node_id in combo {
@@ -1641,80 +1658,6 @@ where
         }
         Ok(())
     }
-
-    /// The next combination the breadth search should try, advancing the
-    /// cursor past any that reduce to a DAG already measured.
-    ///
-    /// `None` means the enumeration is exhausted.
-    fn next_breadth_combo(&self, state: &mut HmpState) -> Option<Vec<String>> {
-        loop {
-            if state.k > state.working_order.len() {
-                return None;
-            }
-            let combos = combinations(&state.working_order, state.k);
-            if state.combo_index >= combos.len() {
-                // Round finished: refine the order from what this round
-                // measured, then start on the next size.
-                state.k += 1;
-                state.combo_index = 0;
-                state.working_order = Self::reorder_by(
-                    &state.working_order,
-                    &state.round_score_sums,
-                    &state.round_score_counts,
-                    &state.baseline_scores,
-                );
-                state.round_score_sums.clear();
-                state.round_score_counts.clear();
-                continue;
-            }
-            let combo = combos[state.combo_index].clone();
-            state.combo_index += 1;
-            return Some(combo);
-        }
-    }
-
-    /// The next combination the greedy beam search should try.
-    fn next_greedy_combo(&self, state: &mut HmpState) -> Option<Vec<String>> {
-        if state.beams.is_empty() {
-            state.beams.push(BeamState {
-                combo: Vec::new(),
-                runtime_ms: state.best_ms,
-            });
-            state.proposals = state.beams.clone();
-        }
-        loop {
-            if state.node_cursor >= state.working_order.len() {
-                return None;
-            }
-            let node_id = state.working_order[state.node_cursor].clone();
-
-            if state.beam_cursor >= state.beams.len() {
-                // Every beam has been expanded at this node: prune to the
-                // width and move on. Beams carried forward unchanged are among
-                // the proposals, which is what lets the search drop a node it
-                // committed to earlier.
-                let mut proposals = std::mem::take(&mut state.proposals);
-                proposals.sort_by_key(|p| p.runtime_ms);
-                proposals.dedup_by(|a, b| a.combo == b.combo);
-                proposals.truncate(self.beam_width.max(1));
-                state.beams = proposals;
-                state.node_cursor += 1;
-                state.beam_cursor = 0;
-                state.proposals = state.beams.clone();
-                continue;
-            }
-
-            let beam = state.beams[state.beam_cursor].clone();
-            state.beam_cursor += 1;
-            if beam.combo.contains(&node_id) {
-                continue;
-            }
-            let mut combo = beam.combo.clone();
-            combo.push(node_id);
-            return Some(combo);
-        }
-    }
-
     /// Everything the report needs, from the state as it now stands.
     fn outcome_from(&self, state: &HmpState) -> PassOutcome {
         PassOutcome {
@@ -1733,8 +1676,8 @@ where
                 },
                 max_runs: self.max_runs,
                 top_cpu_time: self.top_cpu_time,
-                strategy: format!("{:?}", self.strategy),
-                beam_width: self.beam_width,
+                search_budget: self.search_budget,
+                candidates_costed: state.candidates.len(),
                 normalize_with_cardinality: self.normalize_with_cardinality,
                 downstream_cost: self.downstream_cost,
                 use_pushdown: self.use_pushdown,
@@ -1761,8 +1704,8 @@ where
             working_set: state.working_set.clone(),
             best_combo: state.best_combo.clone(),
             iterations: state.iterations.clone(),
-            strategy: self.strategy,
-            beam_width: self.beam_width,
+            search_budget: self.search_budget,
+            candidates_costed: state.candidates.len(),
         });
     }
 
@@ -1838,17 +1781,28 @@ where
                     return self.promote(ctx, state).await;
                 }
 
-                // Skip candidates that reduce to a DAG already measured; each
-                // costs nothing but a rewrite, and paying a DAG run for a
-                // duplicate is the expensive mistake.
+                // A state row written before the search kept a candidate list
+                // decodes with an empty one. That is "not enumerated yet", not
+                // "exhausted", and promoting here would silently end a search
+                // that was merely persisted by an older build.
+                if !state.candidates_built {
+                    warn!(
+                        "HMPPass: this search predates the candidate list and cannot be \
+                         resumed mid-flight; promoting the best combination it had found"
+                    );
+                    return self.promote(ctx, state).await;
+                }
+
+                // Walk the candidates in the order they were priced, skipping
+                // any that reduce to a DAG already measured: each costs nothing
+                // but a rewrite, and paying a DAG run for a duplicate is the
+                // expensive mistake.
                 loop {
-                    let combo = match self.strategy {
-                        HMPStrategy::Breadth => self.next_breadth_combo(&mut state),
-                        HMPStrategy::Greedy => self.next_greedy_combo(&mut state),
-                    };
-                    let Some(combo) = combo else {
+                    let Some(candidate) = state.candidates.get(state.cursor) else {
                         return self.promote(ctx, state).await;
                     };
+                    let combo = candidate.combo.clone();
+                    state.cursor += 1;
 
                     let mut trial = ctx.dag.clone();
                     // A combination that cannot be rewritten is not a failed
@@ -1864,15 +1818,6 @@ where
                     let sig = dag_signature(&trial);
                     let fallback = self.incumbent_dag(ctx.dag, &state).await;
 
-                    if let Some(&measured) = state.tried_combos.get(&sig) {
-                        // Already measured under another combo: score this
-                        // beam from that measurement instead of re-running.
-                        state.proposals.push(BeamState {
-                            combo: combo.clone(),
-                            runtime_ms: measured,
-                        });
-                        continue;
-                    }
                     if state.tried_sigs.contains(&sig) {
                         debug!("combo {combo:?} reduces to a DAG already tried, skipping");
                         continue;
@@ -2007,7 +1952,6 @@ where
                 .map(|r| (r.node.clone(), r.ranking_score))
                 .collect();
             state.working_set = self.working_set_from(&ranking);
-            state.working_order = state.working_set.clone();
             self.node_rows = ranking;
             state.phase = "searching".to_string();
 
@@ -2016,6 +1960,10 @@ where
                 state.working_set.len(),
                 state.working_set
             );
+
+            state.candidates = self.build_candidates(ctx.dag, &state.working_set).await;
+            state.cursor = 0;
+            state.candidates_built = true;
             self.record_trial(ctx.store, ctx.dag_id, &run.run_id, &state, runtime_ms, true)
                 .await?;
             self.save_state(ctx.store, ctx.dag_id, &state).await?;
@@ -2043,18 +1991,11 @@ where
                     Vec::new()
                 }),
         );
-        state.tried_combos.insert(in_flight.sig, runtime_ms);
-        state.proposals.push(BeamState {
-            combo: in_flight.combo.clone(),
-            runtime_ms,
-        });
-
-        // Accumulate the ranking this trial implies, for the reordering the
-        // breadth search does between combination sizes.
-        for row in self.ranking_for(ctx.dag, stats).await {
-            *state.round_score_sums.entry(row.node.clone()).or_insert(0.0) += row.ranking_score;
-            *state.round_score_counts.entry(row.node).or_insert(0) += 1;
-        }
+        // Fit the cost model to what this trial actually executed. The search
+        // no longer re-ranks between rounds, so this is what keeps trial
+        // evidence reaching the model -- and it reads the plans the run already
+        // collected rather than issuing EXPLAINs of its own.
+        self.learn_from(ctx.dag, stats);
 
         let improved = runtime_ms < state.best_ms;
         if improved {
@@ -2107,8 +2048,8 @@ where
 
         state.runs_used += 1;
         // A lower bound, not a measurement: at least the budget. Recording it
-        // as the candidate's runtime keeps the beam and the de-duplication from
-        // ever preferring it, without claiming to know how bad it was.
+        // as the candidate's runtime keeps the search from ever preferring it,
+        // without claiming to know how bad it was.
         let censored_ms = self.budget(&state).unwrap_or(i64::MAX);
         debug!(
             "combo {:?} produced no usable measurement; rejecting as censored (>= {censored_ms}ms)",
@@ -2124,11 +2065,13 @@ where
                 .with_outcome("cancelled")
                 .with_run_cost(ctx),
         );
-        state.tried_combos.insert(in_flight.sig, censored_ms);
-        state.proposals.push(BeamState {
-            combo: in_flight.combo,
-            runtime_ms: censored_ms,
-        });
+        // A cancelled candidate is still a candidate that has been paid for.
+        // `step_before` records the signature as it proposes, so this is
+        // normally already present -- but a combo that reached here by any
+        // other route must not be re-proposed either.
+        if !state.tried_sigs.contains(&in_flight.sig) {
+            state.tried_sigs.push(in_flight.sig.clone());
+        }
 
         self.record_trial(ctx.store, ctx.dag_id, run_id, &state, censored_ms, false)
             .await?;
@@ -2350,19 +2293,8 @@ where
                 format!("{}/{} runs", data.runs_used, data.max_runs),
             ),
             (
-                "Search strategy",
-                match data.strategy {
-                    HMPStrategy::Breadth => "breadth",
-                    HMPStrategy::Greedy => "greedy",
-                }
-                .to_string(),
-            ),
-            (
-                "Beam width",
-                match data.strategy {
-                    HMPStrategy::Greedy => data.beam_width.to_string(),
-                    HMPStrategy::Breadth => "n/a".to_string(),
-                },
+                "Combinations costed",
+                format!("{}/{}", data.candidates_costed, data.search_budget),
             ),
             (
                 "Ranking normalized by cardinality",
@@ -2477,20 +2409,16 @@ where
             })
             .collect();
 
-        let combinations_desc = match data.strategy {
-            HMPStrategy::Breadth => {
-                "Combinations of working-set nodes were tried smallest-first (singles, then pairs, \
-                 ...) until the run budget was exhausted. Between sizes, the search order was \
-                 refined using the EXPLAIN ANALYZE plans collected from the previous size's trials."
-                    .to_string()
-            }
-            HMPStrategy::Greedy => format!(
-                "A beam search (width {}) walked the node ranking, keeping the {} \
-                 best-performing materialization combos alive at each step -- including the option \
-                 of leaving a node out -- until the run budget was exhausted.",
-                data.beam_width, data.beam_width
-            ),
-        };
+        let combinations_desc = format!(
+            "Combinations of working-set nodes were priced before any of them was run: up to \
+             {} of them, each costed by inlining its members as materialized CTEs and charging \
+             every copy but one. A combination is costed as a chain -- each member against a DAG \
+             in which the members before it are already tables -- so a node is not credited with \
+             removing work that another member of the same combination already removed. {} were \
+             costed, and the run budget was spent on them in descending order of the duplicate \
+             computation they remove.",
+            data.search_budget, data.candidates_costed
+        );
 
         format!(
             r##"<div class="section-stack">
@@ -2575,7 +2503,7 @@ mod tests {
     }
 
     async fn test_pass(
-        beam_width: usize,
+        search_budget: usize,
     ) -> HMPPass<DuckDBConnection, SimpleEngine<DuckDBConnection>> {
         let conn = in_memory_conn().await;
         let engine = Arc::new(SimpleEngine::new(Arc::clone(&conn)).unwrap());
@@ -2588,13 +2516,12 @@ mod tests {
             None,
             None,
             false,
-            HMPStrategy::Breadth,
             // The existing tests fabricate operator-signature plans, which is
             // what this method reads.
             HmpCostMethod::Signature,
             SubtreeCostMethod::default(),
             false,
-            beam_width,
+            search_budget,
             false,
             true,
             crate::opt::common::DEFAULT_BUDGET_EPS,
@@ -2981,7 +2908,6 @@ mod tests {
             None,
             None,
             false,
-            HMPStrategy::Breadth,
             HmpCostMethod::DupAttribution,
             SubtreeCostMethod::Cardinality,
             false,
@@ -3058,10 +2984,14 @@ mod tests {
         );
     }
 
-    /// No plans at all: nothing to attribute, and `ranking_for` must fall
-    /// through rather than report that this DAG duplicates nothing.
+    /// Attribution no longer depends on the run having collected plans.
+    ///
+    /// It used to: the View's own plan was the `own` term and had to come from
+    /// `stats.node_stats`, so a run without plans declined outright. The set
+    /// coster EXPLAINs the build-once probe itself, so the only thing a missing
+    /// plan now costs is the cardinality normalization.
     #[tokio::test]
-    async fn dup_attribution_declines_when_the_run_carried_no_plans() {
+    async fn dup_attribution_still_measures_when_the_run_carried_no_plans() {
         let mut pass = test_pass(2).await;
         pass.cost_method = HmpCostMethod::DupAttribution;
         pass.dup_cost_model = SubtreeCostMethod::Cardinality;
@@ -3080,8 +3010,15 @@ mod tests {
             system_samples: Vec::new(),
         };
 
-        assert!(pass.ranking_dup(&dag, &stats).await.is_none());
-        // And the dispatcher falls back rather than propagating the `None`.
+        let rows = pass
+            .ranking_dup(&dag, &stats)
+            .await
+            .expect("the set coster EXPLAINs what it needs, so this still measures");
+        assert!(
+            rows.iter().all(|r| r.cardinality.is_none()),
+            "with no stored plan there is nothing to normalize by: {rows:?}"
+        );
+        // And the dispatcher still works from here.
         let _ = pass.ranking_for(&dag, &stats).await;
     }
 
@@ -3147,110 +3084,13 @@ mod tests {
         // And `ranking_for` takes the fallback rather than returning nothing.
         let _ = pass.ranking_for(&dag, &stats).await;
     }
-
-    // "shelf" is a materialized Table whose EXPLAIN plan roots two operators:
-    // OP1 (cheap, traced only to b_view) and OP2 (expensive, traced only to
-    // c_view). Baseline ranks b_view above c_view, but the fabricated trial
-    // observation shows the opposite (c_view now costs more than b_view) --
-    // simulating what a real trial's fresh EXPLAIN ANALYZE plans can reveal
-    // once other nodes have already been materialized. `refine_node_order`
-    // should re-rank to match the observation, not the stale baseline.
+    // End-to-end smoke test for the search, driven through the step interface:
+    // the batch driver supplies the executions, and HMP proposes a candidate
+    // before each and scores it after. The search must converge, must stop at
+    // its run budget, and must trial candidates in the order it priced them --
+    // the whole point of pricing them before spending runs.
     #[tokio::test]
-    async fn refine_node_order_promotes_node_with_higher_observed_cost() {
-        let pass = test_pass(2).await;
-
-        let shelf_plan = r#"{"operator_name":"ROOT","operator_timing":0.0,"children":[
-            {"operator_name":"OP1","operator_timing":2.0,"extra_info":{"Estimated Cardinality":"1"},"children":[]},
-            {"operator_name":"OP2","operator_timing":8.0,"extra_info":{"Estimated Cardinality":"1"},"children":[]}
-        ]}"#;
-        let b_view_plan = r#"[{"operator_name":"OP1","operator_timing":2.0,"extra_info":{"Estimated Cardinality":"1"},"children":[]}]"#;
-        let c_view_plan = r#"[{"operator_name":"OP2","operator_timing":8.0,"extra_info":{"Estimated Cardinality":"1"},"children":[]}]"#;
-
-        let dag = make_dag(vec![
-            node("shelf", "SELECT 1 AS x", MaterializeMode::Table, &[]),
-            node("b_view", "SELECT 1 AS x", MaterializeMode::View, &[]),
-            node("c_view", "SELECT 1 AS x", MaterializeMode::View, &[]),
-            node("b_sink1", "SELECT * FROM b_view", MaterializeMode::Table, &["b_view"]),
-            node("b_sink2", "SELECT * FROM b_view", MaterializeMode::Table, &["b_view"]),
-            node("c_sink1", "SELECT * FROM c_view", MaterializeMode::Table, &["c_view"]),
-            node("c_sink2", "SELECT * FROM c_view", MaterializeMode::Table, &["c_view"]),
-        ]);
-
-        let mut node_stats_map = HashMap::new();
-        node_stats_map.insert("shelf".to_string(), node_stats(Some(shelf_plan.to_string())));
-        node_stats_map.insert("b_view".to_string(), node_stats(Some(b_view_plan.to_string())));
-        node_stats_map.insert("c_view".to_string(), node_stats(Some(c_view_plan.to_string())));
-
-        let exec_stats = ExecStats {
-            start: Utc::now(),
-            finish: Utc::now(),
-            duration: chrono::TimeDelta::zero(),
-            node_stats: node_stats_map,
-            system_samples: vec![],
-        };
-
-        let baseline_scores: HashMap<String, f64> = [
-            ("b_view".to_string(), 10.0),
-            ("c_view".to_string(), 5.0),
-        ]
-        .into_iter()
-        .collect();
-        let nodes = vec!["b_view".to_string(), "c_view".to_string()];
-
-        // The search now accumulates each trial's ranking as it is measured
-        // rather than replaying stored observations, so the equivalent of one
-        // observation is that trial's ranking folded into the round's sums.
-        let mut sums: HashMap<String, f64> = HashMap::new();
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for row in pass.ranking_for(&dag, &exec_stats).await {
-            *sums.entry(row.node.clone()).or_insert(0.0) += row.ranking_score;
-            *counts.entry(row.node).or_insert(0) += 1;
-        }
-
-        let refined = HMPPass::<DuckDBConnection, SimpleEngine<DuckDBConnection>>::reorder_by(
-            &nodes,
-            &sums,
-            &counts,
-            &baseline_scores,
-        );
-
-        assert_eq!(refined, vec!["c_view".to_string(), "b_view".to_string()]);
-    }
-
-    // Nodes absent from every observation (e.g. materialized in all trials
-    // seen so far) fall back to the baseline score instead of being treated
-    // as zero-cost.
-    #[tokio::test]
-    async fn refine_node_order_falls_back_to_baseline_for_unobserved_nodes() {
-
-        let baseline_scores: HashMap<String, f64> = [
-            ("b_view".to_string(), 10.0),
-            ("c_view".to_string(), 5.0),
-        ]
-        .into_iter()
-        .collect();
-        let nodes = vec!["c_view".to_string(), "b_view".to_string()];
-
-        // No observations at all -- order should be untouched apart from
-        // falling back fully to baseline_scores (b_view still ranks first).
-        let refined = HMPPass::<DuckDBConnection, SimpleEngine<DuckDBConnection>>::reorder_by(
-            &nodes,
-            &HashMap::new(),
-            &HashMap::new(),
-            &baseline_scores,
-        );
-
-        assert_eq!(refined, vec!["b_view".to_string(), "c_view".to_string()]);
-    }
-
-    // End-to-end smoke test for the Greedy strategy's beam search, now driven
-    // through the step interface: the batch driver supplies the executions,
-    // and HMP proposes a candidate before each and scores it after. This is
-    // the test that the inversion preserved the search -- the beam still
-    // converges, still stops at its budget, and the budget is still counted in
-    // DAG runs.
-    #[tokio::test]
-    async fn greedy_beam_search_runs_and_respects_budget() {
+    async fn search_respects_the_run_budget_and_trials_in_priced_order() {
         let conn = in_memory_conn().await;
         conn.execute(
             "CREATE TABLE orders AS SELECT range AS order_id, range % 4 AS region \
@@ -3291,16 +3131,17 @@ mod tests {
         let config = OptimizerConfig::default()
             .with_all_disabled()
             .with_hmp_pass()
-            .with_hmp_strategy(HMPStrategy::Greedy)
             .with_hmp_max_runs(4)
             .with_hmp_top_cpu_time(1.0)
             .with_hmp_use_pushdown(false)
-            .with_hmp_beam_width(2);
+            .with_hmp_cost_method(HmpCostMethod::DupAttribution)
+            .with_hmp_dup_cost_model(SubtreeCostMethod::Cardinality)
+            .with_hmp_search_budget(8);
 
         let stores = MemoryStoreFactory::open().unwrap();
         let mut optimizer = Optimizer::new_with_config(conn, engine, config);
         let report = optimizer
-            .run(&mut dag, "dag-1", "greedy", 1, &stores)
+            .run(&mut dag, "dag-1", "search", 1, &stores)
             .await
             .unwrap();
 
@@ -3311,6 +3152,32 @@ mod tests {
             hmp.dag_runs_used
         );
         assert!(hmp.dag_runs_used >= 1, "the baseline alone is one run");
+
+        let PassDetail::Hmp(detail) = &hmp.detail else {
+            panic!("HMP must report HMP detail");
+        };
+        assert!(
+            detail.candidates_costed > 0,
+            "the search should have priced candidates before spending runs"
+        );
+        assert!(
+            detail.candidates_costed <= 8,
+            "costing must stay inside the search budget, priced {}",
+            detail.candidates_costed
+        );
+
+        // Every combo that was actually trialled must appear in the order the
+        // pricing put them in, and never before a combo priced above it.
+        let trialled: Vec<&Vec<String>> = hmp
+            .iterations
+            .iter()
+            .map(|it| &it.combo)
+            .filter(|c| !c.is_empty())
+            .collect();
+        assert!(
+            !trialled.is_empty(),
+            "at least one candidate should have been trialled and named"
+        );
     }
 
     #[tokio::test]
@@ -3337,7 +3204,7 @@ mod tests {
         state.best_ms = 1000;
         state.best_combo = vec!["kept".to_string()];
         state.working_set = vec!["a".to_string(), "b".to_string()];
-        state.working_order = state.working_set.clone();
+        state.candidates_built = true;
         state.in_flight = Some(InFlight {
             combo: vec!["a".to_string()],
             sig: "sig-a".to_string(),
@@ -3377,10 +3244,10 @@ mod tests {
         // new best.
         assert_eq!(after.best_ms, 1000);
         assert_eq!(after.best_combo, vec!["kept".to_string()]);
-        assert_eq!(
-            after.tried_combos.get("sig-a").copied(),
-            Some(1000),
-            "the censored observation must be filed at the budget, not discarded"
+        assert!(
+            after.tried_sigs.iter().any(|sig| sig == "sig-a"),
+            "the cancelled combo must stay recorded as tried, or the next \
+             Before step re-proposes it"
         );
         assert_eq!(
             after.iterations.last().unwrap().outcome.as_deref(),
@@ -3416,7 +3283,7 @@ mod tests {
         state.baseline_ms = 1000;
         state.best_ms = 1000;
         state.working_set = vec!["v".to_string()];
-        state.working_order = vec!["v".to_string()];
+        state.candidates_built = true;
         state.runs_used = 1;
         state.in_flight = Some(InFlight {
             combo: vec!["v".to_string()],
@@ -3614,6 +3481,93 @@ mod tests {
     // A continuous optimization's whole premise is that its search survives
     // between runs, so state written by one step has to be what the next one
     // reads. Register, step, and check the search actually moved.
+    /// Costing can come back with nothing at all -- a connector that cannot
+    /// EXPLAIN, or a run whose plans were never collected. The search must fall
+    /// back to trying combinations unpriced rather than hand back an empty
+    /// list, because an empty candidate list promotes on the next step and so
+    /// turns the pass off without saying so.
+    #[tokio::test]
+    async fn an_uncostable_search_falls_back_to_plain_combinations() {
+        let pass = test_pass(32).await;
+        let dag = make_dag(vec![
+            node("a", "SELECT 1", MaterializeMode::View, &[]),
+            node("b", "SELECT 2", MaterializeMode::View, &[]),
+            node("t1", "SELECT * FROM a", MaterializeMode::Table, &["a"]),
+            node("t2", "SELECT * FROM b", MaterializeMode::Table, &["b"]),
+        ]);
+        // The learned model has been fitted to nothing, so the region coster
+        // declines to price anything it is handed.
+
+        let working_set = vec!["a".to_string(), "b".to_string()];
+        let candidates = pass.build_candidates(&dag, &working_set).await;
+
+        assert!(
+            !candidates.is_empty(),
+            "an uncostable search must still offer candidates, or HMP silently \
+             stops optimizing"
+        );
+        assert!(
+            candidates.iter().all(|c| c.partial),
+            "unpriced candidates must be flagged as such rather than claim a cost"
+        );
+        assert!(
+            candidates.iter().take(2).all(|c| c.combo.len() == 1),
+            "the fallback tries combinations smallest-first: {candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|c| c.combo.len() == 2),
+            "and still reaches the pairs: {candidates:?}"
+        );
+    }
+
+    /// A state row written before the candidate list existed must still
+    /// decode, and must not read as an exhausted search.
+    ///
+    /// `load_state` turns a decode failure into a hard error, so without the
+    /// struct-level `#[serde(default)]` every search in flight at upgrade time
+    /// would break; and without `candidates_built` a search that decoded fine
+    /// would still promote immediately, because an empty candidate list is
+    /// indistinguishable from a finished one.
+    #[test]
+    fn a_legacy_state_row_decodes_and_is_not_mistaken_for_exhausted() {
+        // Shaped like a pre-change persisted state, mid-search: the cursors
+        // that no longer exist, and none of the fields that replaced them.
+        let legacy = r#"{
+            "phase": "searching",
+            "baseline_ms": 1200,
+            "best_ms": 900,
+            "best_combo": ["a"],
+            "working_set": ["a", "b"],
+            "baseline_scores": {"a": 2.0, "b": 1.0},
+            "working_order": ["a", "b"],
+            "runs_used": 2,
+            "iterations": [],
+            "tried_sigs": ["sig-a"],
+            "k": 2,
+            "combo_index": 1,
+            "round_score_sums": {},
+            "round_score_counts": {},
+            "beams": [{"combo": ["a"], "runtime_ms": 900}],
+            "node_cursor": 1,
+            "beam_cursor": 0,
+            "proposals": [],
+            "tried_combos": {"sig-a": 900},
+            "in_flight": null
+        }"#;
+
+        let state: HmpState =
+            serde_json::from_str(legacy).expect("a state row from an older build must decode");
+
+        assert_eq!(state.phase, "searching");
+        assert_eq!(state.best_ms, 900);
+        assert_eq!(state.tried_sigs, vec!["sig-a".to_string()]);
+        assert!(
+            !state.candidates_built,
+            "the row predates the candidate list, so the search has not enumerated yet"
+        );
+        assert!(state.candidates.is_empty());
+    }
+
     #[tokio::test]
     async fn search_state_persists_between_steps() {
         let store = MemoryStore::open("hmp").unwrap();

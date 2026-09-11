@@ -21,13 +21,11 @@ variants:
   omp: {passes: [omp, pushdown]}
 
 # Lists here multiply into the matrix, but only for variants whose passes
-# actually read the option -- `hmp_strategy` does not duplicate `unopt` or
+# actually read the option -- `hmp_search_budget` does not duplicate `unopt` or
 # `omp` cells.
 dee_opt:
   hmp_max_runs: [3]
-  hmp_strategy: [breadth]
   hmp_downstream_cost: [false]
-  hmp_beam_width: 2
   hmp_top_cpu_time: 0.5
   omp_node_centrality: outdegree
   omp_top: 3

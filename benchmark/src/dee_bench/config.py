@@ -85,9 +85,6 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
                doc="Fraction of total operator CPU time the HMP working set must cover."),
     DeeOptSpec("hmp_normalize_with_cardinality", "--hmp-normalize-with-cardinality", "bool", frozenset({"hmp"}),
                doc="Divide HMP's ranking score by the candidate's estimated cardinality."),
-    DeeOptSpec("hmp_strategy", "--hmp-strategy", "str", frozenset({"hmp"}),
-               choices=("breadth", "greedy"),
-               doc="HMP's search strategy over the candidate ranking."),
     DeeOptSpec("hmp_cost_method", "--hmp-cost-method", "str", frozenset({"hmp"}),
                choices=("leafset", "signature", "node_time", "learned_cost", "dup_attribution"),
                doc="How HMP reads a View's cost off a run's plans. `leafset` matches a View "
@@ -104,8 +101,9 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
                    "`learned_cost` gives seconds, from constants fitted to executed plans; "
                    "`cardinality` sums the region's estimated output rows; `operators` counts "
                    "its operators. Ignored by every other cost method."),
-    DeeOptSpec("hmp_beam_width", "--hmp-beam-width", "int", frozenset({"hmp"}),
-               doc="Beam width for the greedy HMP strategy. Ignored by breadth."),
+    DeeOptSpec("hmp_search_budget", "--hmp-search-budget", "int", frozenset({"hmp"}),
+               doc="Candidate combinations HMP prices before it spends any DAG run on them. "
+                   "Bounds costing, which is EXPLAIN-only; `hmp_max_runs` bounds executions."),
     DeeOptSpec("hmp_use_pushdown", "--hmp-no-pushdown", "bool", frozenset({"hmp"}), negated=True,
                doc="Run the pushdown pass on each HMP candidate before measuring it."),
     DeeOptSpec("trial_resume", "--trial-resume", "bool",

@@ -24,16 +24,16 @@ def cell(variant="hmp", passes=("hmp",), dee_opt=None, **kw):
 
 class TestPruning:
     def test_drops_options_no_enabled_pass_reads(self):
-        opts = {"hmp_strategy": "greedy", "omp_top": 5, "hmp_max_runs": 4}
-        assert prune_dee_opt(opts, ("hmp",)) == {"hmp_max_runs": 4, "hmp_strategy": "greedy"}
+        opts = {"hmp_search_budget": 8, "omp_top": 5, "hmp_max_runs": 4}
+        assert prune_dee_opt(opts, ("hmp",)) == {"hmp_max_runs": 4, "hmp_search_budget": 8}
 
     def test_baseline_variant_keeps_nothing(self):
-        opts = {"hmp_strategy": "greedy", "omp_top": 5}
+        opts = {"hmp_search_budget": 8, "omp_top": 5}
         assert prune_dee_opt(opts, ()) == {}
 
     def test_pushdown_alone_reads_no_search_options(self):
         # Pushdown is a static analysis with no search to tune.
-        assert prune_dee_opt({"hmp_strategy": "greedy"}, ("pushdown",)) == {}
+        assert prune_dee_opt({"hmp_search_budget": 8}, ("pushdown",)) == {}
 
     def test_option_shared_by_two_passes_survives_either(self):
         opts = {"profile_iterations": True}
@@ -48,8 +48,8 @@ class TestCellId:
         assert a.cell_id == b.cell_id
 
     def test_is_insensitive_to_option_ordering(self):
-        a = cell(dee_opt={"hmp_max_runs": 4, "hmp_strategy": "greedy"})
-        b = cell(dee_opt={"hmp_strategy": "greedy", "hmp_max_runs": 4})
+        a = cell(dee_opt={"hmp_max_runs": 4, "hmp_search_budget": 8})
+        b = cell(dee_opt={"hmp_search_budget": 8, "hmp_max_runs": 4})
         assert a.cell_id == b.cell_id
 
     def test_distinguishes_meaningful_differences(self):
@@ -65,8 +65,8 @@ class TestCellId:
     def test_pruned_options_collapse_to_one_cell(self):
         # The point of pruning: sweeping an HMP option must not silently
         # produce several identical unoptimized cells.
-        a = cell(variant="unopt", passes=(), dee_opt=prune_dee_opt({"hmp_strategy": "breadth"}, ()))
-        b = cell(variant="unopt", passes=(), dee_opt=prune_dee_opt({"hmp_strategy": "greedy"}, ()))
+        a = cell(variant="unopt", passes=(), dee_opt=prune_dee_opt({"hmp_search_budget": 8}, ()))
+        b = cell(variant="unopt", passes=(), dee_opt=prune_dee_opt({"hmp_search_budget": 32}, ()))
         assert a.cell_id == b.cell_id
 
 

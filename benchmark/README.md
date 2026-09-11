@@ -69,7 +69,7 @@ variants:                        # the ablation ladder
 
 dee_opt:                         # every dee optimizer option; lists sweep
   hmp_max_runs: [1, 4]
-  hmp_strategy: [breadth, greedy]
+  hmp_search_budget: [8, 32]
 
 backends:                        # backend tuning; lists sweep here too
   duckdb:   {threads: 16, max_memory: [4GB, 16GB]}
@@ -176,7 +176,7 @@ than assumed.
 ### Why the matrix does not explode
 
 Options are pruned to the passes that actually read them before cells are
-deduplicated. Sweeping `hmp_strategy` does not multiply `unopt` or `omp` cells,
+deduplicated. Sweeping `hmp_search_budget` does not multiply `unopt` or `omp` cells,
 because neither consults it. In practice this is a 3-4x reduction and, more
 importantly, stops identical experiments being double-counted in aggregates.
 

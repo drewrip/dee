@@ -132,9 +132,13 @@ pub struct HmpDetail {
     /// The `--hmp-max-runs` budget this pass was given.
     pub max_runs: usize,
     pub top_cpu_time: f64,
-    /// `"Breadth"` or `"Greedy"`.
-    pub strategy: String,
-    pub beam_width: usize,
+    /// The `--hmp-search-budget` this pass was given: how many candidate
+    /// combinations it was allowed to price before spending any DAG run.
+    #[serde(default)]
+    pub search_budget: usize,
+    /// How many it actually priced.
+    #[serde(default)]
+    pub candidates_costed: usize,
     pub normalize_with_cardinality: bool,
     pub downstream_cost: bool,
     pub use_pushdown: bool,

@@ -26,7 +26,6 @@ variants:
 
 dee_opt:
   hmp_max_runs: 12
-  hmp_strategy: breadth
   # The learned ranking is very top-heavy -- the leading candidate takes almost
   # all the ranked mass -- so a 0.8 cut admits one node and the search exhausts
   # after two runs. 1.0 puts the whole ranking in the working set, which is what

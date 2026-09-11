@@ -48,7 +48,6 @@ variants:
 
 dee_opt:
   hmp_max_runs: 4
-  hmp_strategy: breadth
 
 backends:
   duckdb:

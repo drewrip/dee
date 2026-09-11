@@ -1,3 +1,4 @@
+pub mod combo;
 pub mod common;
 pub mod dup;
 pub mod explain;
@@ -28,7 +29,7 @@ use crate::{
     executor::{Executor, ExecutorError, RunOptions, StopReason},
     opt::{
         dup::SubtreeCostMethod,
-        hmp::{HMPStrategy, HmpCostMethod},
+        hmp::HmpCostMethod,
         omp::OMPCentrality,
         resume::ReusePolicy,
     },
@@ -709,7 +710,6 @@ pub struct OptimizerConfig {
     pub hmp_show_operators: Option<String>,
     pub hmp_show_nodes: Option<String>,
     pub hmp_normalize_with_cardinality: bool,
-    pub hmp_strategy: HMPStrategy,
     /// HMP: how a View's cost is read off a run's plans. `leafset` attributes a
     /// View to the region of a consumer's plan whose scanned base relations are
     /// still contained in the View's own; `signature` is the older method that
@@ -723,9 +723,13 @@ pub struct OptimizerConfig {
     /// Ignored by every other method, none of which has a notion of a region.
     pub hmp_dup_cost_model: SubtreeCostMethod,
     pub hmp_use_pushdown: bool,
-    /// HMP: number of hypotheses the `Greedy` strategy's beam search keeps
-    /// alive at each step. Unused by the `Breadth` strategy.
-    pub hmp_beam_width: usize,
+    /// HMP: how many candidate combinations the search may price before it
+    /// starts spending DAG runs on them.
+    ///
+    /// Separate from `hmp_max_runs`, which bounds executions: this bounds how
+    /// much of the combination space is *costed*, which is EXPLAIN-only and so
+    /// far cheaper than measuring.
+    pub hmp_search_budget: usize,
     /// Capture a CPU/memory/disk timeseries for every HMP/OMP candidate run
     /// and attach it to that iteration's stats.
     pub profile_iterations: bool,
@@ -854,11 +858,10 @@ impl Default for OptimizerConfig {
             hmp_show_operators: None,
             hmp_show_nodes: None,
             hmp_normalize_with_cardinality: false,
-            hmp_strategy: HMPStrategy::default(),
             hmp_cost_method: HmpCostMethod::default(),
             hmp_dup_cost_model: SubtreeCostMethod::default(),
             hmp_use_pushdown: true,
-            hmp_beam_width: 2,
+            hmp_search_budget: 32,
             profile_iterations: false,
             run_pushdown_pass: false,
             // Off by default like Pushdown: it spends DAG runs, and the
@@ -1038,20 +1041,15 @@ impl OptimizerConfig {
         self
     }
 
-    pub fn with_hmp_strategy(mut self, strategy: HMPStrategy) -> Self {
-        self.hmp_strategy = strategy;
-        self
-    }
-
     pub fn with_hmp_use_pushdown(mut self, use_pushdown: bool) -> Self {
         self.hmp_use_pushdown = use_pushdown;
         self
     }
 
-    /// Number of hypotheses the `Greedy` strategy's beam search keeps alive
-    /// at each step. Unused by the `Breadth` strategy.
-    pub fn with_hmp_beam_width(mut self, beam_width: usize) -> Self {
-        self.hmp_beam_width = beam_width.max(1);
+    /// Candidate combinations the search may price before it starts spending
+    /// DAG runs on them.
+    pub fn with_hmp_search_budget(mut self, budget: usize) -> Self {
+        self.hmp_search_budget = budget.max(1);
         self
     }
 
@@ -1345,9 +1343,9 @@ mod tests {
     #[test]
     fn test_optimizer_config_round_trips_through_json() {
         let config = OptimizerConfig {
-            hmp_strategy: HMPStrategy::Greedy,
             omp_centrality: OMPCentrality::Paths,
             hmp_max_runs: 7,
+            hmp_search_budget: 12,
             hmp_top_cpu_time: 0.25,
             run_pushdown_pass: false,
             ..OptimizerConfig::default()
@@ -1356,7 +1354,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: OptimizerConfig = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(back.hmp_strategy, HMPStrategy::Greedy);
+        assert_eq!(back.hmp_search_budget, 12);
         assert!(matches!(back.omp_centrality, OMPCentrality::Paths));
         assert_eq!(back.hmp_max_runs, 7);
         assert_eq!(back.hmp_top_cpu_time, 0.25);
@@ -1373,7 +1371,7 @@ mod tests {
         assert_eq!(partial.hmp_max_runs, 4);
         assert_eq!(partial.hmp_top_cpu_time, defaults.hmp_top_cpu_time);
         assert_eq!(partial.run_hmp_pass, defaults.run_hmp_pass);
-        assert_eq!(partial.hmp_beam_width, defaults.hmp_beam_width);
+        assert_eq!(partial.hmp_search_budget, defaults.hmp_search_budget);
     }
 
     #[test]
@@ -1389,7 +1387,6 @@ mod tests {
         // The CLI's --hmp-strategy/--omp-node-centrality values and the JSON
         // encoding must agree, or the same setting means two different things
         // depending on how it was supplied.
-        assert_eq!(serde_json::to_string(&HMPStrategy::Breadth).unwrap(), "\"breadth\"");
         assert_eq!(serde_json::to_string(&OMPCentrality::OutDegree).unwrap(), "\"outdegree\"");
         // `node_time` is two words in the CLI and one key in JSON; the parser
         // has to accept the CLI's spelling too.
