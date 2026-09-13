@@ -14,6 +14,7 @@ use crate::{
     opt::{
         Optimization, OptimizerConfig,
         hmp::HMPPass,
+        nodefusion::NodeFusionPass,
         omp::OMPPass,
         parallelism::ParallelismTuning,
         pushdown::PushdownPass,
@@ -63,6 +64,16 @@ pub const OPTIMIZATIONS: &[OptimizationInfo] = &[
               materialized node's own query. A pure rewrite: it measures \
               nothing and runs the DAG zero times.",
     },
+    OptimizationInfo {
+        name: "nodefusion",
+        optimization_type: OptimizationType::Once,
+        default_step_phase: StepPhase::Before,
+        doc: "Fuses the DAG into one node. Every View a Table reads becomes a \
+              CTE, every Table becomes a branch of one UNION ALL discriminated \
+              by a `kind` column, and each Table node is rewritten to project \
+              its own rows back out. A pure rewrite: it measures nothing and \
+              runs the DAG zero times.",
+    },
 ];
 
 pub fn info(name: &str) -> Option<&'static OptimizationInfo> {
@@ -90,6 +101,7 @@ where
         "omp" => Some(Box::new(OMPPass::from_config(conn, engine, config))),
         "parallelism" => Some(Box::new(ParallelismTuning::from_config(config))),
         "pushdown" => Some(Box::new(PushdownPass::new(conn, engine))),
+        "nodefusion" => Some(Box::new(NodeFusionPass::from_config(config))),
         _ => None,
     }
 }

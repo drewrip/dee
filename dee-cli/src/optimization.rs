@@ -40,7 +40,7 @@ pub enum OptimizationSubcommand {
 #[derive(Args)]
 pub struct RegisterCommand {
     pub dag: String,
-    /// Which optimization: parallelism, hmp, omp, pushdown.
+    /// Which optimization: parallelism, hmp, omp, pushdown, nodefusion.
     pub optimization: String,
     /// When it steps: before, after, or both. Defaults to what the
     /// optimization asks for.

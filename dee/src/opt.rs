@@ -1,5 +1,6 @@
 pub mod combo;
 pub mod makespan;
+pub mod nodefusion;
 pub mod common;
 pub mod dup;
 pub mod explain;
@@ -45,8 +46,9 @@ const RESUME_BUDGET_MULTIPLE: u32 = 3;
 
 pub use crate::opt::explain::render_explain_html;
 pub use crate::opt::report::{
-    CandidateScore, HmpDetail, IterationStat, OmpDetail, OptimizeReport, ParallelismDetail,
-    PassDetail, PassOutcome, PassReport, PushdownDetail, PushdownOutcome, RungResult,
+    CandidateScore, HmpDetail, IterationStat, NodeFusionDetail, OmpDetail, OptimizeReport,
+    ParallelismDetail, PassDetail, PassOutcome, PassReport, PushdownDetail, PushdownOutcome,
+    RungResult,
 };
 pub use crate::opt::step::{
     BudgetMetric, OptimizationType, RegisterContext, ResumeTiming, RunContext, StepContext,
@@ -340,7 +342,9 @@ where
                     baseline_runtime_ms.get_or_insert(d.baseline_runtime_ms.round() as i64);
                     final_runtime_ms = Some(d.best_runtime_ms.round() as i64);
                 }
-                PassDetail::Pushdown(_) | PassDetail::None => {}
+                PassDetail::Pushdown(_)
+                | PassDetail::NodeFusion(_)
+                | PassDetail::None => {}
             }
         }
 
@@ -682,6 +686,7 @@ fn pass_label(name: &str) -> &'static str {
         "omp" => "OMPPass",
         "pushdown" => "PushdownPass",
         "parallelism" => "ParallelismTuning",
+        "nodefusion" => "NodeFusionPass",
         _ => "UnknownPass",
     }
 }
@@ -759,6 +764,31 @@ pub struct OptimizerConfig {
     pub profile_iterations: bool,
     pub run_pushdown_pass: bool,
     pub run_parallelism_pass: bool,
+    /// Fuse every Table node into one query. See [`crate::opt::nodefusion`].
+    pub run_nodefusion_pass: bool,
+    /// NodeFusion: emit inlined *View* CTEs `AS MATERIALIZED`.
+    ///
+    /// Does not apply to an inlined Table's CTE, which is materialized on its
+    /// own account -- a Table was authored as a materialization barrier, and a
+    /// plain CTE that several downstream CTEs read may be unfolded into each of
+    /// them, which is the duplication the pass exists to remove.
+    pub nodefusion_materialize_ctes: bool,
+    /// NodeFusion: materialize an inlined View CTE that more than one Table
+    /// node reads.
+    ///
+    /// Naive on purpose. It counts how many Tables reach the View through the
+    /// fused graph and materializes it above one, without pricing what the
+    /// View costs or what sharing it would save -- the floor a cost-based rule
+    /// has to beat. Narrower than `nodefusion_materialize_ctes`, which turns
+    /// on every View regardless, and subsumed by it when both are set.
+    pub nodefusion_naive_materialize_ctes: bool,
+    /// NodeFusion: the exact set of node IDs whose CTEs are materialized.
+    ///
+    /// When set it overrides both `nodefusion_materialize_ctes` and the Table
+    /// default, so it is also the way to make an intermediate Table's CTE
+    /// plain. A name matches either as the full node ID or as its bare table
+    /// name. `None` leaves the defaults in charge.
+    pub nodefusion_materialize_ctes_override: Option<Vec<String>>,
     /// ParallelismTuning: the node-concurrency caps to measure. Rungs that
     /// cannot bind on the DAG in front of them -- at or above its node count,
     /// or equal to its current setting -- are dropped rather than tried.
@@ -889,6 +919,10 @@ impl Default for OptimizerConfig {
             hmp_search_budget: 32,
             profile_iterations: false,
             run_pushdown_pass: false,
+            run_nodefusion_pass: false,
+            nodefusion_materialize_ctes: false,
+            nodefusion_naive_materialize_ctes: false,
+            nodefusion_materialize_ctes_override: None,
             // Off by default like Pushdown: it spends DAG runs, and the
             // ladder is only worth its cost where node-level concurrency is
             // actually contended.
@@ -920,6 +954,7 @@ impl OptimizerConfig {
         self.run_hmp_pass = false;
         self.run_pushdown_pass = false;
         self.run_parallelism_pass = false;
+        self.run_nodefusion_pass = false;
         self
     }
 
@@ -928,6 +963,7 @@ impl OptimizerConfig {
         self.run_hmp_pass = true;
         self.run_pushdown_pass = true;
         self.run_parallelism_pass = true;
+        self.run_nodefusion_pass = true;
         self
     }
 
@@ -971,6 +1007,15 @@ impl OptimizerConfig {
         if self.run_pushdown_pass {
             passes.push("pushdown");
         }
+        // Always last. Fusion replaces the node structure every other pass
+        // reasons about -- a View it inlined is no longer a materialization
+        // candidate, a Table it rewrote is a projection out of one relation,
+        // and the node-level concurrency the ladder tuned is gone -- so
+        // anything scheduled after it would be optimizing a DAG that no longer
+        // resembles the one it was configured for.
+        if self.run_nodefusion_pass {
+            passes.push("nodefusion");
+        }
         passes
     }
 
@@ -980,6 +1025,7 @@ impl OptimizerConfig {
             "hmp" => self.run_hmp_pass = enabled,
             "pushdown" => self.run_pushdown_pass = enabled,
             "parallelism" => self.run_parallelism_pass = enabled,
+            "nodefusion" => self.run_nodefusion_pass = enabled,
             _ => warn!("Unknown optimizer pass: {}", name),
         }
     }
@@ -1093,6 +1139,26 @@ impl OptimizerConfig {
 
     pub fn with_pushdown_pass(mut self) -> Self {
         self.run_pushdown_pass = true;
+        self
+    }
+
+    pub fn with_nodefusion_pass(mut self) -> Self {
+        self.run_nodefusion_pass = true;
+        self
+    }
+
+    pub fn with_nodefusion_materialize_ctes(mut self, materialize: bool) -> Self {
+        self.nodefusion_materialize_ctes = materialize;
+        self
+    }
+
+    pub fn with_nodefusion_naive_materialize_ctes(mut self, materialize: bool) -> Self {
+        self.nodefusion_naive_materialize_ctes = materialize;
+        self
+    }
+
+    pub fn with_nodefusion_materialize_ctes_override(mut self, nodes: Option<Vec<String>>) -> Self {
+        self.nodefusion_materialize_ctes_override = nodes;
         self
     }
 

@@ -215,7 +215,7 @@ pub(crate) fn inline_view_ast(
 /// the two engines dee reads plans from both have it (Postgres since 12,
 /// DuckDB always). Elsewhere the CTE is emitted plain, and whether the engine
 /// materializes it is the engine's decision.
-fn supports_materialized_hint(dialect: DialectType) -> bool {
+pub(crate) fn supports_materialized_hint(dialect: DialectType) -> bool {
     matches!(dialect, DialectType::DuckDB | DialectType::PostgreSQL)
 }
 
@@ -549,7 +549,7 @@ pub fn landing_pad_name(node_id: &str) -> String {
 ///   `"foo"`                    → `` (empty — no prefix)
 ///
 /// The landing pad inherits this prefix so it lands in the same catalog/schema.
-fn schema_prefix(node_id: &str) -> String {
+pub(crate) fn schema_prefix(node_id: &str) -> String {
     // Qualified identifiers join segments with `"."`.  Find the last occurrence
     // of that separator and return everything up to and including it.
     if let Some(pos) = node_id.rfind("\".\"") {
@@ -558,6 +558,26 @@ fn schema_prefix(node_id: &str) -> String {
         format!("{}\".", &node_id[..pos])
     } else {
         String::new()
+    }
+}
+
+/// The node ID of the fused node NodeFusion builds beside `sibling_id`: the
+/// same schema prefix, with `base` as the bare name.
+///
+/// Examples:
+///   (`"warehouse"."main"."foo"`, `dee_fused`) -> `"warehouse"."main"."dee_fused"`
+///   (`foo`, `dee_fused`)                      -> `dee_fused`
+///
+/// The prefix is inherited for the same reason [`landing_pad_name`] inherits
+/// it: the executor places a relation wherever its ID says, and a fused node
+/// that lands in a different catalog from the nodes reading it does not bind.
+pub(crate) fn fused_node_name(sibling_id: &str, base: &str) -> String {
+    let prefix = schema_prefix(sibling_id);
+    let rest = &sibling_id[prefix.len()..];
+    if rest.starts_with('"') {
+        format!("{prefix}\"{base}\"")
+    } else {
+        format!("{prefix}{base}")
     }
 }
 

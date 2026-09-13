@@ -17,6 +17,7 @@ use crate::{
     connectors::Connector,
     dag::{Dag, MaterializeMode, TransformNode},
     graph::Graph,
+    opt::common::{dialect_for_db, rewrite_node_refs},
     profile::SystemUsageSample,
 };
 
@@ -598,6 +599,7 @@ where
         };
 
         let topo = dag.nodes.topological_sort();
+        let dialect = dialect_for_db(&dag.db);
 
         // Build a mapping from original node ID → prefixed node ID so we can
         // rename every reference inside query_text and depends_on.  The prefix
@@ -621,15 +623,41 @@ where
             .map(|n| {
                 let new_id = rename_map[&n.id].clone();
 
-                // Rewrite query_text: replace every original node name with its
-                // prefixed counterpart.  Longer names are replaced first to
-                // avoid partial matches (e.g. "foo" matching inside "foo_bar").
-                let mut new_query = n.query_text.clone();
-                let mut sorted_originals: Vec<&String> = rename_map.keys().collect();
-                sorted_originals.sort_by_key(|k| std::cmp::Reverse(k.len()));
-                for orig in sorted_originals {
-                    new_query = new_query.replace(orig.as_str(), &rename_map[orig]);
-                }
+                // Rewrite query_text so every reference to another node names
+                // its prefixed counterpart.
+                //
+                // At the AST level, because the textual substitution this
+                // replaced matched anywhere the name appeared: inside a longer
+                // identifier (a node `a` rewrote `amount` into
+                // `dee_tmp_amount`), inside a string literal, inside a column
+                // name. Sorting the names longest-first only narrowed that; it
+                // could not fix it, since the collision is with identifiers the
+                // map says nothing about.
+                //
+                // A query the parser cannot read falls back to the old
+                // behaviour rather than failing: resolving schemas is a
+                // prerequisite for several passes, and a node whose SQL uses
+                // syntax polyglot-sql does not cover should not take the whole
+                // DAG's schemas down with it. The fallback is only wrong in the
+                // way it was always wrong, and it now says so.
+                let new_query = match rewrite_node_refs(&n.query_text, &rename_map, dialect) {
+                    Some(rewritten) => rewritten,
+                    None => {
+                        warn!(
+                            "resolve_schemas: could not rewrite '{}' at the AST level; falling \
+                             back to textual substitution, which can match inside a longer \
+                             identifier or a string literal",
+                            n.id
+                        );
+                        let mut new_query = n.query_text.clone();
+                        let mut sorted_originals: Vec<&String> = rename_map.keys().collect();
+                        sorted_originals.sort_by_key(|k| std::cmp::Reverse(k.len()));
+                        for orig in sorted_originals {
+                            new_query = new_query.replace(orig.as_str(), &rename_map[orig]);
+                        }
+                        new_query
+                    }
+                };
 
                 let new_deps = n
                     .depends_on
@@ -826,6 +854,73 @@ mod tests {
     use super::split_qualified_identifier;
     use crate::connectors::duckdb::{DuckDBConfig, DuckDBConnection};
     use crate::dag::TransformNode;
+
+    #[tokio::test]
+    async fn test_resolve_schemas_does_not_rename_inside_longer_identifiers() {
+        // A node named `a` and a column named `amount`. The textual
+        // substitution this replaced rewrote the column into `dee_tmp_amount`
+        // and the whole call failed with "Referenced column not found"; a node
+        // named `pad` beside it turned `pad` into `pdee_tmp_ad`. Both are
+        // matches the rename map never asked for.
+        let conn = DuckDBConnection::new(DuckDBConfig::new_from_path(":memory:".into()))
+            .await
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE orders AS SELECT range AS id, range * 1.5 AS amount FROM range(5)"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let node = |id: &str, query: &str, deps: &[&str]| TransformNode {
+            id: id.to_string(),
+            query_text: query.to_string(),
+            materialize: MaterializeMode::View,
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            schema: None,
+        };
+        let mut map = HashMap::new();
+        for n in [
+            node("pad", "SELECT id, amount FROM orders", &[]),
+            node("a", "SELECT sum(amount) AS total FROM pad", &["pad"]),
+            // And a string literal spelling a node's name, which the textual
+            // path would have rewritten into a comparison against a temp view.
+            node(
+                "b",
+                "SELECT id, 'pad' AS origin FROM pad WHERE amount > 0",
+                &["pad"],
+            ),
+        ] {
+            map.insert(n.id.clone(), n);
+        }
+        let mut dag = Dag {
+            db: "DuckDB".to_string(),
+            nodes: Graph::new(map),
+            sources: vec![],
+            max_parallelism: None,
+        };
+
+        let engine = SimpleEngine::new(conn).unwrap();
+        engine
+            .resolve_schemas(&mut dag)
+            .await
+            .expect("every node's schema should resolve");
+
+        for id in ["pad", "a", "b"] {
+            let node = dag.nodes.get(id.to_string()).unwrap();
+            assert!(node.schema.is_some(), "'{id}' has no resolved schema");
+        }
+        let a = dag.nodes.get("a".to_string()).unwrap();
+        assert_eq!(
+            a.schema.as_ref().unwrap().flattened_fields()[0].name(),
+            "total"
+        );
+        // The DAG itself is never rewritten -- only the throwaway copy is.
+        assert_eq!(
+            dag.nodes.get("b".to_string()).unwrap().query_text,
+            "SELECT id, 'pad' AS origin FROM pad WHERE amount > 0"
+        );
+    }
 
     /// `n` independent nodes, each a query slow enough that two running
     /// concurrently overlap observably.

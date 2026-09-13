@@ -92,7 +92,7 @@ pub enum CliHmpObjective {
 #[derive(Args, Clone, Debug)]
 pub struct OptimizerArgs {
     /// Passes to run, starting from everything off. Comma separated:
-    /// parallelism, hmp, omp, pushdown.
+    /// parallelism, hmp, omp, pushdown, nodefusion.
     #[arg(long, value_delimiter = ',', conflicts_with = "disable")]
     pub enable: Option<Vec<String>>,
     /// Passes to skip, starting from everything on.
@@ -187,6 +187,20 @@ pub struct OptimizerArgs {
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
     pub parallelism_stop_on_narrowest_failure: Option<bool>,
 
+    /// NodeFusion: emit inlined View CTEs as materialized CTEs. Never applies
+    /// to an inlined Table's CTE, which is materialized on its own account.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    pub nodefusion_materialize_ctes: Option<bool>,
+    /// NodeFusion: materialize an inlined View CTE that more than one Table
+    /// node reads. Naive: it counts readers rather than pricing them.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    pub nodefusion_naive_materialize_ctes: Option<bool>,
+    /// NodeFusion: the exact set of node IDs whose CTEs are materialized,
+    /// overriding every default -- so it is also how an inlined Table's CTE is
+    /// made plain. Comma separated; a bare table name matches a qualified ID.
+    #[arg(long, value_delimiter = ',')]
+    pub nodefusion_materialize_ctes_override: Option<Vec<String>>,
+
     /// Capture a resource timeseries for every candidate run.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
     pub profile_iterations: Option<bool>,
@@ -256,6 +270,21 @@ impl OptimizerArgs {
         set("omp_early_termination", self.omp_exhaust.map(|v| json!(!v)));
         set("omp_use_pushdown", self.omp_no_pushdown.map(|v| json!(!v)));
         set("hmp_use_pushdown", self.hmp_no_pushdown.map(|v| json!(!v)));
+
+        set(
+            "nodefusion_materialize_ctes",
+            self.nodefusion_materialize_ctes.map(|v| json!(v)),
+        );
+        set(
+            "nodefusion_naive_materialize_ctes",
+            self.nodefusion_naive_materialize_ctes.map(|v| json!(v)),
+        );
+        set(
+            "nodefusion_materialize_ctes_override",
+            self.nodefusion_materialize_ctes_override
+                .as_ref()
+                .map(|v| json!(v)),
+        );
 
         set("hmp_downstream_cost", self.hmp_downstream_cost.map(|v| json!(v)));
         set("hmp_max_runs", self.hmp_max_runs.map(|v| json!(v)));
@@ -351,19 +380,20 @@ impl OptimizerArgs {
     }
 }
 
-const PASSES: [(&str, &str); 4] = [
+const PASSES: [(&str, &str); 5] = [
     ("run_parallelism_pass", "parallelism"),
     ("run_hmp_pass", "hmp"),
     ("run_omp_pass", "omp"),
     ("run_pushdown_pass", "pushdown"),
+    ("run_nodefusion_pass", "nodefusion"),
 ];
 
 /// Print a resolved config, showing only what bears on the passes that will run.
 ///
 /// A full `OptimizerConfig` is twenty-odd fields, most of which belong to a pass
 /// that is switched off. Printing all of them before every optimization buries
-/// the two or three settings that actually determine the result, so the `omp_`
-/// and `hmp_` prefixes -- which the field names already follow -- are used to
+/// the two or three settings that actually determine the result, so the
+/// per-pass prefixes -- which the field names already follow -- are used to
 /// drop the irrelevant ones.
 pub fn print_config(config: &Value) {
     let enabled: Vec<&str> = PASSES
@@ -387,7 +417,12 @@ pub fn print_config(config: &Value) {
     keys.sort();
     for key in keys {
         let relevant = match key.split_once('_') {
-            Some((prefix, _)) if prefix == "omp" || prefix == "hmp" || prefix == "parallelism" => {
+            Some((prefix, _))
+                if prefix == "omp"
+                    || prefix == "hmp"
+                    || prefix == "parallelism"
+                    || prefix == "nodefusion" =>
+            {
                 enabled.contains(&prefix)
             }
             // `run_*_pass` is already reported as the pass list, and `explain`

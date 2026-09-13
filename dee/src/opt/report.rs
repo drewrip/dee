@@ -293,6 +293,20 @@ pub struct PushdownOutcome {
     pub outcome: String,
 }
 
+/// NodeFusion-specific fields of a [`PassReport`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NodeFusionDetail {
+    /// The fused node's ID, or `None` when the DAG was not fused.
+    pub fused_node: Option<String>,
+    pub tables_fused: usize,
+    pub views_inlined: usize,
+    pub materialized_ctes: usize,
+    /// Columns in the fused relation, not counting `kind`.
+    pub fused_columns: usize,
+    /// What happened, in a sentence -- including why a DAG was left alone.
+    pub outcome: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PassDetail {
@@ -300,6 +314,7 @@ pub enum PassDetail {
     Omp(OmpDetail),
     Pushdown(PushdownDetail),
     Parallelism(ParallelismDetail),
+    NodeFusion(NodeFusionDetail),
     /// A step that advanced an optimization's state without reaching a
     /// conclusion worth describing -- a continuous pass recording a
     /// measurement, say. Pass-specific detail is reported when the search

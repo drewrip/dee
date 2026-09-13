@@ -196,6 +196,43 @@ Run it **before** the materialization passes, which is where
 against an untuned concurrency setting is crediting HMP with a win that belongs
 to the ladder.
 
+**NodeFusion** collapses the whole DAG into one query. Every View a Table reads
+becomes a CTE, every Table becomes a branch of one `UNION ALL` discriminated by
+a `kind` column, and each Table node is rewritten to project its own rows back
+out of the fused relation. Work two Tables share is then one CTE the engine can
+plan once, rather than one subtree it re-plans per Table — the same duplication
+HMP and OMP pay measured runs to find, attacked structurally instead. Like
+Pushdown it measures nothing and spends no runs.
+
+```bash
+dee optimize pipeline --enable nodefusion
+dee optimize pipeline --enable nodefusion --nodefusion-materialize-ctes
+dee optimize pipeline --enable nodefusion \
+    --nodefusion-materialize-ctes-override stg_orders,stg_accounts
+```
+
+A Table that feeds another Table is fused too: it gets a CTE *and* a `kind` of
+its own, so it is computed once inside the fused node and still delivered as its
+own relation. That is what keeps the result acyclic — everything upstream of any
+Table ends up inside the fused node, which therefore reads nothing but the
+warehouse's own source tables. Views stay in the graph and are still created, so
+a sink view goes on binding to the name it was written against.
+
+An *intermediate* Table's CTE — one that feeds another fused node — is
+materialized by default, because it is read both by its own `UNION ALL` branch
+and by whatever is downstream of it, and a plain CTE read twice may be unfolded
+twice. Everything else is plain: a Table that feeds nothing is read once.
+`--nodefusion-materialize-ctes` turns the rest on; the override names the exact
+set instead, overriding both defaults, and is therefore also how an intermediate
+Table's CTE is made plain.
+
+It runs **last**, after every other pass, and `enabled_passes` puts it there
+whatever order you name. Fusion replaces the node structure the other passes
+reason about: a View it inlined is no longer a materialization candidate, and
+the node-level concurrency the ladder tuned is gone. A DAG with a TempTable
+upstream of a Table is left alone and says so — that TempTable is a barrier a
+materialization search placed on purpose.
+
 **Continuous optimization** is the other way to reach the same thing. `dee
 optimize` above is a job: it decides now, and it buys the DAG runs its search
 needs to decide. But dee is already running this DAG — on a schedule, from a

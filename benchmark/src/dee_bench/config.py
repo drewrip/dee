@@ -35,7 +35,7 @@ class DeeOptSpec:
     # optimizer settings go over HTTP as an OptimizerConfig object -- but kept
     # because it is what a person types, and what `doctor` reports against.
     flag: str
-    kind: str  # "bool" | "int" | "float" | "str" | "int_list"
+    kind: str  # "bool" | "int" | "float" | "str" | "int_list" | "str_list"
     # Which passes actually read this option. An option whose passes are all
     # disabled for a variant is pruned from that cell, so it cannot silently
     # multiply the matrix with duplicate experiments.
@@ -162,6 +162,19 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
                "bool", frozenset({"parallelism"}),
                doc="Abandon the ladder when its narrowest rung fails, since no wider cap relieves "
                    "more contention than that one does."),
+    DeeOptSpec("nodefusion_materialize_ctes", "--nodefusion-materialize-ctes", "bool",
+               frozenset({"nodefusion"}),
+               doc="Emit the View CTEs NodeFusion inlines as materialized CTEs. An inlined "
+                   "Table's CTE is materialized on its own account and is not affected."),
+    DeeOptSpec("nodefusion_naive_materialize_ctes", "--nodefusion-naive-materialize-ctes", "bool",
+               frozenset({"nodefusion"}),
+               doc="Materialize an inlined View CTE that more than one Table node reads. Naive: "
+                   "it counts readers rather than pricing them, and is subsumed by "
+                   "nodefusion_materialize_ctes."),
+    DeeOptSpec("nodefusion_materialize_ctes_override", "--nodefusion-materialize-ctes-override",
+               "str_list", frozenset({"nodefusion"}),
+               doc="The exact set of node IDs whose CTEs NodeFusion materializes, overriding "
+                   "every default -- so it is also how an inlined Table's CTE is made plain."),
     DeeOptSpec("profile_iterations", "--profile-iterations", "bool", frozenset({"hmp", "omp", "parallelism"}),
                doc="Capture a resource timeseries for every candidate DAG the optimizer runs."),
 )
@@ -172,7 +185,7 @@ DEE_OPT_BY_NAME: dict[str, DeeOptSpec] = {s.name: s for s in DEE_OPT_SPECS}
 REPEAT_MODES = ("group", "queue")
 
 
-VALID_PASSES = ("parallelism", "hmp", "omp", "pushdown")
+VALID_PASSES = ("parallelism", "hmp", "omp", "pushdown", "nodefusion")
 
 # How a cell's optimizations are driven.
 #
@@ -468,6 +481,16 @@ def _coerce(spec: DeeOptSpec, value: Any) -> Any:
                 )
             out.append(item)
         return out
+    if spec.kind == "str_list":
+        # Wrapped for the same reason `int_list` is: the matrix expands a bare
+        # list into one cell per element, so a list-valued option arrives
+        # already wrapped.
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ConfigError(
+                f"dee_opt.{spec.name} must be a non-empty list of node IDs, got {value!r}; "
+                f"write it wrapped -- `{spec.name}: [[\"a\", \"b\"]]` is the single set a,b"
+            )
+        return [str(item) for item in value]
     value = str(value)
     if spec.choices and value not in spec.choices:
         raise ConfigError(

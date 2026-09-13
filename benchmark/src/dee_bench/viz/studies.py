@@ -83,6 +83,68 @@ def label_backends(con) -> None:
         )
 
 
+def label_variants(con) -> None:
+    """Fold a swept optimizer parameter into the `variant` column of every view.
+
+    The counterpart of :func:`label_backends`, for the other axis a cell can be
+    swept along. An option that belongs to a pass is written under `dee_opt`
+    and swept there rather than copied into a variant of its own, so two cells
+    agree on project, backend, scale factor *and* variant and differ only in
+    that parameter -- and one would silently overwrite the other in every chart
+    and table. Rewriting `variant` as
+    ``nodefusion[nodefusion_naive_materialize_ctes=true]`` separates them
+    everywhere at once, and reads as the one thing that cell changed.
+
+    Only settings that vary *within a variant* appear, so a run that sweeps
+    nothing has one configuration per variant, no label to add, and its views
+    are left exactly as they were.
+    """
+    tables = _tables(con)
+    if "cells" not in tables:
+        return
+
+    by_variant: dict[str, set[str]] = {}
+    for variant, dee_opt in _rows(con, "SELECT DISTINCT variant, dee_opt FROM cells"):
+        by_variant.setdefault(variant, set()).add(dee_opt or "{}")
+
+    labels: dict[tuple[str, str], str] = {}
+    for variant, configs in by_variant.items():
+        ordered_configs = sorted(configs)
+        for config, label in zip(ordered_configs, config_labels(
+            [json.loads(c) for c in ordered_configs]
+        )):
+            labels[(variant, config)] = f"{variant}[{label}]" if label else variant
+    if all(label == variant for (variant, _), label in labels.items()):
+        return
+
+    # Keyed by cell, because `payback` carries the cell it priced but not the
+    # `dee_opt` that distinguishes it.
+    by_cell = {
+        cell_id: labels[(variant, dee_opt or "{}")]
+        for cell_id, variant, dee_opt in _rows(
+            con, "SELECT cell_id, variant, dee_opt FROM cells"
+        )
+    }
+    con.execute("CREATE OR REPLACE TEMP TABLE variant_labels(cell_id VARCHAR, label VARCHAR)")
+    con.executemany(
+        "INSERT INTO variant_labels VALUES (?, ?)", [[c, l] for c, l in by_cell.items()]
+    )
+    for table in ("cells", "payback"):
+        if table not in tables:
+            continue
+        columns = {c[0] for c in _rows(con, f"DESCRIBE {table}")}
+        if not {"cell_id", "variant"} <= columns:
+            continue
+        con.execute(f"CREATE OR REPLACE TEMP TABLE _{table}_variant_raw AS SELECT * FROM {table}")
+        con.execute(f"DROP VIEW IF EXISTS {table}")
+        con.execute(
+            f"CREATE VIEW {table} AS "
+            f"SELECT r.* REPLACE (COALESCE(l.label, r.variant) AS variant) "
+            f"FROM _{table}_variant_raw r "
+            f"LEFT JOIN variant_labels l USING (cell_id)"
+        )
+
+
 def _drop_empty_labels(labels: list[str], by_variant: dict[str, list]) -> tuple[list[str], dict[str, list]]:
     """Drop label positions where every series is None.
 
@@ -489,12 +551,13 @@ BUILDERS = [
 
 
 def build_all(con) -> list[Study]:
-    # Before any study runs, so every one of them sees backends that already
-    # name the tuning they were measured under.
-    try:
-        label_backends(con)
-    except Exception:  # noqa: BLE001 - labelling must never lose the studies
-        pass
+    # Before any study runs, so every one of them sees backends and variants
+    # that already name what they were measured under.
+    for label in (label_backends, label_variants):
+        try:
+            label(con)
+        except Exception:  # noqa: BLE001 - labelling must never lose the studies
+            pass
     out = []
     for fn in BUILDERS:
         try:

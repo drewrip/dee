@@ -383,13 +383,10 @@ def _check_server(args: argparse.Namespace) -> bool:
         print(f"  {name}: in dee-bench but not in the server -- remove it from DEE_OPT_SPECS")
     for name in extra:
         # Not every server option needs to be sweepable; the pass toggles are
-        # set from a variant's pass list rather than from dee_opt.
-        if name in (
-            "run_hmp_pass",
-            "run_omp_pass",
-            "run_pushdown_pass",
-            "run_parallelism_pass",
-        ):
+        # set from a variant's pass list rather than from dee_opt. Derived from
+        # VALID_PASSES rather than listed, so adding a pass does not leave a
+        # spurious "consider adding it" behind.
+        if name in {f"run_{pass_name}_pass" for pass_name in VALID_PASSES}:
             continue
         print(f"  {name}: on the server but not in dee-bench -- consider adding it")
 

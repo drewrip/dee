@@ -26,7 +26,7 @@ use crate::store::repo::registrations;
 
 #[derive(Deserialize, Default)]
 pub struct RegisterBody {
-    /// Which optimization: `parallelism`, `hmp`, `omp`, `pushdown`.
+    /// Which optimization: `parallelism`, `hmp`, `omp`, `pushdown`, `nodefusion`.
     pub name: String,
     /// `before`, `after` or `both`. Defaults to the optimization author's
     /// choice, which is what the caller wants unless they have a reason.
