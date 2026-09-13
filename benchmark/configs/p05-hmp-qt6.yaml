@@ -1,0 +1,54 @@
+# HMP on p05_hr, optimizing for total query time, with early cancellation on.
+#
+# Six runs: one baseline plus five trials. `hmp_objective: query_time` means
+# two things at once, and the point of this cell is to exercise both:
+#
+#   * the search ranks candidates by duplicate computation removed, and
+#     promotes a trial that beats the incumbent's `node_time_ms` -- total work,
+#     not wall clock;
+#   * `trial_resume: true` cancels a candidate the moment it overruns the
+#     incumbent, and under this objective the budget it overruns is measured in
+#     *node time* rather than wall clock, so a trial is cut off for doing too
+#     much work rather than for taking too long.
+#
+# A cancelled trial's `runtime_ms` is therefore the censoring level in the
+# objective's own units. `trial_ms` holds the real wall clock for it.
+#
+#   dee-bench run -c configs/p05-hmp-qt6.yaml
+name: p05-hmp-qt6
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/p05-hmp-qt6
+verbosity: detailed
+
+matrix:
+  project: [p05_hr]
+  backend: [duckdb]
+  sf: [1]
+  variant: [hmp]
+
+variants:
+  hmp:
+    passes: [hmp]
+    hmp_cost_method: dup_attribution
+
+dee_opt:
+  hmp_max_runs: 6
+  hmp_dup_cost_model: learned_cost
+  hmp_top_cpu_time: 1.0
+  hmp_use_pushdown: false
+  hmp_objective: query_time
+
+  # Early cancellation on -- the whole point of this cell.
+  trial_resume: true
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 1
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

@@ -140,6 +140,15 @@ pub async fn optimizer_options() -> Json<Vec<OptimizerOption>> {
                   `learned_cost` gives seconds, from constants fitted to executed plans; \
                   `cardinality` sums the region's estimated output rows; `operators` counts \
                   its operators. Ignored by every other cost method." },
+        OptimizerOption { name: "hmp_objective", flag: "--hmp-objective", kind: "str",
+            passes: &["hmp"],
+            choices: Some(&["makespan", "query_time"]),
+            default: json!(d.hmp_objective),
+            doc: "Which measure the HMP search minimizes. `makespan` orders candidates by \
+                  predicted wall clock and promotes a trial that beats the incumbent's \
+                  runtime; `query_time` orders them by duplicate computation removed and \
+                  promotes a trial that beats the incumbent's node time. Materializing a View \
+                  cuts the sum and usually lengthens the critical path, so the two disagree." },
         OptimizerOption { name: "hmp_search_budget", flag: "--hmp-search-budget", kind: "int",
             passes: &["hmp"], choices: None, default: json!(d.hmp_search_budget),
             doc: "Candidate combinations HMP prices before it spends any DAG run on them. \

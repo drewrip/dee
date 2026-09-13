@@ -138,6 +138,36 @@ impl DuckDBConfig {
     }
 }
 
+/// The settings that go into [`Connector::cost_backend_key`].
+///
+/// Everything here changes how bytes reach the disk: the block size the
+/// storage layer lays rows out in, when a checkpoint flushes the WAL, how much
+/// the write buffer will hold, whether the engine may pick the order-preserving
+/// sink (which writes row groups as they arrive rather than buffering them),
+/// and how hard it compresses on the way.
+///
+/// `threads` is deliberately absent. It looks like it belongs, but DuckDB sums
+/// a write operator's `operator_timing` across threads, so the measured cost of
+/// a write does not move with it --- 1, 4 and 8 threads were measured within 2%
+/// of each other on the same write. Keying on it would split one engine's
+/// samples across every thread count a benchmark sweep happens to use.
+///
+/// Note also that `checkpoint_threshold` and `write_buffer_row_group_memory_limit`
+/// were measured as inert for the write rate on DuckDB 1.5.5 (1 MB / 16 MB /
+/// 4 GB and 32 MB / 1 GB respectively all gave the same cost). They are kept
+/// because they describe the storage path and a future version may make them
+/// matter, and because splitting two models that turn out to agree costs a
+/// re-fit while pooling two that do not costs a wrong price.
+const COST_RELEVANT_SETTINGS: [&str; 7] = [
+    "default_block_size",
+    "checkpoint_threshold",
+    "wal_autocheckpoint",
+    "write_buffer_row_group_memory_limit",
+    "memory_limit",
+    "preserve_insertion_order",
+    "force_compression",
+];
+
 /// How long to wait for interrupted statements to actually stop before giving
 /// up and saying so. Generous: the alternative to waiting is letting a caller
 /// drop a relation another statement is still writing.
@@ -312,6 +342,24 @@ impl DuckDBConnection {
         .map_err(|e| ConnectorError::Execute(format!("blocking task failed: {e}")))?
     }
 }
+
+/// DuckDB's two write sinks, and the walk that says which one a plan gets.
+///
+/// DuckDB picks `BATCH_CREATE_TABLE_AS` when the pipeline feeding the write
+/// still carries batch order, and writes row groups straight out as they
+/// arrive; otherwise it picks `CREATE_TABLE_AS` and buffers first. The two
+/// differ by about 2x per byte on real DAGs, and only the second one has the
+/// dead zone where small writes never reach the disk at all --- so which sink a
+/// candidate would get has to be predicted before its build can be priced.
+pub const DUCKDB_BATCH_WRITE: &str = "BATCH_CREATE_TABLE_AS";
+pub const DUCKDB_BUFFERED_WRITE: &str = "CREATE_TABLE_AS";
+
+/// The relation name the write-path probe plans against.
+///
+/// Never created: `EXPLAIN` of a `CREATE OR REPLACE TABLE` plans the statement
+/// and stops. The name only has to be one no DAG would use, so that if a future
+/// DuckDB ever did materialize during `EXPLAIN` it would not land on anything.
+const WRITE_PATH_PROBE: &str = "dee_write_path_probe";
 
 #[async_trait]
 impl Connector for DuckDBConnection {
@@ -658,6 +706,92 @@ impl Connector for DuckDBConnection {
 
     /// DuckDB's `threads` setting: one pool shared by every query on the
     /// database, so it bounds the whole engine and not just one statement.
+    async fn write_path_for(&self, query_text: &str) -> Result<Option<String>, ConnectorError> {
+        // `CREATE OR REPLACE`, and a name of our own: a plain `CREATE TABLE`
+        // whose name is already taken plans as a bare `CREATE_TABLE` and
+        // answers nothing. `EXPLAIN` neither creates nor replaces --- verified
+        // against a populated table of that name, which survived intact.
+        let probe = format!("EXPLAIN (FORMAT JSON) CREATE OR REPLACE TABLE {WRITE_PATH_PROBE} AS ({query_text})");
+        let json = self
+            .blocking(move |conn| {
+                let mut stmt = conn.prepare(&probe).map_err(|e| {
+                    ConnectorError::Execute(format!("Failed to prepare write-path probe: {e}"))
+                })?;
+                let json: String = stmt
+                    .query_row([], |row| {
+                        if row.as_ref().column_count() >= 2 {
+                            row.get(1)
+                        } else {
+                            row.get(0)
+                        }
+                    })
+                    .map_err(|e| {
+                        ConnectorError::Execute(format!("write-path probe failed: {e}"))
+                    })?;
+                Ok(Some(json))
+            })
+            .await;
+        // A query the engine will not plan as a write is not an error worth
+        // failing a costing over --- the caller falls back to inferring it.
+        let Ok(Some(json)) = json else {
+            return Ok(None);
+        };
+        let root = crate::plan::parse_duckdb_plan(&json)
+            .and_then(|p| p.into_iter().next())
+            .filter(|n| crate::plan::is_write_operator(&n.operator))
+            .map(|n| n.operator.to_ascii_uppercase());
+        Ok(root)
+    }
+
+    async fn cost_backend_key(&self) -> Result<Option<String>, ConnectorError> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|_| ConnectorError::Execute("didn't get connection from pool".to_string()))?;
+        let version: String = conn
+            .query_row("SELECT version()", [], |row| row.get(0))
+            .map_err(|e| ConnectorError::Execute(format!("reading version - {e}")))?;
+        // The file, not the alias: two DAGs can attach the same database under
+        // different names, and the same name can be attached to two files.
+        // `:memory:` for an in-memory database, which is what DuckDB reports.
+        let path: String = conn
+            .query_row(
+                "SELECT path FROM duckdb_databases() WHERE database_name = current_database()",
+                [],
+                |row| row.get::<_, Option<String>>(0).map(|p| p.unwrap_or_default()),
+            )
+            .map_err(|e| ConnectorError::Execute(format!("reading database path - {e}")))?;
+        let path = if path.is_empty() {
+            ":memory:".to_string()
+        } else {
+            // Canonicalized so a relative path and an absolute one to the same
+            // file share a model rather than fitting two.
+            std::fs::canonicalize(&path)
+                .map(|p| p.display().to_string())
+                .unwrap_or(path)
+        };
+
+        let mut settings = Vec::new();
+        for name in COST_RELEVANT_SETTINGS {
+            let value: String = conn
+                .query_row(
+                    "SELECT value FROM duckdb_settings() WHERE name = ?",
+                    [name],
+                    |row| row.get::<_, Option<String>>(0).map(|v| v.unwrap_or_default()),
+                )
+                // A setting this build does not have is recorded as absent
+                // rather than skipped: skipping it would make the key depend on
+                // which reads happened to succeed.
+                .unwrap_or_else(|_| "-".to_string());
+            settings.push(format!("{name}={value}"));
+        }
+
+        Ok(Some(format!(
+            "duckdb {version} db={path} {}",
+            settings.join(" ")
+        )))
+    }
+
     async fn parallelism_budget(&self) -> Result<Option<usize>, ConnectorError> {
         let conn = self
             .pool
@@ -831,5 +965,90 @@ mod tests {
         let t = &result.get("t").unwrap()[0];
         assert_eq!(t.projections, vec!["a"]);
         assert!(t.filters.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod write_path_tests {
+    use super::{DUCKDB_BATCH_WRITE, DUCKDB_BUFFERED_WRITE, WRITE_PATH_PROBE};
+    use crate::connectors::Connector;
+    use crate::connectors::duckdb::{DuckDBConfig, DuckDBConnection};
+
+    #[tokio::test]
+    async fn asking_the_engine_settles_the_window_the_walk_cannot() {
+        let c = DuckDBConnection::new(DuckDBConfig::new_from_path(":memory:".to_string()))
+            .await
+            .unwrap();
+        c.execute(
+            "CREATE TABLE src AS SELECT i::BIGINT a, (i%97)::BIGINT b, (i%1000)::BIGINT g \
+             FROM range(200000) t(i)"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let unpartitioned = "SELECT a, row_number() OVER (ORDER BY b) r FROM src";
+        let partitioned = "SELECT a, row_number() OVER (PARTITION BY g) r FROM src";
+        assert_eq!(
+            c.write_path_for(unpartitioned).await.unwrap().as_deref(),
+            Some(DUCKDB_BATCH_WRITE)
+        );
+        assert_eq!(
+            c.write_path_for(partitioned).await.unwrap().as_deref(),
+            Some(DUCKDB_BUFFERED_WRITE)
+        );
+
+        // And the two ordinary shapes, so the probe is answering about the
+        // pipeline and not just echoing something constant.
+        assert_eq!(
+            c.write_path_for("SELECT * FROM src").await.unwrap().as_deref(),
+            Some(DUCKDB_BATCH_WRITE)
+        );
+        assert_eq!(
+            c.write_path_for("SELECT g, count(*) n FROM src GROUP BY g")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(DUCKDB_BUFFERED_WRITE)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_write_path_probe_creates_and_replaces_nothing() {
+        let c = DuckDBConnection::new(DuckDBConfig::new_from_path(":memory:".to_string()))
+            .await
+            .unwrap();
+        c.execute("CREATE TABLE src AS SELECT 1 AS a".to_string())
+            .await
+            .unwrap();
+        // A populated table sitting exactly where the probe plans to write.
+        c.execute(format!("CREATE TABLE {WRITE_PATH_PROBE} AS SELECT 42 AS keep_me"))
+            .await
+            .unwrap();
+
+        assert!(c.write_path_for("SELECT * FROM src").await.unwrap().is_some());
+
+        let schema = c
+            .get_schema(WRITE_PATH_PROBE.to_string())
+            .await
+            .expect("the probe table is still there")
+            .expect("and still readable");
+        assert_eq!(
+            schema.fields().len(),
+            1,
+            "the probe replaced a real table: {schema:?}"
+        );
+        assert_eq!(schema.field(0).name(), "keep_me", "column was overwritten");
+    }
+
+    #[tokio::test]
+    async fn an_unplannable_query_answers_none_rather_than_erroring() {
+        let c = DuckDBConnection::new(DuckDBConfig::new_from_path(":memory:".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            c.write_path_for("SELECT * FROM no_such_relation").await.unwrap(),
+            None
+        );
     }
 }

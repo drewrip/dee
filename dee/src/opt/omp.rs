@@ -459,6 +459,7 @@ where
                         reuse: self.reuse_policy,
                         label: Self::describe_plan(&state.top_candidates, &in_flight.modes),
                         budget_ms: self.budget(&state),
+                        budget_metric: crate::opt::step::BudgetMetric::WallClock,
                         fallback,
                         record: Box::new(self.outcome_from(&state)),
                     });
@@ -499,6 +500,7 @@ where
                         reuse: self.reuse_policy,
                         label: Self::describe_plan(&state.top_candidates, &modes),
                         budget_ms: self.budget(&state),
+                        budget_metric: crate::opt::step::BudgetMetric::WallClock,
                         fallback,
                         record: Box::new(self.outcome_from(&state)),
                     });

@@ -89,6 +89,23 @@ pub struct PlanNode {
     /// [`crate::opt::dup`].
     #[serde(default)]
     pub subplan: Option<String>,
+    /// Rows this operator read, before any filter it applied.
+    ///
+    /// The learned cost model prices an operator by what it *consumed*, and
+    /// for a leaf scan the plan's output cardinality is the wrong number: a
+    /// scan that reads 3.2M rows and emits a thousand did the work of the
+    /// 3.2M. Only a scan reports this; everything else derives its input from
+    /// its children. `None` where the backend does not say.
+    #[serde(default)]
+    pub rows_scanned: Option<f64>,
+    /// Wall clock for the whole statement, set on the root node only.
+    ///
+    /// Postgres reports it as `Execution Time`, a sibling of `Plan`, and the
+    /// gap between it and the root's inclusive time is what writing the result
+    /// cost --- Postgres has no write operator of its own to time. DuckDB does
+    /// (`CREATE_TABLE_AS`), so it leaves this `None`.
+    #[serde(default)]
+    pub total_execution_time_s: Option<f64>,
     pub children: Vec<PlanNode>,
 }
 
@@ -137,6 +154,32 @@ impl PlanNode {
         let rows = self.cardinality? as f64;
         let width = self.row_width_bytes?;
         Some(rows * width)
+    }
+
+    /// Bytes this operator consumed.
+    ///
+    /// Its own scan count where it has one, otherwise the sum of what its
+    /// children emitted. A leaf with neither falls back to its own output: a
+    /// scan that says nothing about what it read is at least known to have
+    /// produced what it produced, and pricing it at nothing would make the
+    /// operators we know least about look cheapest.
+    ///
+    /// This is the denominator the learned cost model fits against. Output
+    /// bytes were the wrong one --- an aggregate over 3.2M rows emitting twenty
+    /// of them is not cheap, and dividing its seconds by those twenty rows'
+    /// bytes produced a constant orders of magnitude off anything it could
+    /// then be applied to.
+    pub fn input_bytes(&self) -> Option<f64> {
+        if let (Some(rows), Some(width)) = (self.rows_scanned, self.row_width_bytes)
+            && rows > 0.0
+        {
+            return Some(rows * width);
+        }
+        let from_children: f64 = self.children.iter().filter_map(Self::output_bytes).sum();
+        if from_children > 0.0 {
+            return Some(from_children);
+        }
+        self.output_bytes()
     }
 
     /// The rows this operator is expected to emit: the measured count where the
@@ -251,16 +294,54 @@ pub fn is_pseudo_scan(operator: &str) -> bool {
     )
 }
 
+/// The write path a plan with no named write operator is fitted under.
+///
+/// Postgres has no write operator to name --- `EXPLAIN ANALYZE` of a
+/// `CREATE TABLE AS` shows the `SELECT` and nothing else --- and an engine that
+/// persists every relation the same way has only one path anyway. One name
+/// keeps those engines in the same keyed structure as the ones with several.
+pub const SINGLE_WRITE_PATH: &str = "WRITE";
+
+/// The write path a plan was written through, read off an executed plan.
+///
+/// The name of the write operator the engine actually used, which is what the
+/// constant for that path is fitted under. [`SINGLE_WRITE_PATH`] for an engine
+/// that names no write operator.
+///
+/// This is the *learning* side. Pricing a View that has never been written has
+/// no write operator to read, and asks the engine instead ---
+/// [`crate::connectors::Connector::write_path_for`].
+pub fn observed_write_path(roots: &[PlanNode]) -> String {
+    fn find(node: &PlanNode) -> Option<String> {
+        if is_write_operator(&node.operator) {
+            return Some(node.operator.to_ascii_uppercase());
+        }
+        node.children.iter().find_map(find)
+    }
+    roots
+        .iter()
+        .find_map(find)
+        .unwrap_or_else(|| SINGLE_WRITE_PATH.to_string())
+}
+
 /// Operators that write a relation rather than compute one.
 ///
-/// Their cost is proportional to what they *wrote*, which the plan reports
-/// nowhere, while the rows they emit are a one-row count of it: DuckDB gives
-/// `CREATE_TABLE_AS` an `operator_cardinality` of 1 and a `result_set_size` of
-/// 8 bytes however large the table. Seconds divided by those 8 bytes is not a
-/// seconds-per-byte constant for anything --- measured on p03 it came out at
-/// 1.6e-2, seven orders of magnitude above a hash join's 5.6e-10, and dragged
-/// the whole model's mean with it. So the learned model does not fit one, and
-/// no plan it prices contains one: a VIEW's plan is a `SELECT`.
+/// Their cost is proportional to what they *wrote*, and the rows they emit are
+/// a one-row count of it: DuckDB gives `CREATE_TABLE_AS` an
+/// `operator_cardinality` of 1 and a `result_set_size` of 8 bytes however large
+/// the table. Seconds divided by those 8 bytes is not a seconds-per-byte
+/// constant for anything --- measured on p03 it came out at 1.6e-2, seven orders
+/// of magnitude above a hash join's 5.6e-10, and dragged the whole model's mean
+/// with it. So a write is kept out of the per-operator constants, and no plan
+/// they price contains one: a VIEW's plan is a `SELECT`.
+///
+/// What is wrong there is the operator's *output size*, not its *timing*.
+/// DuckDB reports `operator_timing` on the write like any other operator, and
+/// dividing that by the payload it wrote --- rows written times the width of the
+/// operator below --- is a real constant. That is what
+/// [`crate::opt::learned::LearnedCostModel::observe_write`] fits, and it is why
+/// this predicate exists in two places: to exclude a write from the compute
+/// constants, and to find it for the write constant.
 ///
 /// The same fact `rows_written_from_plan` is built on, applied to cost.
 pub fn is_write_operator(operator: &str) -> bool {
@@ -380,6 +461,11 @@ struct DuckDBPlan {
     /// why the learned model has to fall back to a learned width there.
     #[serde(default)]
     result_set_size: Option<f64>,
+    /// Rows this operator read before filtering, reported by DuckDB profiling
+    /// on scans. Absent from `EXPLAIN (FORMAT JSON)` and from older DuckDB, so
+    /// `extra_info` is checked as well.
+    #[serde(default)]
+    operator_rows_scanned: Option<f64>,
     #[serde(default)]
     extra_info: std::collections::HashMap<String, serde_json::Value>,
     #[serde(default)]
@@ -456,6 +542,15 @@ impl DuckDBPlan {
                 aggregate_functions(&exprs, &[])
             })
             .unwrap_or_default();
+        let rows_scanned = self
+            .operator_rows_scanned
+            .or_else(|| {
+                self.extra_info
+                    .get("Rows Scanned")
+                    .or_else(|| self.extra_info.get("rows_scanned"))
+                    .and_then(json_to_f64)
+            })
+            .filter(|r| *r > 0.0);
         vec![PlanNode {
             operator,
             // DuckDB's operator_timing is already this operator's own time.
@@ -466,6 +561,9 @@ impl DuckDBPlan {
             aggregates,
             relation,
             subplan: None,
+            rows_scanned,
+            // DuckDB times its write operator directly; nothing to derive.
+            total_execution_time_s: None,
             children,
         }]
     }
@@ -502,6 +600,12 @@ pub fn parse_duckdb_plan(json: &str) -> Option<Vec<PlanNode>> {
 struct PgPlanWrapper {
     #[serde(rename = "Plan")]
     plan: PgPlan,
+    /// Wall clock for the whole statement, a sibling of `Plan` under
+    /// `EXPLAIN ANALYZE`. What it has beyond the root node's inclusive time is
+    /// the part of the run no operator accounted for --- on a `CREATE TABLE AS`
+    /// that is the write.
+    #[serde(rename = "Execution Time", default)]
+    execution_time_ms: Option<f64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -537,6 +641,10 @@ struct PgPlan {
     /// `"SubPlan N"` elsewhere. Only the CTE spelling is read.
     #[serde(rename = "Subplan Name", default)]
     subplan_name: Option<String>,
+    /// Rows a scan read and then discarded. Added back to `Actual Rows` it
+    /// gives what the scan actually consumed --- see [`PlanNode::rows_scanned`].
+    #[serde(rename = "Rows Removed by Filter", default)]
+    rows_removed_by_filter: Option<f64>,
     #[serde(rename = "Plans", default)]
     plans: Vec<PgPlan>,
 }
@@ -618,6 +726,12 @@ impl PgPlan {
             .and_then(|s| s.strip_prefix("CTE "))
             .map(|n| n.trim().trim_matches('"').to_string())
             .filter(|n| !n.is_empty());
+        // What a scan consumed is what it kept plus what it threw away. Only
+        // recorded where the node discarded something: a node with no filter
+        // has no separate input to report, and its children speak for it.
+        let rows_scanned = self.rows_removed_by_filter.filter(|r| *r > 0.0).map(|removed| {
+            (self.actual_rows.unwrap_or(0.0) + removed) * loops
+        });
         PlanNode {
             operator: self.node_type,
             exclusive_time_s: exclusive,
@@ -627,6 +741,10 @@ impl PgPlan {
             aggregates,
             relation,
             subplan,
+            rows_scanned,
+            // Filled in by `parse_postgres_plan` on the root, where the
+            // statement-level timing lives.
+            total_execution_time_s: None,
             children: self
                 .plans
                 .into_iter()
@@ -642,7 +760,15 @@ pub fn parse_postgres_plan(json: &str) -> Option<Vec<PlanNode>> {
     Some(
         wrappers
             .into_iter()
-            .map(|w| w.plan.into_plan_node(1.0))
+            .map(|w| {
+                let total = w.execution_time_ms;
+                let mut root = w.plan.into_plan_node(1.0);
+                // Root only. It is a property of the statement, not of an
+                // operator, and a reader that found it deeper would be
+                // reading the same number twice.
+                root.total_execution_time_s = total.map(|ms| ms / 1000.0);
+                root
+            })
             .collect(),
     )
 }
@@ -650,6 +776,75 @@ pub fn parse_postgres_plan(json: &str) -> Option<Vec<PlanNode>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bare(operator: &str, rows: u64, width: f64, children: Vec<PlanNode>) -> PlanNode {
+        PlanNode {
+            operator: operator.into(),
+            exclusive_time_s: None,
+            cardinality: Some(rows),
+            estimated_cardinality: Some(rows as f64),
+            row_width_bytes: Some(width),
+            aggregates: Vec::new(),
+            relation: None,
+            subplan: None,
+            rows_scanned: None,
+            total_execution_time_s: None,
+            children,
+        }
+    }
+
+    /// An interior operator consumed whatever its children emitted --- which
+    /// for an aggregate is nothing like what it emits itself.
+    #[test]
+    fn input_bytes_sums_what_the_children_emitted() {
+        let agg = bare("HASH_GROUP_BY", 20, 8.0, vec![bare("SEQ_SCAN", 1000, 24.0, vec![])]);
+        assert_eq!(agg.input_bytes(), Some(24000.0));
+        assert_eq!(agg.output_bytes(), Some(160.0), "and it is not this");
+    }
+
+    /// A scan that says what it read is priced on that, not on what survived
+    /// its filter.
+    #[test]
+    fn input_bytes_prefers_a_scans_own_count() {
+        let mut scan = bare("SEQ_SCAN", 10, 24.0, vec![]);
+        scan.rows_scanned = Some(1000.0);
+        assert_eq!(scan.input_bytes(), Some(24000.0));
+    }
+
+    /// A leaf that reports neither is still known to have produced something.
+    /// Pricing it at nothing would make the operators least is known about
+    /// look cheapest of all.
+    #[test]
+    fn a_leaf_with_no_scan_count_falls_back_to_its_own_output() {
+        assert_eq!(bare("SEQ_SCAN", 100, 24.0, vec![]).input_bytes(), Some(2400.0));
+    }
+
+    /// `Execution Time` is a property of the statement. A reader that found it
+    /// on an inner node would be counting the same seconds twice.
+    #[test]
+    fn the_postgres_execution_time_lands_on_the_root_and_nowhere_else() {
+        let json = r#"[{"Execution Time": 150.0, "Plan": {
+            "Node Type": "Aggregate", "Actual Total Time": 100.0,
+            "Actual Rows": 1, "Actual Loops": 1, "Plan Rows": 1, "Plan Width": 8,
+            "Plans": [{"Node Type": "Seq Scan", "Actual Total Time": 60.0,
+                       "Actual Rows": 1000, "Actual Loops": 1, "Plan Rows": 1000,
+                       "Plan Width": 24, "Plans": []}]}}]"#;
+        let plans = parse_postgres_plan(json).expect("the fixture parses");
+        assert_eq!(plans[0].total_execution_time_s, Some(0.150));
+        assert_eq!(plans[0].children[0].total_execution_time_s, None);
+    }
+
+    /// A scan's input is what it kept plus what its filter threw away.
+    #[test]
+    fn a_postgres_filter_reveals_what_the_scan_actually_read() {
+        let json = r#"[{"Plan": {"Node Type": "Seq Scan", "Actual Total Time": 60.0,
+            "Actual Rows": 10, "Rows Removed by Filter": 990, "Actual Loops": 1,
+            "Plan Rows": 10, "Plan Width": 24, "Plans": []}}]"#;
+        let plans = parse_postgres_plan(json).expect("the fixture parses");
+        assert_eq!(plans[0].rows_scanned, Some(1000.0));
+        assert_eq!(plans[0].input_bytes(), Some(24000.0));
+    }
+
 
     const PG_ANALYZE: &str = r#"[{"Plan": {
         "Node Type": "Aggregate",

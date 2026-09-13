@@ -101,6 +101,14 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
                    "`learned_cost` gives seconds, from constants fitted to executed plans; "
                    "`cardinality` sums the region's estimated output rows; `operators` counts "
                    "its operators. Ignored by every other cost method."),
+    DeeOptSpec("hmp_objective", "--hmp-objective", "str", frozenset({"hmp"}),
+               choices=("makespan", "query_time"),
+               doc="Which measure the HMP search minimizes. `makespan` orders candidates by "
+                   "predicted wall clock and promotes a trial that beats the incumbent's "
+                   "runtime; `query_time` orders them by duplicate computation removed and "
+                   "promotes a trial that beats the incumbent's node time. Materializing a "
+                   "View cuts the sum and usually lengthens the critical path, so the two "
+                   "disagree."),
     DeeOptSpec("hmp_search_budget", "--hmp-search-budget", "int", frozenset({"hmp"}),
                doc="Candidate combinations HMP prices before it spends any DAG run on them. "
                    "Bounds costing, which is EXPLAIN-only; `hmp_max_runs` bounds executions."),

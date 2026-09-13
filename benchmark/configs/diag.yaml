@@ -1,0 +1,16 @@
+name: diag
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/diag
+verbosity: detailed
+matrix: {project: [p05_hr], backend: [duckdb], sf: [1], variant: [qt]}
+variants:
+  qt: {passes: [hmp], hmp_cost_method: dup_attribution, hmp_objective: query_time}
+dee_opt:
+  hmp_max_runs: 3
+  hmp_dup_cost_model: learned_cost
+  hmp_top_cpu_time: 1.0
+  hmp_use_pushdown: false
+  trial_resume: false
+backends: {duckdb: {threads: 8, max_memory: 16GB}}
+execution: {repetitions: 1, warmups: 1, sample_interval_ms: 100, timeout_s: 3600}

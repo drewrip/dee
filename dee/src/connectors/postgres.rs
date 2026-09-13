@@ -30,6 +30,29 @@ pub struct PostgresConfig {
 
 impl PostgresConfig {}
 
+/// The settings that go into [`Connector::cost_backend_key`].
+///
+/// Postgres persists every write through WAL to the heap, and these are the
+/// settings that decide how much work that is: whether a commit waits for the
+/// disk at all, whether full pages are logged, how WAL is compressed, and how
+/// often a checkpoint spreads the dirty buffers out. The gap between
+/// `synchronous_commit = off` and `on` alone is larger than any effect the
+/// write model tries to capture, so two servers that differ here must not
+/// share a constant.
+///
+/// Deliberately not a superset of everything that touches I/O: see the DuckDB
+/// constant of the same name for why a wider key is not a safer one.
+const COST_RELEVANT_SETTINGS: [&str; 8] = [
+    "wal_level",
+    "synchronous_commit",
+    "fsync",
+    "full_page_writes",
+    "wal_compression",
+    "max_wal_size",
+    "checkpoint_timeout",
+    "checkpoint_completion_target",
+];
+
 /// See the DuckDB connector's constant of the same name.
 const INTERRUPT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -295,6 +318,48 @@ impl Connector for PostgresConnection {
     /// `max_parallel_workers`: the server-wide pool every backend draws its
     /// parallel workers from. The per-gather limit bounds one query; this
     /// bounds the engine, which is what a second concurrent node contends for.
+    async fn cost_backend_key(&self) -> Result<Option<String>, ConnectorError> {
+        // One query rather than one per setting, and over `pg_settings` rather
+        // than `current_setting()`: `pg_settings` is readable by every role and
+        // returns a row for a restricted setting with a null value, so the key
+        // does not depend on the privileges of whoever happens to be connected.
+        let names: Vec<String> = COST_RELEVANT_SETTINGS.iter().map(|s| s.to_string()).collect();
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT name, setting FROM pg_settings WHERE name = ANY($1) ORDER BY name",
+        )
+        .bind(&names)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ConnectorError::Execute(format!("reading pg_settings - {e}")))?;
+
+        let (version, host, port, database): (String, Option<String>, Option<i32>, String) =
+            sqlx::query_as(
+                "SELECT current_setting('server_version'),                         host(coalesce(inet_server_addr(), '127.0.0.1'::inet)),                         inet_server_port(),                         current_database()",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| ConnectorError::Execute(format!("identifying the server - {e}")))?;
+
+        let found: std::collections::HashMap<_, _> = rows.into_iter().collect();
+        let settings: Vec<String> = COST_RELEVANT_SETTINGS
+            .iter()
+            .map(|name| {
+                let v = found
+                    .get(*name)
+                    .map(|v| v.clone().unwrap_or_else(|| "restricted".to_string()))
+                    .unwrap_or_else(|| "-".to_string());
+                format!("{name}={v}")
+            })
+            .collect();
+
+        Ok(Some(format!(
+            "postgres {version} server={}:{}/{database} {}",
+            host.unwrap_or_else(|| "local".to_string()),
+            port.unwrap_or(5432),
+            settings.join(" ")
+        )))
+    }
+
     async fn parallelism_budget(&self) -> Result<Option<usize>, ConnectorError> {
         let row: (String,) = sqlx::query_as("SHOW max_parallel_workers")
             .fetch_one(&self.pool)
@@ -674,3 +739,4 @@ mod pushdown_guard_tests {
         assert!(out["t"][0].filters.is_empty());
     }
 }
+

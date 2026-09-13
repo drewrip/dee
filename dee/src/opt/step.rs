@@ -23,6 +23,25 @@ use crate::{
 ///
 /// This is the distinction the server needs in order to know when to call
 /// `step`, and the one the old single-`run` interface could not express.
+/// What a trial's budget is measured in.
+///
+/// A search cancels a candidate that has already lost, and "already lost"
+/// depends on what it is trying to win. Capping wall clock while optimizing
+/// total work cancels on a measure nobody is optimizing --- and would reject a
+/// candidate for being slow when slow is not the complaint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetMetric {
+    /// Wall clock: stop the run once it has taken this long. Enforced against
+    /// a deadline, so it binds mid-node.
+    #[default]
+    WallClock,
+    /// Total node time: stop once every finished node's duration sums past the
+    /// cap. Checked as each node completes, so it cannot interrupt a node
+    /// already running --- a single long node overshoots by its own duration.
+    NodeTime,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum OptimizationType {
@@ -282,6 +301,11 @@ pub enum StepOutcome {
         /// measured to completion, because a pipeline that did not run is not
         /// an outcome a search gets to choose.
         budget_ms: Option<i64>,
+        /// Which measure `budget_ms` caps.
+        ///
+        /// Wall clock is what every pass but HMP wants, and what the field
+        /// above meant before this existed.
+        budget_metric: BudgetMetric,
         /// The DAG a cancelled trial is finished under: this search's
         /// incumbent, the best it has measured so far.
         ///
@@ -416,6 +440,7 @@ mod tests {
             !StepOutcome::Trial {
                 label: "c1".into(),
                 budget_ms: None,
+                budget_metric: BudgetMetric::WallClock,
                 fallback: None,
                 reuse: Default::default(),
                 record: record(),

@@ -360,6 +360,7 @@ class CellRunner:
                     "combo": it.get("combo") or [],
                     "outcome": it.get("outcome"),
                     "node_time_ms": it.get("node_time_ms"),
+                    "predicted_makespan_ms": it.get("predicted_makespan_ms"),
                     "trial_ms": it.get("trial_ms"),
                     "resume_overhead_ms": it.get("resume_overhead_ms"),
                     "resume_ms": it.get("resume_ms"),

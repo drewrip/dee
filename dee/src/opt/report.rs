@@ -25,6 +25,14 @@ pub struct IterationStat {
     /// Measured wall time of this candidate. For a cancelled trial this is
     /// only a lower bound (the cancellation budget), since the run was killed
     /// before finishing.
+    ///
+    /// **A cancelled trial's value is in the objective's units, not always
+    /// wall clock.** The budget a candidate overran is the thing worth knowing
+    /// about it, and under `query_time` that budget is a total-node-time cap:
+    /// the number here is then a lower bound on *work*, and the trial's actual
+    /// wall clock is in `trial_ms`, where it will be larger. Reading this
+    /// column as milliseconds of wall clock across a mixed-objective run
+    /// compares two different quantities.
     pub runtime_ms: i64,
     /// Materialization combo tried at this iteration; empty for a baseline
     /// and for passes that don't vary materializations.
@@ -44,9 +52,21 @@ pub struct IterationStat {
     /// notices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_time_ms: Option<i64>,
+    /// What this candidate's wall clock was *predicted* to be, before it ran.
+    ///
+    /// Recorded beside `runtime_ms` so the prediction can be scored against the
+    /// measurement without a second run. A ranking built on a prediction nobody
+    /// checks is a ranking nobody can fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_makespan_ms: Option<i64>,
     /// Wall time the candidate itself ran before being cancelled. `None` on an
     /// iteration that was not cancelled --- there `runtime_ms` is the whole of
     /// it.
+    ///
+    /// This is always wall clock, even under an objective whose *budget* is
+    /// not: it is how long the trial ran, not what it ran out of. On a
+    /// cancelled `query_time` iteration it will exceed `runtime_ms`, because
+    /// the two are then in different units --- see `runtime_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial_ms: Option<i64>,
     /// Wall time between the cancellation and the incumbent picking the run
@@ -77,6 +97,12 @@ impl IterationStat {
 
     pub fn with_combo(mut self, combo: Vec<String>) -> Self {
         self.combo = combo;
+        self
+    }
+
+    /// Record what this candidate's wall clock was predicted to be, in seconds.
+    pub fn with_predicted_makespan(mut self, seconds: Option<f64>) -> Self {
+        self.predicted_makespan_ms = seconds.map(|s| (s * 1000.0) as i64);
         self
     }
 
@@ -139,6 +165,23 @@ pub struct HmpDetail {
     /// How many it actually priced.
     #[serde(default)]
     pub candidates_costed: usize,
+    /// Which measure the search ordered candidates by and promoted them on:
+    /// `"makespan"` or `"query_time"`.
+    ///
+    /// Recorded because it changes what every other number in this report
+    /// means --- the same DAG searched under the other objective trials a
+    /// different order and accepts a different winner.
+    #[serde(default)]
+    pub objective: String,
+    /// The critical-path walk applied to the *baseline* DAG with its own
+    /// measured node durations.
+    ///
+    /// A control for [`IterationStat::predicted_makespan_ms`]: this uses no
+    /// estimates at all, so a gap between it and `baseline_runtime_ms` is a
+    /// fault in the schedule model rather than in the cost model. `None` when
+    /// no candidate could be predicted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_baseline_makespan_ms: Option<i64>,
     pub normalize_with_cardinality: bool,
     pub downstream_cost: bool,
     pub use_pushdown: bool,

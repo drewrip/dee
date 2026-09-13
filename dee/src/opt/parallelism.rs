@@ -616,6 +616,7 @@ where
                         budget_ms: (in_flight.stage != "control")
                             .then(|| self.budget(&state))
                             .flatten(),
+                        budget_metric: crate::opt::step::BudgetMetric::WallClock,
                         record: Box::new(self.outcome_from(&state)),
                     });
                 }
@@ -659,6 +660,7 @@ where
                     budget_ms: (stage != "control")
                         .then(|| self.budget(&state))
                         .flatten(),
+                    budget_metric: crate::opt::step::BudgetMetric::WallClock,
                     record: Box::new(self.outcome_from(&state)),
                 })
             }

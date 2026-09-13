@@ -134,6 +134,59 @@ pub trait Connector {
         crate::plan::TimeBasis::CpuTime
     }
 
+    /// Which write path this engine would persist `query_text`'s result
+    /// through, asked of the engine itself.
+    ///
+    /// An engine that has more than one way to write a relation decides which
+    /// during planning, and will say so if the statement it is asked to plan is
+    /// the write rather than the `SELECT` underneath it. On DuckDB, `EXPLAIN` of
+    /// a `CREATE OR REPLACE TABLE ... AS ...` names the sink at the root of the
+    /// plan --- exactly, including the cases the shape of the `SELECT` cannot
+    /// distinguish --- without executing anything and without creating or
+    /// replacing the table.
+    ///
+    /// The engine's answer or nothing. There was briefly a fallback that
+    /// inferred the sink from the shape of the `SELECT`, and it was removed: it
+    /// was right 83 times in 86 against the engine's 86, and the three it missed
+    /// were a case the `SELECT` plan genuinely cannot express (a window's
+    /// `PARTITION BY`). A cost model that silently substitutes a guess for a
+    /// measurement is worse than one that declines to answer, because the guess
+    /// is indistinguishable from the fact downstream.
+    ///
+    /// `Ok(None)` means *this engine will not say*, and the caller must treat
+    /// the write as unpriced rather than free.
+    ///
+    /// Defaults to [`SINGLE_WRITE_PATH`](crate::plan::SINGLE_WRITE_PATH) --- one
+    /// way of writing, which is the truth for Postgres and for any engine that
+    /// names no write operator, and is what
+    /// [`crate::plan::observed_write_path`] files those engines' measurements
+    /// under, so the two agree by construction.
+    async fn write_path_for(&self, _query_text: &str) -> Result<Option<String>, ConnectorError> {
+        Ok(Some(crate::plan::SINGLE_WRITE_PATH.to_string()))
+    }
+
+    /// A stable identity for the engine that learned cost constants belong to.
+    ///
+    /// Seconds per byte is a property of an engine on a machine, not of the
+    /// pipeline that happened to measure it, so what one DAG observes should
+    /// price the next one's Views. But it is a property of *that* engine.
+    /// DuckDB appending to a local file and Postgres writing through WAL to a
+    /// different disk do not share a write constant, and neither do two
+    /// databases whose storage settings differ --- so constants are stored
+    /// under this key, and shared exactly as far as they transfer.
+    ///
+    /// Carry what plausibly changes the cost of a byte and nothing else. A key
+    /// that carries an irrelevant setting splits one engine's samples into two
+    /// half-learned models, and a constant fitted on too few writes is the
+    /// failure this exists to avoid.
+    ///
+    /// `Ok(None)` where the connector cannot identify itself. The caller then
+    /// keeps its constants in memory rather than pooling them with an unknown
+    /// engine's, which is the whole point of the key.
+    async fn cost_backend_key(&self) -> Result<Option<String>, ConnectorError> {
+        Ok(None)
+    }
+
     /// How much parallelism the engine as a whole can bring to bear, in
     /// cores or worker slots.
     ///

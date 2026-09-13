@@ -14,7 +14,7 @@ use dee::executor::{Executor, ExecutorError, ProfilingConfig, RunOptions, Simple
 use dee::opt::resume;
 use tokio::sync::watch;
 
-use dee::opt::{RunContext, StepPhase};
+use dee::opt::{BudgetMetric, RunContext, StepPhase};
 
 use crate::error::ServerError;
 use crate::exec::connectors::ConnectorHandle;
@@ -248,6 +248,17 @@ where
         let budget = budgeted.as_ref().map(|t| {
             std::time::Duration::from_millis(t.budget_ms.expect("filtered above") as u64)
         });
+        // The cap routed to whichever measure the pass is capping. Exactly one
+        // is ever set: under two budgets a run is cancelled by whichever binds
+        // first, which is neither of them.
+        let metric = budgeted
+            .as_ref()
+            .map(|t| t.budget_metric)
+            .unwrap_or_default();
+        let (wall_budget, node_time_budget) = match metric {
+            BudgetMetric::WallClock => (budget, None),
+            BudgetMetric::NodeTime => (None, budget),
+        };
         if let (Some(trial), Some(budget)) = (budgeted.as_ref(), budget) {
             log::debug!(
                 "{}'s candidate {} runs under a {}ms budget, with a fallback to finish the run",
@@ -340,7 +351,8 @@ where
             .run_with(
                 dag,
                 RunOptions {
-                    budget,
+                    budget: wall_budget,
+                    node_time_budget,
                     // Whatever a cancelled candidate built is what the resume
                     // reuses, so a budgeted run must not tidy up after itself.
                     cleanup_on_cancel: budget.is_none(),
@@ -439,6 +451,7 @@ where
                             // A delivery must not be cut short again, but a
                             // pathological engine state must not hang the group.
                             budget: budget.map(|b| b * RESUME_BUDGET_MULTIPLE),
+                            node_time_budget: None,
                             cleanup_on_cancel: false,
                         },
                     )

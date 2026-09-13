@@ -20,7 +20,7 @@ use crate::{
         common::{dialect_for_db, make_temp},
         dup::{SubtreeCostMethod, duplicate_cost_set},
         leafset::{PlanArena, ViewRegionRequest, attribute_chain, has_top_level_group_by},
-        learned::LearnedCostModel,
+        learned::{CostBasis, LearnedCostModel},
         explain::{render_bar_row, render_card_grid, render_ranked_table},
         pushdown::PushdownPass,
         resume::node_signature,
@@ -104,6 +104,62 @@ impl std::str::FromStr for HmpCostMethod {
     }
 }
 
+/// What HMP is trying to make smaller.
+///
+/// The two are not the same number and not reliably correlated. Total query
+/// time is the sum of every node's duration; makespan is the wall clock, a
+/// longest path through the DAG. Materializing a View removes duplicate
+/// computation --- which always cuts the sum --- and inserts a build that must
+/// finish before its consumers start, which usually lengthens the path. On p05
+/// ten of eleven candidates cut query time and *every one* raised makespan.
+///
+/// So there is no single ranking that serves both, and no reweighting of one
+/// that produces the other: a sum cannot see chain depth. The caller says which
+/// it wants, and that choice picks both the order candidates are trialled in
+/// and the test a trial has to pass to be promoted --- searching by one measure
+/// while accepting on the other is how a search finds ten improvements and
+/// promotes none of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HmpObjective {
+    /// Wall clock. Candidates are ordered by predicted makespan ascending, and
+    /// a trial is promoted when it beats the incumbent's `runtime_ms`.
+    ///
+    /// The default, because it is what a person waiting on the DAG experiences.
+    #[default]
+    Makespan,
+    /// Total work. Candidates are ordered by duplicate computation removed,
+    /// descending, and a trial is promoted when it beats the incumbent's
+    /// `node_time_ms`.
+    ///
+    /// What to pick when the DAG shares a machine and the cost that matters is
+    /// how much of it the run consumes, not how long the run takes.
+    QueryTime,
+}
+
+impl HmpObjective {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HmpObjective::Makespan => "makespan",
+            HmpObjective::QueryTime => "query_time",
+        }
+    }
+}
+
+impl std::str::FromStr for HmpObjective {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "makespan" | "wall_clock" => Ok(HmpObjective::Makespan),
+            "query_time" | "querytime" | "node_time" => Ok(HmpObjective::QueryTime),
+            other => Err(format!(
+                "unknown hmp objective '{other}'; expected makespan or query_time"
+            )),
+        }
+    }
+}
+
 /// Where HMP is in its search, as persisted between steps.
 ///
 /// The old pass held all of this on the stack of a single `run()`, because
@@ -128,12 +184,24 @@ struct HmpState {
     phase: String,
     baseline_ms: i64,
     best_ms: i64,
+    /// The incumbent's total query time --- every node's duration summed.
+    ///
+    /// Tracked beside `best_ms` rather than instead of it because the two are
+    /// different measures and only one of them is the objective; the other is
+    /// still recorded per iteration so a run can be read either way after the
+    /// fact. `i64::MAX` until the baseline lands, matching `best_ms`.
+    #[serde(default)]
+    best_node_time_ms: i64,
     best_combo: Vec<String>,
     /// The ranked candidate Views the search will explore.
     working_set: Vec<String>,
     /// Each candidate View's score from the baseline run, which seeds the
     /// enumeration's priority queue.
     baseline_scores: HashMap<String, f64>,
+    /// The baseline DAG's critical path from its measured node durations, in
+    /// milliseconds. The control for every predicted makespan this pass records.
+    #[serde(default)]
+    predicted_baseline_ms: Option<i64>,
     /// DAG executions this search has consumed, baseline included.
     runs_used: usize,
     iterations: Vec<IterationStat>,
@@ -164,9 +232,19 @@ struct HmpState {
 struct CandidateCombo {
     /// Members, consumer-most first -- the order they must be materialized in.
     combo: Vec<String>,
-    /// Duplicate computation the combination removes, from the telescoping
-    /// chain in [`crate::opt::combo`].
+    /// Duplicate computation the combination removes, measured as a set by
+    /// [`crate::opt::combo`].
     cost: f64,
+    /// Predicted wall clock of the DAG with this combination materialized, in
+    /// seconds, or `None` when it could not be predicted.
+    ///
+    /// The second axis the candidates are ordered on. Recorded per trial so the
+    /// prediction can be read against the runtime the trial actually had.
+    #[serde(default)]
+    makespan_s: Option<f64>,
+    /// Members lying on one dependency chain, and so building in sequence.
+    #[serde(default)]
+    stages: usize,
     /// A member could not be priced and was charged zero, so `cost` is a floor.
     #[serde(default)]
     partial: bool,
@@ -176,6 +254,10 @@ struct CandidateCombo {
 struct InFlight {
     combo: Vec<String>,
     sig: String,
+    /// What this candidate's wall clock was predicted to be, carried so the
+    /// trial that follows can be recorded beside its own prediction.
+    #[serde(default)]
+    makespan_s: Option<f64>,
 }
 
 impl HmpState {
@@ -190,9 +272,11 @@ impl Default for HmpState {
             phase: "baseline".to_string(),
             baseline_ms: 0,
             best_ms: i64::MAX,
+            best_node_time_ms: i64::MAX,
             best_combo: Vec::new(),
             working_set: Vec::new(),
             baseline_scores: HashMap::new(),
+            predicted_baseline_ms: None,
             runs_used: 0,
             iterations: Vec::new(),
             tried_sigs: Vec::new(),
@@ -238,6 +322,8 @@ where
     /// What `DupAttribution` prices a plan region with. Unused by the other
     /// methods, which have no notion of a region.
     dup_cost_model: SubtreeCostMethod,
+    /// Which measure the search orders candidates by and promotes them on.
+    objective: HmpObjective,
     /// Cancel a trial once it has overrun the incumbent and finish the run
     /// under the incumbent instead, rather than measuring every candidate to
     /// completion.
@@ -353,6 +439,7 @@ where
         normalize_with_cardinality: bool,
         cost_method: HmpCostMethod,
         dup_cost_model: SubtreeCostMethod,
+        objective: HmpObjective,
         use_pushdown: bool,
         search_budget: usize,
         profile_iterations: bool,
@@ -370,6 +457,7 @@ where
             normalize_with_cardinality,
             cost_method,
             dup_cost_model,
+            objective,
             use_pushdown,
             search_budget: search_budget.max(1),
             profile_iterations,
@@ -779,10 +867,21 @@ const STATE_TABLE: &str = "opt_hmp_state";
 const TRIALS_TABLE: &str = "opt_hmp_trials";
 /// The `LearnedCost` method's seconds-per-byte constants.
 ///
-/// One row for the whole engine rather than one per DAG: a hash join's cost per
-/// output byte is a property of the engine and the machine, not of the pipeline
-/// that happened to contain it, so what one DAG measures should price the next
-/// one's Views on its very first run.
+/// One row per *engine* rather than one per DAG: a hash join's cost per input
+/// byte is a property of the engine and the machine, not of the pipeline that
+/// happened to contain it, so what one DAG measures should price the next one's
+/// Views on its very first run. Measured across eight dag-bench projects on one
+/// machine, the spread within a single DAG's own tables was larger than the
+/// spread between the DAGs' fitted constants --- a per-DAG constant would
+/// average over more variation than it isolates, and would leave every new DAG
+/// starting from nothing.
+///
+/// But only per engine. The row is keyed by [`Connector::cost_backend_key`],
+/// because a DuckDB write and a Postgres write share no constant, and neither
+/// do two databases whose storage settings differ. Before that key existed this
+/// table held a single unkeyed row, which every backend on the store wrote into
+/// and read back --- rows from then have a null `backend` and are never
+/// selected, so they are refitted rather than misapplied.
 const LEARNED_TABLE: &str = "opt_hmp_learned_cost";
 
 impl<C, E> HMPPass<C, E>
@@ -804,6 +903,7 @@ where
             config.hmp_normalize_with_cardinality,
             config.hmp_cost_method,
             config.hmp_dup_cost_model,
+            config.hmp_objective,
             config.hmp_use_pushdown,
             config.hmp_search_budget,
             config.profile_iterations,
@@ -870,9 +970,36 @@ where
     /// A missing table is an empty model, not an error: the pass is asked to
     /// rank before it has ever been registered in tests and benchmarks, and a
     /// model that has learned nothing is exactly what it should have then.
-    async fn load_learned(&self, store: &dyn OptStore) -> LearnedCostModel {
+    /// This engine's identity, or `None` when the connector will not say.
+    ///
+    /// Without it the constants stay in memory for the run and are neither read
+    /// nor written: pooling two engines' seconds-per-byte under one unkeyed row
+    /// is the exact failure the key exists to prevent, and is worse than
+    /// learning nothing.
+    async fn backend_key(&self) -> Option<String> {
+        match self.conn.cost_backend_key().await {
+            Ok(Some(key)) => Some(key),
+            Ok(None) => {
+                warn!(
+                    "HMPPass: this connector does not identify its backend, so the learned \
+                     cost constants will not be persisted; they would be pooled with every \
+                     other engine on this store"
+                );
+                None
+            }
+            Err(e) => {
+                warn!("HMPPass: could not identify the backend to key cost constants by: {e}");
+                None
+            }
+        }
+    }
+
+    async fn load_learned(&self, store: &dyn OptStore, backend: &str) -> LearnedCostModel {
         let rows = match store
-            .query(&format!("SELECT model FROM {LEARNED_TABLE}"), &[])
+            .query(
+                &format!("SELECT model FROM {LEARNED_TABLE} WHERE backend = ?"),
+                &[json!(backend)],
+            )
             .await
         {
             Ok(rows) => rows,
@@ -886,12 +1013,28 @@ where
         rows.first()
             .and_then(|r| r.get("model"))
             .and_then(|v| v.as_str())
-            .and_then(|raw| match serde_json::from_str(raw) {
+            .and_then(|raw| match serde_json::from_str::<LearnedCostModel>(raw) {
                 Ok(model) => Some(model),
                 Err(e) => {
                     warn!("HMPPass: discarding an undecodable learned cost model: {e}");
                     None
                 }
+            })
+            // Constants fitted against output bytes cannot be mixed with ones
+            // fitted against input bytes: the difference between them is the
+            // operator's selectivity, which for an aggregate is orders of
+            // magnitude. A row from before the change says so and is dropped,
+            // and the model refits from the runs that follow.
+            .filter(|model: &LearnedCostModel| {
+                let keep = model.basis() == CostBasis::InputBytes;
+                if !keep {
+                    warn!(
+                        "HMPPass: discarding a learned cost model fitted against {:?}; \
+                         it will be refitted from this run",
+                        model.basis()
+                    );
+                }
+                keep
             })
             .unwrap_or_default()
     }
@@ -904,17 +1047,26 @@ where
     async fn save_learned(
         &self,
         store: &dyn OptStore,
+        backend: &str,
         model: &LearnedCostModel,
     ) -> Result<(), OptimizerError> {
         let encoded = serde_json::to_string(model)
             .map_err(|e| OptimizerError::Store(crate::opt::OptStoreError::Decode(e.to_string())))?;
+        // Only this engine's row: another backend on the same store has its own,
+        // and it is not this run's to replace.
         store
-            .execute(&format!("DELETE FROM {LEARNED_TABLE}"), &[])
+            .execute(
+                &format!("DELETE FROM {LEARNED_TABLE} WHERE backend = ?"),
+                &[json!(backend)],
+            )
             .await?;
         store
             .execute(
-                &format!("INSERT INTO {LEARNED_TABLE} (model, updated_at) VALUES (?, now())"),
-                &[json!(encoded)],
+                &format!(
+                    "INSERT INTO {LEARNED_TABLE} (backend, model, updated_at) \
+                     VALUES (?, ?, now())"
+                ),
+                &[json!(backend), json!(encoded)],
             )
             .await?;
         Ok(())
@@ -943,7 +1095,10 @@ where
         if !self.uses_learned_constants() {
             return;
         }
-        let stored = self.load_learned(store).await;
+        let Some(backend) = self.backend_key().await else {
+            return;
+        };
+        let stored = self.load_learned(store, &backend).await;
         if let Ok(mut model) = self.learned.lock() {
             model.merge(&stored);
         }
@@ -961,7 +1116,10 @@ where
         if snapshot.is_empty() {
             return;
         }
-        if let Err(e) = self.save_learned(store, &snapshot).await {
+        let Some(backend) = self.backend_key().await else {
+            return;
+        };
+        if let Err(e) = self.save_learned(store, &backend, &snapshot).await {
             warn!("HMPPass: could not persist the learned cost model: {e}");
         }
         // The stored row is now everything this pass knows, so keeping the
@@ -1185,6 +1343,13 @@ where
                 && let Some(plans) = self.conn.parse_plan(plan_str)
             {
                 model.observe(&plans);
+                // What the write itself cost. Nothing else observes it: a write
+                // operator's own output is a one-row count of the table, so
+                // every other coster skips it and its bytes have to come from
+                // the rows the run reported writing.
+                if let Some(rows) = node_stat.rows_produced {
+                    model.observe_write(&node.id, &plans, rows as f64);
+                }
             }
         }
     }
@@ -1555,6 +1720,7 @@ where
         &self,
         dag: &Dag,
         working_set: &[String],
+        baseline: Option<&ExecStats>,
     ) -> Vec<CandidateCombo> {
         if working_set.is_empty() {
             return Vec::new();
@@ -1582,6 +1748,8 @@ where
             &singletons,
             coster.as_ref(),
             self.search_budget,
+            baseline,
+            self.objective,
         )
         .await;
 
@@ -1596,6 +1764,8 @@ where
                 .map(|c| CandidateCombo {
                     combo: c.combo,
                     cost: c.cost,
+                    makespan_s: c.makespan_s,
+                    stages: c.stages,
                     partial: false,
                 })
                 .collect();
@@ -1620,6 +1790,8 @@ where
                 out.push(CandidateCombo {
                     combo,
                     cost: 0.0,
+                    makespan_s: None,
+                    stages: 0,
                     partial: true,
                 });
             }
@@ -1678,6 +1850,8 @@ where
                 top_cpu_time: self.top_cpu_time,
                 search_budget: self.search_budget,
                 candidates_costed: state.candidates.len(),
+                objective: self.objective.as_str().to_string(),
+                predicted_baseline_makespan_ms: state.predicted_baseline_ms,
                 normalize_with_cardinality: self.normalize_with_cardinality,
                 downstream_cost: self.downstream_cost,
                 use_pushdown: self.use_pushdown,
@@ -1709,7 +1883,21 @@ where
         });
     }
 
-    /// The wall-clock cap this search's next trial runs under.
+    /// Which measure this search's trial budget caps.
+    ///
+    /// The objective's own, so that "already lost" means the same thing to the
+    /// cancellation as it does to the accept test. Capping wall clock while
+    /// optimizing total work would cancel candidates for being slow when slow
+    /// is not the complaint --- and on p05 that describes every candidate worth
+    /// having.
+    fn budget_metric(&self) -> crate::opt::step::BudgetMetric {
+        match self.objective {
+            HmpObjective::Makespan => crate::opt::step::BudgetMetric::WallClock,
+            HmpObjective::QueryTime => crate::opt::step::BudgetMetric::NodeTime,
+        }
+    }
+
+    /// The cap this search's next trial runs under, in the objective's measure.
     ///
     /// `None` until something has been measured -- there is no incumbent to be
     /// worse than -- and `None` when resuming is off, because a budget without
@@ -1717,10 +1905,17 @@ where
     /// unbuilt. Where it does apply, a candidate can never cost more than
     /// `1 + eps` times the best combination found so far.
     fn budget(&self, state: &HmpState) -> Option<i64> {
-        if !self.resume_trials || state.best_ms == i64::MAX || state.best_ms <= 0 {
+        if !self.resume_trials {
             return None;
         }
-        Some(((state.best_ms as f64) * (1.0 + self.budget_eps)).round() as i64)
+        let incumbent = match self.objective {
+            HmpObjective::Makespan => state.best_ms,
+            HmpObjective::QueryTime => state.best_node_time_ms,
+        };
+        if incumbent == i64::MAX || incumbent <= 0 {
+            return None;
+        }
+        Some(((incumbent as f64) * (1.0 + self.budget_eps)).round() as i64)
     }
 
     /// This search's incumbent as a DAG: the authored definition with the best
@@ -1772,6 +1967,7 @@ where
                         reuse: self.reuse_policy,
                         label: describe(&combo),
                         budget_ms: self.budget(&state),
+                        budget_metric: self.budget_metric(),
                         fallback,
                         record: Box::new(self.outcome_from(&state)),
                     });
@@ -1802,6 +1998,7 @@ where
                         return self.promote(ctx, state).await;
                     };
                     let combo = candidate.combo.clone();
+                    let predicted = candidate.makespan_s;
                     state.cursor += 1;
 
                     let mut trial = ctx.dag.clone();
@@ -1827,6 +2024,7 @@ where
                     state.in_flight = Some(InFlight {
                         combo: combo.clone(),
                         sig,
+                        makespan_s: predicted,
                     });
                     self.save_state(ctx.store, ctx.dag_id, &state).await?;
 
@@ -1835,6 +2033,7 @@ where
                         reuse: self.reuse_policy,
                         label: describe(&combo),
                         budget_ms: self.budget(&state),
+                        budget_metric: self.budget_metric(),
                         fallback,
                         record: Box::new(self.outcome_from(&state)),
                     });
@@ -1924,6 +2123,7 @@ where
         if state.phase == "baseline" {
             state.baseline_ms = runtime_ms;
             state.best_ms = runtime_ms;
+            state.best_node_time_ms = stats.node_time_ms();
             state.runs_used = 1;
             state.iterations.push(
                 IterationStat::new(1, runtime_ms)
@@ -1961,7 +2161,11 @@ where
                 state.working_set
             );
 
-            state.candidates = self.build_candidates(ctx.dag, &state.working_set).await;
+            state.predicted_baseline_ms =
+                Some((crate::opt::makespan::measured_baseline(ctx.dag, stats) * 1000.0) as i64);
+            state.candidates = self
+                .build_candidates(ctx.dag, &state.working_set, Some(stats))
+                .await;
             state.cursor = 0;
             state.candidates_built = true;
             self.record_trial(ctx.store, ctx.dag_id, &run.run_id, &state, runtime_ms, true)
@@ -1983,6 +2187,7 @@ where
         state.iterations.push(
             IterationStat::new(state.iterations.len() + 1, runtime_ms)
                 .with_combo(in_flight.combo.clone())
+                .with_predicted_makespan(in_flight.makespan_s)
                 .with_outcome("ok")
                 .with_run_cost(ctx)
                 .with_samples(if self.profile_iterations {
@@ -1997,19 +2202,44 @@ where
         // collected rather than issuing EXPLAINs of its own.
         self.learn_from(ctx.dag, stats);
 
-        let improved = runtime_ms < state.best_ms;
+        // Promote on the measure the search was ordering by. Ranking on one and
+        // accepting on the other is how p05 found ten candidates that cut total
+        // query time -- the best by 27.7% -- and promoted none of them: every
+        // one of the ten had a longer critical path than the baseline, and the
+        // accept test only ever looked at wall clock.
+        let node_time_ms = stats.node_time_ms();
+        let (improved, measure, was, now) = match self.objective {
+            HmpObjective::Makespan => (
+                runtime_ms < state.best_ms,
+                "makespan",
+                state.best_ms,
+                runtime_ms,
+            ),
+            HmpObjective::QueryTime => (
+                node_time_ms < state.best_node_time_ms,
+                "query time",
+                state.best_node_time_ms,
+                node_time_ms,
+            ),
+        };
         if improved {
             debug!(
-                "combo {:?} improved runtime: {}ms -> {runtime_ms}ms",
-                in_flight.combo, state.best_ms
+                "combo {:?} improved {measure}: {was}ms -> {now}ms",
+                in_flight.combo
             );
-            state.best_ms = runtime_ms;
             state.best_combo = in_flight.combo.clone();
         } else {
             debug!(
-                "combo {:?} did not improve runtime ({}ms -> {runtime_ms}ms)",
-                in_flight.combo, state.best_ms
+                "combo {:?} did not improve {measure} ({was}ms -> {now}ms)",
+                in_flight.combo
             );
+        }
+        // Both incumbents track the winner, whichever measure chose it: the one
+        // that is not the objective still bounds the trial-resume budget and
+        // still gets reported.
+        if improved {
+            state.best_ms = runtime_ms;
+            state.best_node_time_ms = node_time_ms;
         }
 
         self.record_trial(
@@ -2062,6 +2292,7 @@ where
         state.iterations.push(
             IterationStat::new(state.iterations.len() + 1, censored_ms)
                 .with_combo(in_flight.combo.clone())
+                .with_predicted_makespan(in_flight.makespan_s)
                 .with_outcome("cancelled")
                 .with_run_cost(ctx),
         );
@@ -2185,10 +2416,22 @@ where
             .execute(
                 &format!(
                     "CREATE TABLE IF NOT EXISTS {LEARNED_TABLE} (
+                         backend    VARCHAR,
                          model      VARCHAR NOT NULL,
                          updated_at TIMESTAMPTZ NOT NULL
                      )"
                 ),
+                &[],
+            )
+            .await?;
+        // A store written before the constants were keyed by engine has the
+        // table without this column. Adding it leaves the old row in place with
+        // a null `backend`, which no read selects -- the constants it holds were
+        // fitted across whatever engines shared this store and cannot be
+        // attributed to one, so they are refitted rather than trusted.
+        ctx.store
+            .execute(
+                &format!("ALTER TABLE {LEARNED_TABLE} ADD COLUMN IF NOT EXISTS backend VARCHAR"),
                 &[],
             )
             .await?;
@@ -2235,8 +2478,10 @@ where
             .unwrap_or(false);
         if empty {
             // The learned constants have no `dag_id` to delete by -- they
-            // describe the engine, not any one DAG -- so they go when the last
-            // registration does, with everything else.
+            // describe an engine, not any one DAG -- so they go when the last
+            // registration does, with everything else. That takes every
+            // backend's row, not just this DAG's: the table is gone, and the
+            // next registration refits from scratch.
             for table in [STATE_TABLE, TRIALS_TABLE, LEARNED_TABLE] {
                 ctx.store
                     .execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
@@ -2520,6 +2765,7 @@ mod tests {
             // what this method reads.
             HmpCostMethod::Signature,
             SubtreeCostMethod::default(),
+            HmpObjective::default(),
             false,
             search_budget,
             false,
@@ -2841,7 +3087,8 @@ mod tests {
             .execute(
                 &format!(
                     "CREATE TABLE IF NOT EXISTS {LEARNED_TABLE} \
-                     (model VARCHAR NOT NULL, updated_at TIMESTAMPTZ NOT NULL)"
+                     (backend VARCHAR, model VARCHAR NOT NULL, \
+                      updated_at TIMESTAMPTZ NOT NULL)"
                 ),
                 &[],
             )
@@ -2879,6 +3126,151 @@ mod tests {
         assert!((rows[0].total_cpu_time_s - 9.0).abs() < 1e-9);
     }
 
+    /// The key names the engine, the file it writes to, and the settings that
+    /// decide what a write costs --- so two connectors over the same file agree
+    /// and a connector over a different one does not.
+    #[tokio::test]
+    async fn the_duckdb_backend_key_names_the_file_and_its_storage_settings() {
+        let mem = in_memory_conn().await;
+        let key = mem.cost_backend_key().await.unwrap().expect("a key");
+        assert!(key.starts_with("duckdb v"), "{key}");
+        assert!(key.contains("db=:memory:"), "{key}");
+        for setting in [
+            "default_block_size",
+            "checkpoint_threshold",
+            "wal_autocheckpoint",
+            "memory_limit",
+            "preserve_insertion_order",
+        ] {
+            assert!(key.contains(&format!("{setting}=")), "{setting} missing from {key}");
+        }
+        // `threads` is deliberately not in it: DuckDB sums a write operator's
+        // timing across threads, so the cost of a write does not move with it,
+        // and keying on it would split a sweep's samples per thread count.
+        assert!(!key.contains("threads="), "{key}");
+
+        // Same process, same in-memory database settings: the same key, so the
+        // two share what they learn.
+        let twin = in_memory_conn().await;
+        assert_eq!(twin.cost_backend_key().await.unwrap().unwrap(), key);
+
+        // A different file is a different engine as far as the constants go.
+        let dir = std::env::temp_dir().join(format!("dee-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w.duckdb");
+        let on_disk = DuckDBConnection::new(DuckDBConfig::new_from_path(
+            path.display().to_string(),
+        ))
+        .await
+        .unwrap();
+        let file_key = on_disk.cost_backend_key().await.unwrap().unwrap();
+        assert_ne!(file_key, key);
+        assert!(file_key.contains("w.duckdb"), "{file_key}");
+        drop(on_disk);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A setting that changes what a write costs changes the key, so the two
+    /// configurations fit their own constants instead of one average.
+    #[tokio::test]
+    async fn a_storage_setting_change_gives_the_backend_a_different_key() {
+        let conn = in_memory_conn().await;
+        let before = conn.cost_backend_key().await.unwrap().unwrap();
+        conn.execute("SET checkpoint_threshold='128MB'".to_string())
+            .await
+            .unwrap();
+        let after = conn.cost_backend_key().await.unwrap().unwrap();
+        assert_ne!(before, after, "checkpoint_threshold is part of the key");
+    }
+
+    /// Two engines sharing one store keep separate constants. Before the key
+    /// existed they shared a single row, and a Postgres write was priced with a
+    /// DuckDB constant.
+    #[tokio::test]
+    async fn one_engines_constants_do_not_price_another() {
+        let store = MemoryStore::open("hmp").unwrap();
+        store
+            .execute(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {LEARNED_TABLE} \
+                     (backend VARCHAR, model VARCHAR NOT NULL, \
+                      updated_at TIMESTAMPTZ NOT NULL)"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let consumers = ["out_a", "out_b"];
+        let mut pass = test_pass(2).await;
+        pass.cost_method = HmpCostMethod::LearnedCost;
+        pass.ranking_learned(&learned_dag(&consumers), &learned_stats(&consumers))
+            .expect("learned something");
+        let snapshot = pass.learned.lock().unwrap().clone();
+        pass.save_learned(&store, "duckdb/one", &snapshot)
+            .await
+            .unwrap();
+
+        // Its own key reads it back.
+        assert!(!pass.load_learned(&store, "duckdb/one").await.is_empty());
+        // Another engine's does not, however much it would like to.
+        assert!(
+            pass.load_learned(&store, "postgres/other").await.is_empty(),
+            "one engine read another's seconds-per-byte"
+        );
+
+        // And writing the second engine's row leaves the first's alone.
+        pass.save_learned(&store, "postgres/other", &snapshot)
+            .await
+            .unwrap();
+        let rows = store
+            .query(&format!("SELECT backend FROM {LEARNED_TABLE}"), &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "a second engine replaced the first's row");
+    }
+
+    /// A row written before the constants were keyed has a null `backend`. It
+    /// was fitted across whatever engines shared the store, so it is refitted
+    /// rather than handed to one of them.
+    #[tokio::test]
+    async fn a_row_from_before_the_key_is_never_adopted() {
+        let store = MemoryStore::open("hmp").unwrap();
+        store
+            .execute(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {LEARNED_TABLE} \
+                     (model VARCHAR NOT NULL, updated_at TIMESTAMPTZ NOT NULL)"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        store
+            .execute(
+                &format!(
+                    "INSERT INTO {LEARNED_TABLE} (model, updated_at) VALUES (?, now())"
+                ),
+                &[json!(r#"{"ops":{},"basis":"input_bytes"}"#)],
+            )
+            .await
+            .unwrap();
+        // The migration `register` runs.
+        store
+            .execute(
+                &format!("ALTER TABLE {LEARNED_TABLE} ADD COLUMN IF NOT EXISTS backend VARCHAR"),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let pass = test_pass(2).await;
+        assert!(
+            pass.load_learned(&store, "duckdb/anything").await.is_empty(),
+            "an unkeyed row was adopted by a named engine"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // DupAttribution
     // ---------------------------------------------------------------------
@@ -2910,6 +3302,7 @@ mod tests {
             false,
             HmpCostMethod::DupAttribution,
             SubtreeCostMethod::Cardinality,
+            HmpObjective::default(),
             false,
             2,
             false,
@@ -3208,6 +3601,7 @@ mod tests {
         state.in_flight = Some(InFlight {
             combo: vec!["a".to_string()],
             sig: "sig-a".to_string(),
+            makespan_s: None,
         });
         pass.save_state(&store, "dag-1", &state).await.unwrap();
 
@@ -3255,6 +3649,110 @@ mod tests {
         );
     }
 
+    /// A trial's stats with wall clock and total node time set independently.
+    fn objective_stats(runtime_ms: i64, node_time_ms: i64) -> ExecStats {
+        let now = Utc::now();
+        let mut only = node_stats(None);
+        only.duration = chrono::TimeDelta::milliseconds(node_time_ms);
+        ExecStats {
+            start: now,
+            finish: now,
+            duration: chrono::TimeDelta::milliseconds(runtime_ms),
+            node_stats: HashMap::from([("x".to_string(), only)]),
+            system_samples: Vec::new(),
+        }
+    }
+
+    /// Run one trial to completion under `objective` and report the incumbent.
+    async fn trial_under(
+        objective: HmpObjective,
+        runtime_ms: i64,
+        node_time_ms: i64,
+    ) -> HmpState {
+        let store = MemoryStore::open("hmp").unwrap();
+        let mut pass = test_pass(4).await;
+        pass.objective = objective;
+        let conn = Arc::clone(&pass.conn);
+        let engine = Arc::clone(&pass.engine);
+
+        pass.register(&RegisterContext {
+            store: &store,
+            dag_id: "dag-1",
+            dag_name: "pipeline",
+        })
+        .await
+        .unwrap();
+
+        let mut state = pass.load_state(&store, "dag-1").await.unwrap().unwrap();
+        state.phase = "searching".to_string();
+        // An incumbent that the candidate beats on work and loses on the clock.
+        state.best_ms = 1000;
+        state.best_node_time_ms = 5000;
+        state.best_combo = vec!["kept".to_string()];
+        state.candidates_built = true;
+        state.in_flight = Some(InFlight {
+            combo: vec!["cand".to_string()],
+            sig: "sig-cand".to_string(),
+            makespan_s: None,
+        });
+        pass.save_state(&store, "dag-1", &state).await.unwrap();
+
+        let mut dag = make_dag(vec![node("x", "SELECT 1", MaterializeMode::Table, &[])]);
+        let mut ctx = StepContext {
+            store: &store,
+            conn,
+            engine,
+            dag: &mut dag,
+            dag_id: "dag-1",
+            dag_name: "pipeline",
+            dag_version: 1,
+            side: StepPhase::After,
+            run: Some(crate::opt::RunContext {
+                run_id: "r1".into(),
+                run_group_id: "g1".into(),
+                run_phase: crate::opt::run_phase::MEASURE.into(),
+                rep_index: 0,
+                stats: Some(objective_stats(runtime_ms, node_time_ms)),
+                resumed: None,
+            }),
+        };
+        pass.step(&mut ctx).await.unwrap();
+        pass.load_state(&store, "dag-1").await.unwrap().unwrap()
+    }
+
+    /// The p05 case, and the reason the objective is a setting.
+    ///
+    /// Ten of eleven candidates there cut total query time --- the best by
+    /// 27.7% --- and every one of them lengthened the critical path. Searching
+    /// by duplicate computation while accepting on wall clock found all ten and
+    /// promoted none.
+    #[tokio::test]
+    async fn query_time_promotes_a_candidate_that_trades_wall_clock_for_work() {
+        let after = trial_under(HmpObjective::QueryTime, 2000, 3000).await;
+        assert_eq!(
+            after.best_combo,
+            vec!["cand".to_string()],
+            "it cut node time 5000ms -> 3000ms, which is the objective"
+        );
+        assert_eq!(after.best_node_time_ms, 3000);
+        assert_eq!(
+            after.best_ms, 2000,
+            "the measure that is not the objective still tracks the winner"
+        );
+    }
+
+    /// The same trial, the same numbers, the other objective --- rejected.
+    #[tokio::test]
+    async fn makespan_rejects_the_candidate_query_time_promotes() {
+        let after = trial_under(HmpObjective::Makespan, 2000, 3000).await;
+        assert_eq!(
+            after.best_combo,
+            vec!["kept".to_string()],
+            "it doubled wall clock 1000ms -> 2000ms, whatever it did to the sum"
+        );
+        assert_eq!(after.best_ms, 1000, "the incumbent stands");
+    }
+
     /// A cancelled iteration must carry what it actually cost, in parts.
     ///
     /// `runtime_ms` there is the censoring level -- "at least this slow" --
@@ -3288,6 +3786,7 @@ mod tests {
         state.in_flight = Some(InFlight {
             combo: vec!["v".to_string()],
             sig: "sig-1".to_string(),
+            makespan_s: None,
         });
         pass.save_state(&store, "dag-1", &state).await.unwrap();
 
@@ -3499,7 +3998,7 @@ mod tests {
         // declines to price anything it is handed.
 
         let working_set = vec!["a".to_string(), "b".to_string()];
-        let candidates = pass.build_candidates(&dag, &working_set).await;
+        let candidates = pass.build_candidates(&dag, &working_set, None).await;
 
         assert!(
             !candidates.is_empty(),

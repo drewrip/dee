@@ -28,7 +28,8 @@ use dee::dag::Dag;
 use dee::executor::Executor;
 use dee::opt::store::OptStore;
 use dee::opt::{
-    Optimization, OptimizationType, RunContext, StepContext, StepOutcome, StepPhase, registry,
+    BudgetMetric, Optimization, OptimizationType, RunContext, StepContext, StepOutcome, StepPhase,
+    registry,
 };
 
 use crate::error::ServerError;
@@ -56,6 +57,8 @@ pub struct InstalledTrial {
     pub label: String,
     /// Cancel the run once it has taken this long.
     pub budget_ms: Option<i64>,
+    /// Which measure `budget_ms` caps --- see [`BudgetMetric`].
+    pub budget_metric: BudgetMetric,
     /// The DAG to finish the run under if the candidate is cancelled: that
     /// search's incumbent. Without one there is nothing better to fall back to,
     /// and the candidate is measured to completion however slow it turns out --
@@ -196,6 +199,7 @@ where
             Ok(StepOutcome::Trial {
                 label,
                 budget_ms,
+                budget_metric,
                 fallback,
                 reuse,
                 ..
@@ -205,6 +209,7 @@ where
                     name: stepper.name.clone(),
                     label,
                     budget_ms,
+                    budget_metric,
                     fallback,
                     reuse,
                 });

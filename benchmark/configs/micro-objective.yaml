@@ -1,0 +1,56 @@
+# Microbenchmark: does the objective actually change what HMP does?
+#
+# One cell, run twice -- once per objective -- with early cancellation ON. That
+# last part is the point of this config. A trial is cancelled once it overruns
+# the incumbent, and *which measure it overran* now follows the objective:
+#
+#   makespan   -> a wall-clock deadline, enforced mid-node
+#   query_time -> a total-node-time cap, checked as each node completes
+#
+# The two are not interchangeable on a DAG with any concurrency. p05 runs eight
+# nodes wide, so its work total passes a cap long before its clock does; a
+# search optimizing work that cancelled on the clock would keep candidates that
+# are burning the machine and cancel ones that are not.
+#
+#   dee-bench run -c configs/micro-objective.yaml
+name: micro-objective
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/micro-objective
+verbosity: detailed
+
+matrix:
+  project: [p05_hr]
+  backend: [duckdb]
+  sf: [1]
+  variant: [makespan, query_time]
+
+variants:
+  makespan:
+    passes: [hmp]
+    hmp_cost_method: dup_attribution
+    hmp_objective: makespan
+  query_time:
+    passes: [hmp]
+    hmp_cost_method: dup_attribution
+    hmp_objective: query_time
+
+dee_opt:
+  hmp_max_runs: 12
+  hmp_dup_cost_model: learned_cost
+  hmp_top_cpu_time: 1.0
+  hmp_use_pushdown: false
+
+  # Early cancellation ON. The whole point of this run.
+  trial_resume: true
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 1
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

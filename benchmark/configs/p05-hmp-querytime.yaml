@@ -1,0 +1,54 @@
+# The same cell as `p05-hmp-noresume.yaml`, searched for the other objective.
+#
+# `hmp_objective: query_time` ranks candidates by duplicate computation removed
+# and promotes a trial that beats the incumbent's `node_time_ms`. The default,
+# `makespan`, ranks by predicted wall clock and promotes on `runtime_ms`. On
+# p05 the two disagree about every candidate: ten of eleven cut total query
+# time and all eleven lengthened the critical path. Run both and diff.
+#
+# HMP alone against p05_hr on DuckDB at sf=1, twelve runs, with early
+# termination OFF. That last part is the point: with `trial_resume` on (the
+# default) a candidate is cancelled the moment it overruns the incumbent, and
+# the iteration's `runtime_ms` is recorded as the censoring level rather than a
+# measurement -- so makespan cannot be read off it at all. Every candidate here
+# runs to completion, so both `runtime_ms` and `node_time_ms` are real.
+#
+#   dee-bench run -c configs/p05-hmp-querytime.yaml
+name: p05-hmp-querytime
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/p05-hmp-querytime
+verbosity: detailed
+
+matrix:
+  project: [p05_hr]
+  backend: [duckdb]
+  sf: [1]
+  variant: [hmp]
+
+variants:
+  hmp:
+    passes: [hmp]
+    hmp_cost_method: dup_attribution
+
+dee_opt:
+  hmp_max_runs: 12
+  hmp_dup_cost_model: learned_cost
+  hmp_top_cpu_time: 1.0
+  hmp_use_pushdown: false
+  hmp_objective: query_time
+
+  # No early termination: every candidate runs to completion, so the makespan
+  # recorded for it is the makespan it actually had.
+  trial_resume: false
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 1
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

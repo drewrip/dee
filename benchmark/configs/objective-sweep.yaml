@@ -1,0 +1,51 @@
+# Does the objective change HMP's answer across DAGs, not just on p05?
+#
+# Five dag-bench projects x both objectives, early cancellation ON. p05 is the
+# DAG every design decision here was made against, so it cannot also be the
+# evidence; the other four are the test of whether any of it generalizes.
+#
+# What to read off it:
+#   * does each objective improve the measure it is optimizing?
+#   * does it damage the other one, and by how much?
+#   * do the two objectives promote different combinations?
+#
+#   dee-bench run -c configs/objective-sweep.yaml
+name: objective-sweep
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/objective-sweep
+verbosity: detailed
+
+matrix:
+  project: [p02_adtech, p03_ecommerce, p05_hr, p07_saas, p09_gaming]
+  backend: [duckdb]
+  sf: [1]
+  variant: [makespan, query_time]
+
+variants:
+  makespan:
+    passes: [hmp]
+    hmp_cost_method: dup_attribution
+    hmp_objective: makespan
+  query_time:
+    passes: [hmp]
+    hmp_cost_method: dup_attribution
+    hmp_objective: query_time
+
+dee_opt:
+  hmp_max_runs: 10
+  hmp_dup_cost_model: learned_cost
+  hmp_top_cpu_time: 1.0
+  hmp_use_pushdown: false
+  trial_resume: true
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 1
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

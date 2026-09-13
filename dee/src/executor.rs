@@ -78,6 +78,18 @@ pub struct RunOptions {
     /// flight -- a DAG whose cost is one dominant node cannot be cut short at
     /// all.
     pub budget: Option<std::time::Duration>,
+    /// Stop the run once every finished node's duration sums past this.
+    ///
+    /// Total work rather than wall clock, for a search optimizing the former:
+    /// a DAG whose nodes run concurrently can pass this long before the clock
+    /// notices, and a search that cancels on the clock would keep a candidate
+    /// that is burning the machine.
+    ///
+    /// Checked as each node completes, which is the only place the sum
+    /// changes. That makes it strictly coarser than `budget`: a node already
+    /// running cannot be interrupted, so the overrun is bounded by the
+    /// concurrent work in flight rather than by nothing.
+    pub node_time_budget: Option<std::time::Duration>,
     /// Nodes whose relations already exist and must not be rebuilt. Their
     /// dependents become runnable exactly as if they had just finished.
     pub skip: HashSet<String>,
@@ -92,6 +104,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             budget: None,
+            node_time_budget: None,
             skip: HashSet::new(),
             cleanup_on_cancel: true,
         }
@@ -453,6 +466,25 @@ where
                 in_progress.remove(&node_id);
                 work_graph.remove(node_id.clone());
                 node_stats.insert(node_id.clone(), stats);
+                // The work total only moves when a node finishes, so this is
+                // the only place it can be tested. Same `StopReason` as the
+                // clock: from the caller's side a budget stop is a budget stop,
+                // and which cap bound it is the caller's own setting.
+                if let Some(cap) = opts.node_time_budget {
+                    let spent: i64 = node_stats
+                        .values()
+                        .map(|s| s.duration.num_milliseconds())
+                        .sum();
+                    if spent as u128 > cap.as_millis() {
+                        debug!(
+                            "SimpleEngine: node-time budget exhausted ({spent}ms against \
+                             {}ms), stopping execution",
+                            cap.as_millis()
+                        );
+                        stopped = Some(StopReason::Budget);
+                        break;
+                    }
+                }
                 completed.insert(node_id.clone());
                 finished += 1;
                 debug!("finished {}/{} nodes", finished, initial_size);
@@ -1063,6 +1095,64 @@ mod tests {
             .new_relation(MaterializeMode::Table, "slow".into(), "SELECT 1 AS n".into())
             .await
             .expect("the relation could not be rebuilt after the cancelled run");
+    }
+
+    /// A node-time budget binds on total work, which is the point: eight nodes
+    /// running concurrently pass a work cap long before the clock notices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_a_node_time_budget_stops_on_work_rather_than_wall_clock() {
+        let engine = engine().await;
+        let dag = wide_dag(8, None);
+        let started = std::time::Instant::now();
+        let outcome = engine
+            .run_with(
+                &dag,
+                RunOptions {
+                    // Far less work than eight of these nodes add up to.
+                    node_time_budget: Some(Duration::from_millis(150)),
+                    cleanup_on_cancel: false,
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .expect("run");
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome.stopped, Some(StopReason::Budget));
+        assert!(
+            outcome.completed.len() < 8,
+            "the work cap did not bind: every node finished"
+        );
+        let spent: i64 = outcome
+            .stats
+            .node_stats
+            .values()
+            .map(|s| s.duration.num_milliseconds())
+            .sum();
+        assert!(spent > 150, "it stopped before the cap was reached: {spent}ms");
+        // The distinction being tested. Concurrency means the work total
+        // outruns the clock, so a wall-clock budget of the same size would not
+        // have bound here at all.
+        eprintln!("node-time stop: {spent}ms of work in {elapsed:?} of wall clock");
+    }
+
+    /// A cap nothing reaches must not cancel anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_a_generous_node_time_budget_lets_the_run_finish() {
+        let engine = engine().await;
+        let dag = wide_dag(2, None);
+        let outcome = engine
+            .run_with(
+                &dag,
+                RunOptions {
+                    node_time_budget: Some(Duration::from_secs(600)),
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .expect("run");
+        assert_eq!(outcome.stopped, None);
+        assert_eq!(outcome.completed.len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

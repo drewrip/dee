@@ -76,6 +76,19 @@ pub enum CliSubtreeCostMethod {
     Operators,
 }
 
+/// Which measure the HMP search minimizes.
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum CliHmpObjective {
+    /// Wall clock. Orders candidates by predicted makespan and promotes a
+    /// trial that beats the incumbent's runtime.
+    Makespan,
+    /// Total work: every node's duration summed. Orders candidates by
+    /// duplicate computation removed and promotes a trial that beats the
+    /// incumbent's node time.
+    #[value(name = "query_time", alias = "query-time")]
+    QueryTime,
+}
+
 #[derive(Args, Clone, Debug)]
 pub struct OptimizerArgs {
     /// Passes to run, starting from everything off. Comma separated:
@@ -121,6 +134,9 @@ pub struct OptimizerArgs {
     /// HMP: what the dup_attribution cost method prices a plan region with.
     #[arg(long)]
     pub hmp_dup_cost_model: Option<CliSubtreeCostMethod>,
+    /// HMP: which measure the search minimizes.
+    #[arg(long)]
+    pub hmp_objective: Option<CliHmpObjective>,
     /// HMP: candidate combinations to price before spending any DAG run.
     #[arg(long)]
     pub hmp_search_budget: Option<usize>,
@@ -264,6 +280,13 @@ impl OptimizerArgs {
                 CliSubtreeCostMethod::LearnedCost => json!("learned_cost"),
                 CliSubtreeCostMethod::Cardinality => json!("cardinality"),
                 CliSubtreeCostMethod::Operators => json!("operators"),
+            }),
+        );
+        set(
+            "hmp_objective",
+            self.hmp_objective.as_ref().map(|o| match o {
+                CliHmpObjective::Makespan => json!("makespan"),
+                CliHmpObjective::QueryTime => json!("query_time"),
             }),
         );
         set("hmp_search_budget", self.hmp_search_budget.map(|v| json!(v)));

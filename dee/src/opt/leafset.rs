@@ -310,6 +310,8 @@ mod tests {
             aggregates: Vec::new(),
             relation: Some(relation.into()),
             subplan: None,
+            rows_scanned: None,
+            total_execution_time_s: None,
             children: Vec::new(),
         }
     }
@@ -324,6 +326,8 @@ mod tests {
             aggregates: Vec::new(),
             relation: None,
             subplan: None,
+            rows_scanned: None,
+            total_execution_time_s: None,
             children,
         }
     }

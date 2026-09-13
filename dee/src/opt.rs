@@ -1,4 +1,5 @@
 pub mod combo;
+pub mod makespan;
 pub mod common;
 pub mod dup;
 pub mod explain;
@@ -29,7 +30,7 @@ use crate::{
     executor::{Executor, ExecutorError, RunOptions, StopReason},
     opt::{
         dup::SubtreeCostMethod,
-        hmp::HmpCostMethod,
+        hmp::{HmpCostMethod, HmpObjective},
         omp::OMPCentrality,
         resume::ReusePolicy,
     },
@@ -48,7 +49,8 @@ pub use crate::opt::report::{
     PassDetail, PassOutcome, PassReport, PushdownDetail, PushdownOutcome, RungResult,
 };
 pub use crate::opt::step::{
-    OptimizationType, RegisterContext, ResumeTiming, RunContext, StepContext, StepOutcome,
+    BudgetMetric, OptimizationType, RegisterContext, ResumeTiming, RunContext, StepContext,
+    StepOutcome,
     StepPhase, run_phase,
 };
 pub use crate::opt::store::{OptStore, OptStoreError, Registration};
@@ -464,21 +466,29 @@ where
 
             // What the pass asked for: a cap on how far this candidate may
             // overrun, and the DAG to finish the run under if it does.
-            let (budget_ms, fallback) = match &before {
+            let (budget_ms, budget_metric, fallback) = match &before {
                 Some(StepOutcome::Trial {
                     budget_ms,
+                    budget_metric,
                     fallback,
                     ..
-                }) => (*budget_ms, fallback.clone()),
-                _ => (None, None),
+                }) => (*budget_ms, *budget_metric, fallback.clone()),
+                _ => (None, BudgetMetric::default(), None),
             };
-            let budget = self
+            let cap = self
                 .config
                 .trial_resume
                 .then_some(budget_ms)
                 .flatten()
                 .filter(|ms| *ms > 0)
                 .map(|ms| std::time::Duration::from_millis(ms as u64));
+            // The same cap, routed to whichever measure the pass is capping.
+            // Exactly one is ever set: a run under two budgets would be
+            // cancelled by whichever bound first, which is neither of them.
+            let (budget, node_time_budget) = match budget_metric {
+                BudgetMetric::WallClock => (cap, None),
+                BudgetMetric::NodeTime => (None, cap),
+            };
 
             let outcome = self
                 .engine
@@ -486,8 +496,9 @@ where
                     &working,
                     RunOptions {
                         budget,
+                        node_time_budget,
                         // Whatever the trial built is what the resume reuses.
-                        cleanup_on_cancel: budget.is_none(),
+                        cleanup_on_cancel: cap.is_none(),
                         ..RunOptions::default()
                     },
                 )
@@ -539,7 +550,8 @@ where
                                 // A delivery must not be cut short again, but a
                                 // pathological engine state must not hang the
                                 // caller either.
-                                budget: budget.map(|b| b * RESUME_BUDGET_MULTIPLE),
+                                budget: cap.map(|b| b * RESUME_BUDGET_MULTIPLE),
+                                node_time_budget: None,
                                 cleanup_on_cancel: false,
                             },
                         )
@@ -722,6 +734,18 @@ pub struct OptimizerConfig {
     /// HMP: what the `dup_attribution` cost method prices a plan region with.
     /// Ignored by every other method, none of which has a notion of a region.
     pub hmp_dup_cost_model: SubtreeCostMethod,
+    /// HMP: which measure the search minimizes.
+    ///
+    /// `makespan` (the default) orders candidates by predicted wall clock and
+    /// promotes a trial that beats the incumbent's `runtime_ms`. `query_time`
+    /// orders them by duplicate computation removed and promotes a trial that
+    /// beats the incumbent's `node_time_ms`.
+    ///
+    /// The two disagree in practice: materializing a View always cuts the sum
+    /// of node durations and usually lengthens the critical path, so a search
+    /// that ranks by one and promotes on the other finds improvements it then
+    /// refuses. This picks both ends at once.
+    pub hmp_objective: HmpObjective,
     pub hmp_use_pushdown: bool,
     /// HMP: how many candidate combinations the search may price before it
     /// starts spending DAG runs on them.
@@ -860,6 +884,7 @@ impl Default for OptimizerConfig {
             hmp_normalize_with_cardinality: false,
             hmp_cost_method: HmpCostMethod::default(),
             hmp_dup_cost_model: SubtreeCostMethod::default(),
+            hmp_objective: HmpObjective::default(),
             hmp_use_pushdown: true,
             hmp_search_budget: 32,
             profile_iterations: false,
@@ -1033,6 +1058,12 @@ impl OptimizerConfig {
     /// What the `dup_attribution` cost method prices a plan region with.
     pub fn with_hmp_dup_cost_model(mut self, model: SubtreeCostMethod) -> Self {
         self.hmp_dup_cost_model = model;
+        self
+    }
+
+    /// Which measure the HMP search minimizes.
+    pub fn with_hmp_objective(mut self, objective: HmpObjective) -> Self {
+        self.hmp_objective = objective;
         self
     }
 

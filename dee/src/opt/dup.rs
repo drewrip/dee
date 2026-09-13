@@ -168,6 +168,23 @@ pub trait SubtreeCost: Send + Sync {
     /// `None` when this model cannot price these operators at all --- which is
     /// not a cost of zero, and must not be read as one.
     fn cost(&self, roots: &[PlanNode]) -> Option<f64>;
+
+    /// What writing this region's `rows` out as a table costs, on top of
+    /// computing it, through the write path named by `path`.
+    ///
+    /// `path` is how the engine says it would persist this region ---
+    /// [`Connector::write_path_for`](crate::connectors::Connector::write_path_for)
+    /// --- because an engine can have several at very different cost per byte,
+    /// and the region itself is a View that has never been written, so its own
+    /// plan names no sink.
+    ///
+    /// Defaults to `None`: most models price plan operators, and a write
+    /// operator's output is a one-row count of what it wrote rather than the
+    /// payload, so there is nothing in the plan to fit. `None` means *this
+    /// model does not know*, not that writing is free.
+    fn write_cost(&self, _path: &str, _roots: &[PlanNode], _rows: f64) -> Option<f64> {
+        None
+    }
 }
 
 /// Seconds, via the learned seconds-per-byte constants.
@@ -176,6 +193,10 @@ pub struct LearnedSubtreeCost<'a>(pub &'a LearnedCostModel);
 impl SubtreeCost for LearnedSubtreeCost<'_> {
     fn cost(&self, roots: &[PlanNode]) -> Option<f64> {
         self.0.cost(roots)
+    }
+
+    fn write_cost(&self, path: &str, roots: &[PlanNode], rows: f64) -> Option<f64> {
+        self.0.write_cost(path, roots, rows)
     }
 }
 
@@ -217,6 +238,30 @@ impl SubtreeCost for OperatorCountSubtreeCost {
     }
 }
 
+/// What building one member of a set costs.
+///
+/// `compute` and `write` are kept apart because only `compute` is measured the
+/// same way the consumer side is, and only `compute` may enter
+/// [`DuplicateCost::duplicate`] --- mixing a modelled write into that
+/// subtraction would change what the number has always meant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemberBuild {
+    pub view: String,
+    /// The member's own region in the build probe. Sums to
+    /// [`DuplicateCost::build_once`].
+    pub compute: f64,
+    /// Writing the result out as a table, from the cost model's write constant.
+    ///
+    /// `None` when the model has no write constant to apply, which is not a
+    /// write that is free. Materializing a multi-million-row View is mostly
+    /// the write: measured on `p05_hr`, building `stg_employees` takes 2.0s
+    /// against 0.17s of modelled compute. A schedule built on the compute
+    /// alone is not merely imprecise, it is wrong by an order of magnitude and
+    /// wrong in one direction, so callers that need a duration must refuse the
+    /// estimate rather than substitute a zero.
+    pub write: Option<f64>,
+}
+
 /// What a *set* of Views duplicates between them, and the numbers behind it.
 ///
 /// The components are kept rather than just the difference because the
@@ -236,9 +281,22 @@ pub struct DuplicateCost {
     /// nested inside a downstream member's, so summing standalone plans counts
     /// the shared work once per member. See [`build_once_cost`].
     pub build_once: f64,
+    /// Per-member breakdown of `build_once`, in `views` order.
+    ///
+    /// The sum of the `compute` terms is exactly `build_once`. Kept because a
+    /// set on one chain builds its members *in sequence*, and a schedule needs
+    /// the terms rather than the total.
+    pub build_per_member: Vec<MemberBuild>,
     /// `(consumer node, what that consumer's plan spends on every member it can
     /// see)`, sorted by consumer for a stable report.
     pub per_consumer: Vec<(String, f64)>,
+    /// `(consumer node, what that consumer's *whole* plan costs)`, same order as
+    /// `per_consumer`.
+    ///
+    /// Subtracting `per_consumer` leaves the work that survives materializing
+    /// the set --- what the consumer would still do once its members are tables
+    /// it merely scans.
+    pub consumer_total: Vec<(String, f64)>,
     /// `sum(per_consumer) - build_once`: the computation that would stop
     /// happening if every member were built once.
     ///
@@ -247,6 +305,20 @@ pub struct DuplicateCost {
     /// pushing their predicates and projections into them --- than it would
     /// standing alone, so materializing them would *add* work.
     pub duplicate: f64,
+    /// What materializing every member would cost to *write*, summed.
+    ///
+    /// Deliberately outside [`Self::duplicate`], which stays what it has always
+    /// been: a difference between two quantities measured the same way, with no
+    /// modelled term in it. The write belongs to the decision rather than to
+    /// that subtraction --- materializing a View removes `duplicate` of repeated
+    /// work and adds this much new work, so the net change in total query time
+    /// is `duplicate - write_total`, and that is what a query-time ranking
+    /// should sort on.
+    ///
+    /// `None` unless every member could be priced. A partial sum would
+    /// understate the charge and silently favour the very candidates whose
+    /// writes could not be priced, which are the ones most likely to be large.
+    pub write_total: Option<f64>,
 }
 
 /// The CTE name a View is inlined under.
@@ -353,7 +425,7 @@ async fn build_once_cost<C>(
     bodies: &HashMap<String, String>,
     coster: &dyn SubtreeCost,
     dialect: polyglot_sql::dialects::DialectType,
-) -> Option<f64>
+) -> Option<Vec<MemberBuild>>
 where
     C: Connector + Send + Sync,
 {
@@ -378,12 +450,44 @@ where
     };
     let plans = conn.parse_plan(&plan_json)?;
 
-    let mut total = 0.0;
+    let mut builds = Vec::with_capacity(order.len());
     for v in order {
         let region = find_subplan(&plans, &cte_name(v))?;
-        total += coster.cost(std::slice::from_ref(region))?;
+        let compute = coster.cost(std::slice::from_ref(region))?;
+        // The region's own root cardinality is how many rows the member would
+        // write. A model that does not price writes contributes nothing here
+        // rather than refusing the whole measurement: `compute` is the part
+        // `duplicate` is built from, and it is already in hand.
+        // Which sink the engine would give this member, asked of the engine:
+        // it decides during planning and names the sink when the statement it
+        // is handed is the write rather than the `SELECT` under it, which costs
+        // one more EXPLAIN and is exact. The probe plan above cannot answer --
+        // it defines each member as a materialized CTE, and a CTE is tagged
+        // `CTE`, not a write -- so this is its own call.
+        //
+        // No fallback. An engine that will not name the path leaves the write
+        // unpriced, which is not a write of zero: `makespan::estimate` refuses
+        // a build it cannot price rather than charging it as free, and that is
+        // the behaviour wanted here. Guessing the path from the shape of the
+        // `SELECT` was tried and removed -- a guess that reads like a
+        // measurement downstream is worse than no answer.
+        let write = match conn.write_path_for(bodies.get(v)?).await {
+            Ok(Some(path)) => region
+                .rows()
+                .and_then(|rows| coster.write_cost(&path, std::slice::from_ref(region), rows)),
+            Ok(None) => None,
+            Err(e) => {
+                warn!("dup: could not ask {} which write path it would use: {e}", v);
+                None
+            }
+        };
+        builds.push(MemberBuild {
+            view: v.clone(),
+            compute,
+            write,
+        });
     }
-    Some(total)
+    Some(builds)
 }
 
 /// Attribute the duplicate computation of a *set* of Views, by planning each of
@@ -462,12 +566,14 @@ where
     }
 
     let bodies = member_bodies(&minor, &set, dialect)?;
-    let build_once = build_once_cost(conn, &order, &bodies, coster, dialect).await?;
+    let build_per_member = build_once_cost(conn, &order, &bodies, coster, dialect).await?;
+    let build_once: f64 = build_per_member.iter().map(|b| b.compute).sum();
 
     let mut consumers: Vec<String> = frontier.into_iter().collect();
     consumers.sort();
 
     let mut per_consumer: Vec<(String, f64)> = Vec::new();
+    let mut consumer_total: Vec<(String, f64)> = Vec::new();
     for consumer in consumers {
         let members = match visible.get(&consumer) {
             Some(m) => m.clone(),
@@ -496,7 +602,7 @@ where
         // would be a partial sum masquerading as a total. No region means the
         // engine did not keep the CTE as one; charging the consumer for the rest
         // would understate what it pays rather than admit to not knowing.
-        let mut consumer_total = 0.0;
+        let mut member_regions = 0.0;
         let mut complete = true;
         for v in &members {
             let Some(region) = find_subplan(&plans, &cte_name(v)) else {
@@ -512,10 +618,18 @@ where
                 complete = false;
                 break;
             };
-            consumer_total += cost;
+            member_regions += cost;
         }
         if complete {
-            per_consumer.push((consumer, consumer_total));
+            // The whole plan, not just the member regions: what is left after
+            // subtracting them is the work this consumer keeps doing once the
+            // members are tables, which is what a schedule needs. Priced from
+            // the plan already in hand, so it costs no extra EXPLAIN. A model
+            // that declines the whole plan falls back to the member regions,
+            // leaving a residual of zero rather than dropping the consumer.
+            let whole = coster.cost(&plans).unwrap_or(member_regions);
+            per_consumer.push((consumer.clone(), member_regions));
+            consumer_total.push((consumer, whole.max(member_regions)));
         }
     }
 
@@ -525,6 +639,10 @@ where
 
     let total: f64 = per_consumer.iter().map(|(_, c)| c).sum();
     let duplicate = total - build_once;
+    let write_total = build_per_member
+        .iter()
+        .map(|b| b.write)
+        .sum::<Option<f64>>();
     debug!(
         "dup({order:?}) = {total:.4} - {build_once:.4} = {duplicate:.4} over {} consumer(s)",
         per_consumer.len()
@@ -532,8 +650,11 @@ where
     Some(DuplicateCost {
         views: order,
         build_once,
+        build_per_member,
         per_consumer,
+        consumer_total,
         duplicate,
+        write_total,
     })
 }
 
@@ -764,6 +885,52 @@ mod tests {
         .await
         .unwrap();
         conn
+    }
+
+    /// The write is summed for the ranking but stays out of `duplicate`, which
+    /// remains a difference between two quantities measured the same way.
+    #[tokio::test]
+    async fn the_write_is_summed_beside_duplicate_not_inside_it() {
+        let conn = engine_with_raw().await;
+        let dag = dag_of(vec![
+            node("v", MaterializeMode::View, &["raw"], "SELECT g, sum(amt) AS total FROM raw GROUP BY g"),
+            node("m1", MaterializeMode::Table, &["v"], "SELECT count(*) AS n FROM v"),
+            node("m2", MaterializeMode::Table, &["v"], "SELECT max(total) AS biggest FROM v"),
+        ]);
+        // `CardinalitySubtreeCost` prices no writes at all, so the total is
+        // unknown rather than zero -- and `duplicate` is unaffected either way.
+        let d = duplicate_cost_set(conn.as_ref(), &dag, &["v".to_string()], &CardinalitySubtreeCost)
+            .await
+            .expect("priced");
+        assert!(
+            d.write_total.is_none(),
+            "a model that prices no writes reported a write total"
+        );
+        assert!(d.duplicate > 0.0, "duplicate still comes from compute alone");
+        assert_eq!(d.build_per_member.len(), 1);
+        assert!(d.build_per_member[0].write.is_none());
+    }
+
+    /// A set is only charged a write total when every member has one. A partial
+    /// sum would understate the charge and favour exactly the members whose
+    /// writes could not be priced.
+    #[test]
+    fn a_partly_priced_set_reports_no_write_total() {
+        let priced = |w: Option<f64>| MemberBuild {
+            view: "v".to_string(),
+            compute: 1.0,
+            write: w,
+        };
+        let all: Option<f64> = [priced(Some(1.0)), priced(Some(2.0))]
+            .iter()
+            .map(|b| b.write)
+            .sum();
+        assert_eq!(all, Some(3.0));
+        let partial: Option<f64> = [priced(Some(1.0)), priced(None)]
+            .iter()
+            .map(|b| b.write)
+            .sum();
+        assert_eq!(partial, None, "a partial sum was reported as a total");
     }
 
     /// Two consumers, each of which computes the View. The duplicate is what
@@ -1043,6 +1210,9 @@ mod tests {
                 )
                 .await
                 .expect("the probe should price")
+                .iter()
+                .map(|b| b.compute)
+                .sum::<f64>()
             }
         };
 
@@ -1074,7 +1244,10 @@ mod tests {
             dialect,
         )
         .await
-        .expect("the probe should price");
+        .expect("the probe should price")
+        .iter()
+        .map(|b| b.compute)
+        .sum::<f64>();
 
         let standalone = OperatorCountSubtreeCost
             .cost(
@@ -1088,6 +1261,60 @@ mod tests {
             probed, standalone,
             "the probe region should be the view's own plan and nothing else"
         );
+    }
+
+    /// The per-member breakdown is the same measurement `build_once` always
+    /// was, just not yet added up.
+    #[tokio::test]
+    async fn build_per_member_sums_to_build_once() {
+        let conn = engine_with_raw().await;
+        let dag = nested_dag();
+        realize(&conn, &dag, &["salary", "profile"]).await;
+
+        let d = duplicate_cost_set(
+            conn.as_ref(),
+            &dag,
+            &["salary".to_string(), "profile".to_string()],
+            &CardinalitySubtreeCost,
+        )
+        .await
+        .expect("the nested pair should price");
+
+        assert_eq!(d.build_per_member.len(), d.views.len());
+        let summed: f64 = d.build_per_member.iter().map(|b| b.compute).sum();
+        assert!(
+            (summed - d.build_once).abs() < 1e-6,
+            "build_once must stay exactly the sum of the compute terms: \
+             {summed} vs {}",
+            d.build_once
+        );
+    }
+
+    /// The residual a schedule is built from --- the whole plan minus the member
+    /// regions --- must never come out negative.
+    #[tokio::test]
+    async fn the_consumer_total_covers_its_member_regions() {
+        let conn = engine_with_raw().await;
+        let dag = nested_dag();
+        realize(&conn, &dag, &["salary", "profile"]).await;
+
+        let d = duplicate_cost_set(
+            conn.as_ref(),
+            &dag,
+            &["salary".to_string(), "profile".to_string()],
+            &CardinalitySubtreeCost,
+        )
+        .await
+        .expect("the nested pair should price");
+
+        assert_eq!(d.consumer_total.len(), d.per_consumer.len());
+        for ((c1, whole), (c2, regions)) in d.consumer_total.iter().zip(&d.per_consumer) {
+            assert_eq!(c1, c2, "the two lists must stay in step");
+            assert!(
+                whole >= regions,
+                "'{c1}' spends {regions} on its members out of a {whole} plan"
+            );
+        }
     }
 
     /// Two members whose bare names collide must not be measured as one.
