@@ -31,6 +31,7 @@ use crate::{
     executor::{Executor, ExecutorError, RunOptions, StopReason},
     opt::{
         dup::SubtreeCostMethod,
+        combo::Objective,
         hmp::{HmpCostMethod, HmpObjective},
         omp::OMPCentrality,
         resume::ReusePolicy,
@@ -67,6 +68,16 @@ pub enum OptimizerError {
     Store(#[from] OptStoreError),
     #[error("unknown optimization '{0}'")]
     Unknown(String),
+    /// A configuration that cannot mean anything coherent -- two settings that
+    /// contradict each other, say.
+    ///
+    /// Separate from `Exec` because nothing went wrong at run time: the DAG is
+    /// fine and the engine is fine, and the right response is to fix the
+    /// config rather than to retry. Raised at the config boundaries by
+    /// [`OptimizerConfig::validate`] and again by the pass itself, which is the
+    /// backstop for a config row written before the validation existed.
+    #[error("optimizer configuration: {0}")]
+    Config(String),
 }
 
 /// One optimization dee can apply to a DAG.
@@ -789,6 +800,55 @@ pub struct OptimizerConfig {
     /// plain. A name matches either as the full node ID or as its bare table
     /// name. `None` leaves the defaults in charge.
     pub nodefusion_materialize_ctes_override: Option<Vec<String>>,
+    /// NodeFusion: choose the materialized-CTE set by measurement rather than
+    /// by rule -- the `adaptive` variant.
+    ///
+    /// Turns NodeFusion from a free rewrite into a search. It measures a
+    /// baseline fusion under the default rule, ranks candidate sets of CTEs by
+    /// [`Self::nodefusion_objective`], trials them one per DAG run, and
+    /// promotes the winner -- the same shape HMP has, over CTEs inside one
+    /// fused query instead of over Views made into tables.
+    ///
+    /// **Incompatible with [`Self::nodefusion_naive_materialize_ctes`]**, which
+    /// is the reader-count floor this exists to beat; running both would mean
+    /// the search's own baseline had the rule already applied, so it would be
+    /// measuring the wrong control. Also incompatible with
+    /// [`Self::nodefusion_materialize_ctes_override`], which pins the exact set
+    /// the search exists to find. Both are rejected by [`Self::validate`]
+    /// rather than silently resolved.
+    pub nodefusion_adaptive_materialize_ctes: bool,
+    /// NodeFusion: which measure the adaptive search minimizes.
+    ///
+    /// The same tension HMP has, one level down. Materializing a CTE stops the
+    /// fused query recomputing it for every reader and inserts a barrier its
+    /// readers must wait on, so it cuts total work and can lengthen the path
+    /// through the `WITH` chain.
+    pub nodefusion_objective: Objective,
+    /// NodeFusion: how many candidate CTE sets the adaptive search may price
+    /// before it starts spending DAG runs on them. EXPLAIN-only, so far
+    /// cheaper than measuring.
+    pub nodefusion_search_budget: usize,
+    /// NodeFusion: DAG executions the adaptive search may spend, baseline
+    /// included.
+    pub nodefusion_max_runs: usize,
+    /// NodeFusion: the share of total ranking score the adaptive working set
+    /// covers -- the prefix of the ranking worth searching.
+    pub nodefusion_top_share: f64,
+    /// NodeFusion: how the adaptive search prices a region of a fused plan.
+    pub nodefusion_cost_model: SubtreeCostMethod,
+    /// NodeFusion: what spooling a MATERIALIZED CTE costs, in seconds per
+    /// byte, replacing the modelled rate outright.
+    ///
+    /// The escape hatch, and what a calibration experiment writes into. `None`
+    /// leaves [`Self::nodefusion_spool_cost_factor`] in charge.
+    pub nodefusion_spool_seconds_per_byte: Option<f64>,
+    /// NodeFusion: what spooling a MATERIALIZED CTE costs, as a fraction of
+    /// what writing the same rows to a table costs.
+    ///
+    /// `None` takes the per-dialect default from
+    /// [`crate::opt::common::default_spool_factor`] -- a modelled guess rather
+    /// than a measurement, which is why it is reachable from a config at all.
+    pub nodefusion_spool_cost_factor: Option<f64>,
     /// ParallelismTuning: the node-concurrency caps to measure. Rungs that
     /// cannot bind on the DAG in front of them -- at or above its node count,
     /// or equal to its current setting -- are dropped rather than tried.
@@ -923,6 +983,14 @@ impl Default for OptimizerConfig {
             nodefusion_materialize_ctes: false,
             nodefusion_naive_materialize_ctes: false,
             nodefusion_materialize_ctes_override: None,
+            nodefusion_adaptive_materialize_ctes: false,
+            nodefusion_objective: Objective::default(),
+            nodefusion_search_budget: 32,
+            nodefusion_max_runs: 1,
+            nodefusion_top_share: 0.5,
+            nodefusion_cost_model: SubtreeCostMethod::default(),
+            nodefusion_spool_seconds_per_byte: None,
+            nodefusion_spool_cost_factor: None,
             // Off by default like Pushdown: it spends DAG runs, and the
             // ladder is only worth its cost where node-level concurrency is
             // actually contended.
@@ -1160,6 +1228,125 @@ impl OptimizerConfig {
     pub fn with_nodefusion_materialize_ctes_override(mut self, nodes: Option<Vec<String>>) -> Self {
         self.nodefusion_materialize_ctes_override = nodes;
         self
+    }
+
+    pub fn with_nodefusion_adaptive_materialize_ctes(mut self, adaptive: bool) -> Self {
+        self.nodefusion_adaptive_materialize_ctes = adaptive;
+        self
+    }
+
+    pub fn with_nodefusion_objective(mut self, objective: Objective) -> Self {
+        self.nodefusion_objective = objective;
+        self
+    }
+
+    pub fn with_nodefusion_search_budget(mut self, budget: usize) -> Self {
+        self.nodefusion_search_budget = budget;
+        self
+    }
+
+    pub fn with_nodefusion_max_runs(mut self, runs: usize) -> Self {
+        self.nodefusion_max_runs = runs;
+        self
+    }
+
+    pub fn with_nodefusion_top_share(mut self, share: f64) -> Self {
+        self.nodefusion_top_share = share;
+        self
+    }
+
+    pub fn with_nodefusion_cost_model(mut self, model: SubtreeCostMethod) -> Self {
+        self.nodefusion_cost_model = model;
+        self
+    }
+
+    pub fn with_nodefusion_spool_seconds_per_byte(mut self, rate: Option<f64>) -> Self {
+        self.nodefusion_spool_seconds_per_byte = rate;
+        self
+    }
+
+    pub fn with_nodefusion_spool_cost_factor(mut self, factor: Option<f64>) -> Self {
+        self.nodefusion_spool_cost_factor = factor;
+        self
+    }
+
+    /// Every way this config contradicts itself, or `Ok(())`.
+    ///
+    /// Called where a config enters dee -- the CLI's flag parsing and the
+    /// server's `PUT .../optimizer` -- so a contradiction is refused at the
+    /// point somebody can still fix it, rather than resolved by whichever
+    /// setting a pass happens to check first. The passes check again anyway,
+    /// because a config row stored before a rule existed still has to be
+    /// refused rather than silently obeyed.
+    ///
+    /// Returns every problem rather than the first, so fixing one does not
+    /// reveal the next on the following attempt.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut problems: Vec<String> = Vec::new();
+
+        if self.nodefusion_adaptive_materialize_ctes && self.nodefusion_naive_materialize_ctes {
+            problems.push(
+                "nodefusion_adaptive_materialize_ctes and \
+                 nodefusion_naive_materialize_ctes are incompatible: the naive \
+                 reader-count rule is the floor the adaptive search exists to \
+                 beat, and applying it to the search's own baseline would make \
+                 every candidate a comparison against the wrong control. Pick one"
+                    .to_string(),
+            );
+        }
+        if self.nodefusion_adaptive_materialize_ctes
+            && self.nodefusion_materialize_ctes_override.is_some()
+        {
+            problems.push(
+                "nodefusion_adaptive_materialize_ctes and \
+                 nodefusion_materialize_ctes_override are incompatible: the \
+                 override pins the exact set the search exists to find, so the \
+                 search would spend DAG runs re-deriving a fixed answer"
+                    .to_string(),
+            );
+        }
+        if self.nodefusion_adaptive_materialize_ctes && self.nodefusion_materialize_ctes {
+            problems.push(
+                "nodefusion_adaptive_materialize_ctes and \
+                 nodefusion_materialize_ctes are incompatible: the global switch \
+                 materializes every View CTE regardless of what the search \
+                 decides, leaving it nothing to decide"
+                    .to_string(),
+            );
+        }
+        if self.nodefusion_adaptive_materialize_ctes && !self.run_nodefusion_pass {
+            problems.push(
+                "nodefusion_adaptive_materialize_ctes is set but the nodefusion \
+                 pass is not enabled, so nothing would read it"
+                    .to_string(),
+            );
+        }
+        if !(0.0..=1.0).contains(&self.nodefusion_top_share) || self.nodefusion_top_share <= 0.0 {
+            problems.push(format!(
+                "nodefusion_top_share must be in (0, 1]; got {}",
+                self.nodefusion_top_share
+            ));
+        }
+        if let Some(f) = self.nodefusion_spool_cost_factor
+            && (!f.is_finite() || f < 0.0)
+        {
+            problems.push(format!(
+                "nodefusion_spool_cost_factor must be a finite number >= 0; got {f}"
+            ));
+        }
+        if let Some(r) = self.nodefusion_spool_seconds_per_byte
+            && (!r.is_finite() || r < 0.0)
+        {
+            problems.push(format!(
+                "nodefusion_spool_seconds_per_byte must be a finite number >= 0; got {r}"
+            ));
+        }
+
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
     }
 
     pub fn with_parallelism_pass(mut self) -> Self {

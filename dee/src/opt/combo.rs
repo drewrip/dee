@@ -34,16 +34,136 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+use async_trait::async_trait;
 use log::debug;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     connectors::Connector,
     dag::Dag,
     executor::ExecStats,
     opt::dup::{SubtreeCost, duplicate_cost_set},
-    opt::hmp::HmpObjective,
     opt::makespan,
 };
+
+/// What a materialization search is trying to make smaller.
+///
+/// The two are not the same number and not reliably correlated. Total query
+/// time is the sum of every node's duration; makespan is the wall clock, a
+/// longest path. Materializing removes duplicate computation --- which always
+/// cuts the sum --- and inserts a build that must finish before its consumers
+/// start, which usually lengthens the path. On p05 ten of eleven candidates cut
+/// query time and *every one* raised makespan.
+///
+/// So there is no single ranking that serves both, and no reweighting of one
+/// that produces the other: a sum cannot see chain depth. The caller says which
+/// it wants, and that choice picks both the order candidates are trialled in
+/// and the test a trial has to pass to be promoted --- searching by one measure
+/// while accepting on the other is how a search finds ten improvements and
+/// promotes none of them.
+///
+/// Shared by HMP, which materializes Views as tables, and by NodeFusion's
+/// adaptive search, which materializes CTEs inside one fused query. The
+/// tension is the same in both: a barrier removes repeated work and lengthens
+/// whatever path runs through it. Lives here rather than in either pass
+/// because a setting two searches read from one config key must have one
+/// definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Objective {
+    /// Wall clock. Candidates are ordered by predicted makespan ascending, and
+    /// a trial is promoted when it beats the incumbent's `runtime_ms`.
+    ///
+    /// The default, because it is what a person waiting on the DAG experiences.
+    #[default]
+    Makespan,
+    /// Total work. Candidates are ordered by duplicate computation removed,
+    /// descending, and a trial is promoted when it beats the incumbent's
+    /// `node_time_ms`.
+    ///
+    /// What to pick when the DAG shares a machine and the cost that matters is
+    /// how much of it the run consumes, not how long the run takes.
+    QueryTime,
+}
+
+impl Objective {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Objective::Makespan => "makespan",
+            Objective::QueryTime => "query_time",
+        }
+    }
+}
+
+impl std::str::FromStr for Objective {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "makespan" | "wall_clock" => Ok(Objective::Makespan),
+            "query_time" | "querytime" | "node_time" => Ok(Objective::QueryTime),
+            other => Err(format!(
+                "unknown objective '{other}'; expected makespan or query_time"
+            )),
+        }
+    }
+}
+
+/// What one candidate set was measured at, on both axes.
+///
+/// # The sign of `cost`
+///
+/// **`cost` is always work *removed*, and higher is always better.** Both
+/// implementations of [`ComboCoster`] have to return it that way, because
+/// [`order_by`] sorts [`Objective::QueryTime`] descending on it and a coster
+/// that returned "total work under this configuration" instead would rank
+/// every candidate exactly backwards --- silently, since a reversed ranking is
+/// still a ranking and the search would go on trialling and promoting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComboScore {
+    /// Work this configuration removes relative to the search's starting
+    /// point, in the cost model's units. Higher is better; may be negative,
+    /// which says the configuration adds work.
+    pub cost: f64,
+    /// Predicted wall clock with this configuration, in seconds, or `None`
+    /// when it could not be predicted.
+    pub makespan_s: Option<f64>,
+    /// How many members build one after another rather than at the same time.
+    pub stages: usize,
+}
+
+/// How one candidate set is priced.
+///
+/// A trait rather than a function pointer because the two searches price
+/// fundamentally different things and neither is a special case of the other:
+/// HMP asks what a set of Views duplicates across the consumers that inline
+/// them, which takes a graph minor and one EXPLAIN per consumer; NodeFusion
+/// asks what a set of CTEs costs inside a single fused query, which takes one
+/// EXPLAIN of that query. What they share is the *search* --- which sets to
+/// price, in what order, and when to stop --- and that is what this module is.
+///
+/// `Send + Sync` because [`search_combos_with`] holds one across an await in a
+/// pass the server drives from a multi-threaded runtime.
+#[async_trait]
+pub trait ComboCoster: Send + Sync {
+    /// Price one set. `members` is in [`canonical_order`].
+    ///
+    /// `None` means "could not be measured" and the caller treats it as
+    /// unknown --- never as a cost of zero, which would put an unpriceable
+    /// candidate at the front of a `QueryTime` ranking.
+    async fn price(&self, members: &[String]) -> Option<ComboScore>;
+
+    /// Whether the empty set is a configuration worth pricing.
+    ///
+    /// False for HMP, whose empty combo *is* its baseline: pricing it would
+    /// add a candidate that rewrites nothing and spends a DAG run proving it.
+    /// True for NodeFusion, whose starting point is the default
+    /// materialization rule rather than the empty set, so "every CTE plain" is
+    /// a real configuration the search has to be able to reach.
+    fn prices_empty_set(&self) -> bool {
+        false
+    }
+}
 
 /// A candidate combination and what materializing all of it is estimated to
 /// remove.
@@ -64,14 +184,6 @@ pub struct CostedCombo {
     /// How many members lie on one dependency chain, and so have to build one
     /// after another.
     pub stages: usize,
-}
-
-/// Everything one combination was measured at.
-#[derive(Debug, Clone, Copy)]
-struct Scored {
-    cost: f64,
-    makespan_s: Option<f64>,
-    stages: usize,
 }
 
 /// All combinations of `items` of size `k`, in the order `items` is given.
@@ -145,7 +257,7 @@ pub fn canonical_order(dag: &Dag, candidates: &[String]) -> Vec<String> {
 /// Each combination is scored on both the duplicate computation it removes and
 /// the wall clock it is predicted to take, and those disagree: on `p05_hr`
 /// every candidate that cut total query time raised makespan. `objective` says
-/// which of the two the resulting order is sorted on --- see [`HmpObjective`].
+/// which of the two the resulting order is sorted on --- see [`Objective`].
 ///
 /// A Pareto frontier over both was tried and taken back out. Computing it from
 /// the measured numbers of the eleven candidates p05 actually trialled yields a
@@ -158,7 +270,63 @@ pub fn canonical_order(dag: &Dag, candidates: &[String]) -> Vec<String> {
 ///
 /// `baseline` supplies the measured per-node durations the makespan prediction
 /// is anchored to. Without it nothing is ranked on that axis, and an objective
-/// of [`HmpObjective::Makespan`] has nothing to sort by --- see `order_by`.
+/// of [`Objective::Makespan`] has nothing to sort by --- see `order_by`.
+// One more than clippy's threshold. Every argument is a distinct input to the
+// search and bundling them into a struct would only move the list.
+/// Prices a set of Views by what they duplicate across the consumers that
+/// inline them: HMP's costing, behind [`ComboCoster`].
+///
+/// One call per combination, whatever its size --- `duplicate_cost_set` prices
+/// the whole set against one graph minor, which is what keeps a chain from
+/// being charged for its own overlap. See the module docs.
+pub struct DupComboCoster<'a, C> {
+    pub conn: &'a C,
+    pub base: &'a Dag,
+    pub coster: &'a dyn SubtreeCost,
+    /// The measured per-node durations the makespan prediction is anchored to.
+    /// Without it nothing is ranked on that axis.
+    pub baseline: Option<&'a ExecStats>,
+}
+
+#[async_trait]
+impl<C> ComboCoster for DupComboCoster<'_, C>
+where
+    C: Connector + Send + Sync,
+{
+    async fn price(&self, members: &[String]) -> Option<ComboScore> {
+        // One measurement, three readings: `duplicate` is the repeated work this
+        // set removes, `write_total` is the new work materializing it adds, and
+        // the per-member and per-consumer terms behind them are what the
+        // schedule is built from. No extra EXPLAIN is issued for the others.
+        let d = duplicate_cost_set(self.conn, self.base, members, self.coster).await?;
+        let est = self
+            .baseline
+            .and_then(|stats| makespan::estimate(self.base, &d, stats));
+        Some(ComboScore {
+            // Net work removed, not gross. Materializing a View stops its
+            // consumers recomputing it and starts paying to write it out, and a
+            // ranking that counts only the first half over-values exactly the
+            // candidates that are expensive to write -- which are the large
+            // ones. Measured on `p05_hr`: the set HMP promoted removed 1897ms of
+            // work net, while the four tables it materialized cost 1425ms to
+            // write, so the gross figure overstated the result by 43%.
+            //
+            // An unpriced write charges nothing, which is the behaviour this
+            // replaced. It is reached only when the model has no write constant
+            // at all, since `write_rate_for` will otherwise substitute another
+            // path's and say so.
+            cost: d.duplicate - d.write_total.unwrap_or(0.0),
+            makespan_s: est.as_ref().map(|e| e.makespan_s),
+            stages: est.as_ref().map(|e| e.stages).unwrap_or(0),
+        })
+    }
+}
+
+/// [`search_combos_with`] over HMP's costing.
+///
+/// The shape this module had before NodeFusion needed the same search over a
+/// different price. Kept as the way HMP spells it, and as the signature the
+/// tests below exercise.
 // One more than clippy's threshold. Every argument is a distinct input to the
 // search and bundling them into a struct would only move the list.
 #[allow(clippy::too_many_arguments)]
@@ -170,69 +338,66 @@ pub async fn search_combos<C>(
     coster: &dyn SubtreeCost,
     budget: usize,
     baseline: Option<&ExecStats>,
-    objective: HmpObjective,
+    objective: Objective,
 ) -> Vec<CostedCombo>
 where
     C: Connector + Send + Sync,
 {
+    let dup = DupComboCoster {
+        conn,
+        base,
+        coster,
+        baseline,
+    };
+    search_combos_with(&dup, candidates, singletons, budget, objective).await
+}
+
+/// The search itself: which sets to price, in what order, and when to stop.
+///
+/// Everything specific to *what a set costs* is behind `coster`; everything
+/// here is about covering the combination space under a budget. See
+/// [`ComboCoster`] for why the two are separate.
+pub async fn search_combos_with(
+    coster: &dyn ComboCoster,
+    candidates: &[String],
+    singletons: &HashMap<String, f64>,
+    budget: usize,
+    objective: Objective,
+) -> Vec<CostedCombo> {
     let n = candidates.len();
     if n == 0 {
         return Vec::new();
     }
 
-    let mut memo: HashMap<Vec<usize>, Option<Scored>> = HashMap::new();
-    let mut costed: Vec<(Vec<usize>, Scored)> = Vec::new();
+    let mut memo: HashMap<Vec<usize>, Option<ComboScore>> = HashMap::new();
+    let mut costed: Vec<(Vec<usize>, ComboScore)> = Vec::new();
     let mut priced_anything = false;
     let mut spent = 0usize;
 
-    // One call per combination, whatever its size: `duplicate_cost_set` prices
-    // the whole set against one graph minor.
-    #[allow(clippy::too_many_arguments)]
-    async fn cost_of<C>(
-        conn: &C,
-        base: &Dag,
+    async fn cost_of(
+        coster: &dyn ComboCoster,
         idx: &[usize],
         candidates: &[String],
-        coster: &dyn SubtreeCost,
-        baseline: Option<&ExecStats>,
-        memo: &mut HashMap<Vec<usize>, Option<Scored>>,
-    ) -> Option<Scored>
-    where
-        C: Connector + Send + Sync,
-    {
+        memo: &mut HashMap<Vec<usize>, Option<ComboScore>>,
+    ) -> Option<ComboScore> {
         if let Some(hit) = memo.get(idx) {
             return *hit;
         }
         let members: Vec<String> = idx.iter().map(|&i| candidates[i].clone()).collect();
-        // One measurement, three readings: `duplicate` is the repeated work this
-        // set removes, `write_total` is the new work materializing it adds, and
-        // the per-member and per-consumer terms behind them are what the
-        // schedule is built from. No extra EXPLAIN is issued for the others.
-        let priced = duplicate_cost_set(conn, base, &members, coster)
-            .await
-            .map(|d| {
-                let est = baseline.and_then(|stats| makespan::estimate(base, &d, stats));
-                Scored {
-                    // Net work removed, not gross. Materializing a View stops
-                    // its consumers recomputing it and starts paying to write
-                    // it out, and a ranking that counts only the first half
-                    // over-values exactly the candidates that are expensive to
-                    // write -- which are the large ones. Measured on `p05_hr`:
-                    // the set HMP promoted removed 1897ms of work net, while
-                    // the four tables it materialized cost 1425ms to write, so
-                    // the gross figure overstated the result by 43%.
-                    //
-                    // An unpriced write charges nothing, which is the behaviour
-                    // this replaced. It is reached only when the model has no
-                    // write constant at all, since `write_rate_for` will
-                    // otherwise substitute another path's and say so.
-                    cost: d.duplicate - d.write_total.unwrap_or(0.0),
-                    makespan_s: est.as_ref().map(|e| e.makespan_s),
-                    stages: est.as_ref().map(|e| e.stages).unwrap_or(0),
-                }
-            });
+        let priced = coster.price(&members).await;
         memo.insert(idx.to_vec(), priced);
         priced
+    }
+
+    // The empty set, for a search whose starting point is not the empty set.
+    // Unpriced for HMP, whose empty combo is its baseline; a real
+    // configuration for NodeFusion, where it means "every CTE plain" and the
+    // default rule has already turned some of them on.
+    if coster.prices_empty_set()
+        && let Some(scored) = cost_of(coster, &[], candidates, &mut memo).await
+    {
+        priced_anything = true;
+        costed.push((Vec::new(), scored));
     }
 
     // Singletons are free: they are what `singletons` was measured from. They
@@ -241,9 +406,7 @@ where
     // different cost method entirely, and mixing units would make the sort
     // meaningless.
     for i in 0..n {
-        if let Some(scored) =
-            cost_of(conn, base, &[i], candidates, coster, baseline, &mut memo).await
-        {
+        if let Some(scored) = cost_of(coster, &[i], candidates, &mut memo).await {
             priced_anything = true;
             costed.push((vec![i], scored));
         }
@@ -265,9 +428,7 @@ where
                     .iter()
                     .filter_map(|c| candidates.iter().position(|x| x == c))
                     .collect();
-                if let Some(scored) =
-                    cost_of(conn, base, &idx, candidates, coster, baseline, &mut memo).await
-                {
+                if let Some(scored) = cost_of(coster, &idx, candidates, &mut memo).await {
                     priced_anything = true;
                     costed.push((idx, scored));
                 }
@@ -290,8 +451,7 @@ where
             if !seen.insert(entry.idx.clone()) {
                 continue;
             }
-            let priced =
-                cost_of(conn, base, &entry.idx, candidates, coster, baseline, &mut memo).await;
+            let priced = cost_of(coster, &entry.idx, candidates, &mut memo).await;
             spent += 1;
             let Some(scored) = priced else { continue };
             priced_anything = true;
@@ -349,7 +509,7 @@ where
 /// makespan --- is invisible to a sum. On p05 the candidates separated perfectly
 /// by chain depth (three stages 4772-5506 ms, four stages 6676-7186 ms, no
 /// overlap) while set size explained almost nothing.
-fn order_by(kept: Vec<CostedCombo>, objective: HmpObjective) -> Vec<CostedCombo> {
+pub fn order_by(kept: Vec<CostedCombo>, objective: Objective) -> Vec<CostedCombo> {
     let by_cost = |a: &CostedCombo, b: &CostedCombo| {
         b.cost
             .partial_cmp(&a.cost)
@@ -358,12 +518,12 @@ fn order_by(kept: Vec<CostedCombo>, objective: HmpObjective) -> Vec<CostedCombo>
     };
     let mut out = kept;
     match objective {
-        HmpObjective::QueryTime => out.sort_by(by_cost),
+        Objective::QueryTime => out.sort_by(by_cost),
         // Cheapest predicted wall clock first. A combination with no prediction
         // sorts after every one that has a prediction, ordered among its peers
         // by work removed: it is unranked on this axis, and an absence must not
         // read as a zero and take the front of the queue.
-        HmpObjective::Makespan => out.sort_by(|a, b| match (a.makespan_s, b.makespan_s) {
+        Objective::Makespan => out.sort_by(|a, b| match (a.makespan_s, b.makespan_s) {
             (Some(x), Some(y)) => x
                 .partial_cmp(&y)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -374,6 +534,34 @@ fn order_by(kept: Vec<CostedCombo>, objective: HmpObjective) -> Vec<CostedCombo>
         }),
     }
     out
+}
+
+/// The prefix of `ranking` whose cumulative score covers `share` of the total
+/// --- the candidates worth searching.
+///
+/// `ranking` must already be sorted best-first; the prefix is only meaningful
+/// against an order. A total of zero or less returns nothing rather than
+/// dividing by it: a ranking that scored nothing has not identified a
+/// candidate, and taking its prefix anyway would search an arbitrary one.
+///
+/// Lifted out of HMP so NodeFusion's adaptive search cuts its working set the
+/// same way. Two searches that disagreed about what "the top half of the
+/// ranking" means would not be comparable to each other.
+pub fn working_set_from<T: AsRef<str>>(ranking: &[(T, f64)], share: f64) -> Vec<String> {
+    let total: f64 = ranking.iter().map(|(_, s)| *s).sum();
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    let mut set = Vec::new();
+    let mut cumulative = 0.0;
+    for (node, score) in ranking {
+        set.push(node.as_ref().to_string());
+        cumulative += *score;
+        if cumulative / total >= share {
+            break;
+        }
+    }
+    set
 }
 
 /// A priority-queue entry ordered by estimated cost, descending.
@@ -422,7 +610,11 @@ mod tests {
         connectors::duckdb::{DuckDBConfig, DuckDBConnection},
         dag::{MaterializeMode, TransformNode},
         graph::Graph,
+        // The alias HMP still spells it by. These tests predate the move and
+        // are left spelling it the old way on purpose: unchanged tests over a
+        // refactored search are the evidence the refactor changed nothing.
         opt::dup::CardinalitySubtreeCost,
+        opt::hmp::HmpObjective,
     };
     use std::sync::Arc;
 

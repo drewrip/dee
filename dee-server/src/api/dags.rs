@@ -178,6 +178,12 @@ pub async fn set_optimizer(
     let dag = lookup(&state, &name).await?;
     let config = body.map(|Json(c)| c).unwrap_or_default();
     crate::api::reject_server_side_paths(&config)?;
+    // A config that contradicts itself is refused at the point it is stored,
+    // rather than at the point a pass trips over it -- by then it is a failed
+    // run rather than a rejected request.
+    config
+        .validate()
+        .map_err(ServerError::BadRequest)?;
     dags::set_optimizer_config(&state.store, dag.dag_id, Some(&config)).await?;
     Ok(Json(OptimizerSettings {
         dag: name,

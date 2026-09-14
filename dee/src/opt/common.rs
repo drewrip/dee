@@ -219,6 +219,38 @@ pub(crate) fn supports_materialized_hint(dialect: DialectType) -> bool {
     matches!(dialect, DialectType::DuckDB | DialectType::PostgreSQL)
 }
 
+/// What spooling a `MATERIALIZED` CTE costs, as a fraction of what writing the
+/// same rows to a table costs on this engine.
+///
+/// **Modelled, not measured.** Nothing in dee fits this constant yet --- a CTE
+/// materialization does not separate out in either backend's plan the way a
+/// `CREATE TABLE AS` does --- so these are estimates of the ratio, chosen from
+/// what the two engines do differently:
+///
+/// * **DuckDB** buffers the CTE in its own memory and hands the readers a
+///   reference. No catalog entry, no durable write, no serialization; the cost
+///   is close to the allocation. Hence a small fraction.
+/// * **PostgreSQL** materializes into a tuplestore, which lives in `work_mem`
+///   until it does not and then spills to a temporary file. A large CTE
+///   therefore pays something much closer to a real write, which is why the
+///   fraction is several times DuckDB's.
+///
+/// Overridable per run --- `nodefusion_spool_cost_factor` replaces the
+/// fraction, `nodefusion_spool_seconds_per_byte` replaces the whole rate ---
+/// because a number this provisional should not be reachable only by
+/// recompiling. Calibrating it against measured fused runs is the obvious next
+/// experiment, and the override is what such an experiment would write into.
+///
+/// Zero for a dialect with no `MATERIALIZED` hint: those emit every CTE plain
+/// (see [`supports_materialized_hint`]), so there is no spool to charge for.
+pub(crate) fn default_spool_factor(dialect: DialectType) -> f64 {
+    match dialect {
+        DialectType::DuckDB => 0.05,
+        DialectType::PostgreSQL => 0.35,
+        _ => 0.0,
+    }
+}
+
 /// Wrap `consumer_sql` in a `WITH <cte_name> AS MATERIALIZED (<body_sql>)`
 /// clause, at the AST level.
 ///

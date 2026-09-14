@@ -175,6 +175,47 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
                "str_list", frozenset({"nodefusion"}),
                doc="The exact set of node IDs whose CTEs NodeFusion materializes, overriding "
                    "every default -- so it is also how an inlined Table's CTE is made plain."),
+    DeeOptSpec("nodefusion_adaptive_materialize_ctes", "--nodefusion-adaptive-materialize-ctes",
+               "bool", frozenset({"nodefusion"}),
+               doc="Choose the materialized CTE set by measurement rather than by rule -- the "
+                   "adaptive variant. Measures a baseline fusion under the default rule, ranks "
+                   "candidate sets by nodefusion_objective, and trials one per DAG run. "
+                   "Incompatible with nodefusion_naive_materialize_ctes, which is the floor it "
+                   "exists to beat, and with the global switch and the override, which would "
+                   "leave it nothing to decide. Unlike every other NodeFusion cell this one "
+                   "spends DAG runs, so read it on payback and not on wall clock alone."),
+    DeeOptSpec("nodefusion_objective", "--nodefusion-objective", "str", frozenset({"nodefusion"}),
+               choices=("makespan", "query_time"),
+               doc="Which measure NodeFusion's adaptive search minimizes. Materializing a CTE "
+                   "stops the fused query recomputing it for every reader and inserts a barrier "
+                   "its readers wait on, so it cuts total work and can lengthen the path through "
+                   "the WITH chain -- the same disagreement hmp_objective settles one level up."),
+    DeeOptSpec("nodefusion_search_budget", "--nodefusion-search-budget", "int",
+               frozenset({"nodefusion"}),
+               doc="Candidate CTE sets the adaptive search prices before it spends any DAG run "
+                   "on them. Bounds costing, which is EXPLAIN-only; nodefusion_max_runs bounds "
+                   "executions."),
+    DeeOptSpec("nodefusion_max_runs", "--nodefusion-max-runs", "int", frozenset({"nodefusion"}),
+               doc="DAG executions the adaptive search may spend on candidates, on top of the "
+                   "one it spends measuring the baseline."),
+    DeeOptSpec("nodefusion_top_share", "--nodefusion-top-share", "float",
+               frozenset({"nodefusion"}),
+               doc="The share of total ranking score the adaptive working set covers, in (0, 1]."),
+    DeeOptSpec("nodefusion_cost_model", "--nodefusion-cost-model", "str",
+               frozenset({"nodefusion"}),
+               choices=("learned_cost", "cardinality", "operators"),
+               doc="What the adaptive search prices a region of a fused plan with. The same "
+                   "three models hmp_dup_cost_model picks between."),
+    DeeOptSpec("nodefusion_spool_seconds_per_byte", "--nodefusion-spool-seconds-per-byte",
+               "float", frozenset({"nodefusion"}),
+               doc="What spooling a MATERIALIZED CTE costs, in seconds per byte, replacing the "
+                   "modelled rate outright. The knob a calibration experiment writes into."),
+    DeeOptSpec("nodefusion_spool_cost_factor", "--nodefusion-spool-cost-factor", "float",
+               frozenset({"nodefusion"}),
+               doc="What spooling a MATERIALIZED CTE costs, as a fraction of writing the same "
+                   "rows to a table. Defaults per backend (DuckDB 0.05, Postgres 0.35). Both "
+                   "defaults are modelled guesses rather than fitted constants, so sweeping this "
+                   "is how the model gets tested."),
     DeeOptSpec("profile_iterations", "--profile-iterations", "bool", frozenset({"hmp", "omp", "parallelism"}),
                doc="Capture a resource timeseries for every candidate DAG the optimizer runs."),
 )

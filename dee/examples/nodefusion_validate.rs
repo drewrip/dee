@@ -7,7 +7,10 @@
 //!
 //! usage: cargo run -p dee --example nodefusion_validate -- <dag.json> <warehouse.duckdb>
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use dee::{
     connectors::Connector,
@@ -132,6 +135,19 @@ async fn run_and_fingerprint(
     result.map(|_| out)
 }
 
+
+/// One configuration to check: either the pass's own rules, or an exact set of
+/// node IDs the way the adaptive search installs one.
+enum Variant {
+    Rule(bool, bool, Option<Vec<String>>),
+    Exact(HashSet<String>),
+}
+
+/// The bare table name of a qualified node ID, for matching a CTE name.
+fn bare(id: &str) -> String {
+    id.rsplit('.').next().unwrap_or(id).trim_matches('"').to_string()
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -170,16 +186,73 @@ async fn main() {
     }
 
     // ---- the fused DAG, under each setting of the materialization knob ----
-    let variants: Vec<(&str, bool, bool, Option<Vec<String>>)> = vec![
-        ("plain View CTEs (the default)", false, false, None),
-        ("the naive rule: Views more than one Table reads", false, true, None),
-        ("every CTE materialized", true, false, None),
-        ("nothing materialized", false, false, Some(Vec::new())),
+    let mut variants: Vec<(String, Variant)> = vec![
+        ("plain View CTEs (the default)".into(), Variant::Rule(false, false, None)),
+        (
+            "the naive rule: Views more than one Table reads".into(),
+            Variant::Rule(false, true, None),
+        ),
+        ("every CTE materialized".into(), Variant::Rule(true, false, None)),
+        ("nothing materialized".into(), Variant::Rule(false, false, Some(Vec::new()))),
     ];
+
+    // Every configuration the adaptive search can actually install, through the
+    // code path it installs them by.
+    //
+    // Not the same as the override above: `rewrite_with` takes an exact set of
+    // node IDs, while the override also matches bare table names, so checking
+    // only the override would leave the search's own path unchecked. These are
+    // the single flips -- each decidable CTE turned the other way from the
+    // default rule -- which is what a trial installs and what a promotion
+    // installs. A search that produced a fused query with different *rows* in
+    // it would be a much worse bug than a search that ranked badly.
+    {
+        let (conn, path) = fresh_conn(warehouse, "probe").await;
+        let engine = Arc::new(SimpleEngine::new(Arc::clone(&conn)).unwrap());
+        let mut probe = base_dag.clone();
+        if engine.resolve_schemas(&mut probe).await.is_ok() {
+            let pass = NodeFusionPass::new(false, false, None);
+            let decidable = pass.decidable_ctes(&probe);
+            let default_set: HashSet<String> = decidable
+                .iter()
+                .filter(|id| {
+                    // Whatever the default rule turned on, read back off a
+                    // default plan rather than re-derived here.
+                    let mut d = probe.clone();
+                    let mut p = NodeFusionPass::new(false, false, None);
+                    p.rewrite(&mut d).is_ok()
+                        && d.nodes
+                            .nodes()
+                            .find(|n| n.id.contains("dee_fused"))
+                            .is_some_and(|n| {
+                                n.query_text
+                                    .contains(&format!("n_{} AS MATERIALIZED", bare(id)))
+                            })
+                })
+                .cloned()
+                .collect();
+            for id in &decidable {
+                let mut set = default_set.clone();
+                if !set.remove(id) {
+                    set.insert(id.clone());
+                }
+                let mut members: Vec<String> = set.iter().cloned().collect();
+                members.sort();
+                variants.push((
+                    format!("the search flipping '{id}' -> {{{}}}", members.join(", ")),
+                    Variant::Exact(set),
+                ));
+            }
+        }
+        drop(engine);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
 
     let mut failures = 0usize;
     let mut ran = 0usize;
-    for (label, materialize, naive, override_list) in variants {
+    for (label, variant) in variants {
+        let label = label.as_str();
         let (conn, path) = fresh_conn(warehouse, "trial").await;
         let engine = Arc::new(SimpleEngine::new(Arc::clone(&conn)).unwrap());
         let mut dag = base_dag.clone();
@@ -194,8 +267,17 @@ async fn main() {
         drop(conn);
         let _ = std::fs::remove_file(&path);
 
-        let mut pass = NodeFusionPass::new(materialize, naive, override_list);
-        let record = match pass.rewrite(&mut dag) {
+        let mut pass = match &variant {
+            Variant::Rule(materialize, naive, over) => {
+                NodeFusionPass::new(*materialize, *naive, over.clone())
+            }
+            Variant::Exact(_) => NodeFusionPass::new(false, false, None),
+        };
+        let rewritten = match &variant {
+            Variant::Rule(..) => pass.rewrite(&mut dag),
+            Variant::Exact(set) => pass.rewrite_with(&mut dag, set),
+        };
+        let record = match rewritten {
             Ok(record) => record,
             Err(e) => {
                 failures += 1;

@@ -305,6 +305,27 @@ pub struct NodeFusionDetail {
     pub fused_columns: usize,
     /// What happened, in a sentence -- including why a DAG was left alone.
     pub outcome: String,
+    /// Whether the materialized set was searched for rather than ruled.
+    ///
+    /// The difference the rest of these fields only make sense against: a
+    /// rule-driven fusion spends no DAG runs and has no baseline, and reporting
+    /// a zero for either would read as a measurement.
+    #[serde(default)]
+    pub adaptive: bool,
+    /// Adaptive only: which measure the search minimized.
+    #[serde(default)]
+    pub objective: Option<String>,
+    /// Adaptive only: the fused DAG's runtime under the default rule, which is
+    /// the control every candidate was read against.
+    #[serde(default)]
+    pub baseline_runtime_ms: Option<i64>,
+    /// Adaptive only: the winner's runtime.
+    #[serde(default)]
+    pub final_runtime_ms: Option<i64>,
+    /// Adaptive only: how many candidate CTE sets were priced. EXPLAIN-only,
+    /// and so not the same number as the DAG runs spent.
+    #[serde(default)]
+    pub candidates_costed: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -175,8 +175,13 @@ pub(crate) fn resolve_config(
         object.insert(key, value);
     }
 
-    serde_json::from_value(merged)
-        .map_err(|e| ServerError::BadRequest(format!("invalid optimizer config: {e}")))
+    let resolved: OptimizerConfig = serde_json::from_value(merged)
+        .map_err(|e| ServerError::BadRequest(format!("invalid optimizer config: {e}")))?;
+    // Checked on the *merged* config rather than on the overrides: a request
+    // that names one half of an incompatible pair is only incompatible once it
+    // has landed beside whatever the DAG already stored, which is here.
+    resolved.validate().map_err(ServerError::BadRequest)?;
+    Ok(resolved)
 }
 
 async fn wait_for(

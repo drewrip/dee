@@ -104,61 +104,12 @@ impl std::str::FromStr for HmpCostMethod {
     }
 }
 
-/// What HMP is trying to make smaller.
+/// What a materialization search is trying to make smaller.
 ///
-/// The two are not the same number and not reliably correlated. Total query
-/// time is the sum of every node's duration; makespan is the wall clock, a
-/// longest path through the DAG. Materializing a View removes duplicate
-/// computation --- which always cuts the sum --- and inserts a build that must
-/// finish before its consumers start, which usually lengthens the path. On p05
-/// ten of eleven candidates cut query time and *every one* raised makespan.
-///
-/// So there is no single ranking that serves both, and no reweighting of one
-/// that produces the other: a sum cannot see chain depth. The caller says which
-/// it wants, and that choice picks both the order candidates are trialled in
-/// and the test a trial has to pass to be promoted --- searching by one measure
-/// while accepting on the other is how a search finds ten improvements and
-/// promotes none of them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HmpObjective {
-    /// Wall clock. Candidates are ordered by predicted makespan ascending, and
-    /// a trial is promoted when it beats the incumbent's `runtime_ms`.
-    ///
-    /// The default, because it is what a person waiting on the DAG experiences.
-    #[default]
-    Makespan,
-    /// Total work. Candidates are ordered by duplicate computation removed,
-    /// descending, and a trial is promoted when it beats the incumbent's
-    /// `node_time_ms`.
-    ///
-    /// What to pick when the DAG shares a machine and the cost that matters is
-    /// how much of it the run consumes, not how long the run takes.
-    QueryTime,
-}
-
-impl HmpObjective {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            HmpObjective::Makespan => "makespan",
-            HmpObjective::QueryTime => "query_time",
-        }
-    }
-}
-
-impl std::str::FromStr for HmpObjective {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "makespan" | "wall_clock" => Ok(HmpObjective::Makespan),
-            "query_time" | "querytime" | "node_time" => Ok(HmpObjective::QueryTime),
-            other => Err(format!(
-                "unknown hmp objective '{other}'; expected makespan or query_time"
-            )),
-        }
-    }
-}
+/// Re-exported from [`crate::opt::combo`], where it lives because both HMP and
+/// NodeFusion's adaptive search order their candidates by it. The name is kept
+/// because it is what `hmp_objective` has always been called on the wire.
+pub use crate::opt::combo::Objective as HmpObjective;
 
 /// Where HMP is in its search, as persisted between steps.
 ///
@@ -844,7 +795,7 @@ fn median(values: &[u64]) -> Option<f64> {
 /// different materialization combinations produce an equivalent DAG (e.g.
 /// after `make_temp`'s landing-pad insertion / view inlining), so we can
 /// avoid re-running a trial we've effectively already tried.
-fn dag_signature(dag: &Dag) -> String {
+pub(crate) fn dag_signature(dag: &Dag) -> String {
     let mut node_sigs: Vec<String> = dag.nodes.nodes().map(node_signature).collect();
     node_sigs.sort_unstable();
     node_sigs.join("|")
@@ -1801,21 +1752,15 @@ where
 
     /// The prefix of `ranking` whose cumulative score covers `top_cpu_time` of
     /// the total -- the candidates worth searching.
+    ///
+    /// The cut itself lives in [`crate::opt::combo::working_set_from`], shared
+    /// with NodeFusion's adaptive search; this only unpacks the ranking rows.
     fn working_set_from(&self, ranking: &[NodeRankingRow]) -> Vec<String> {
-        let total: f64 = ranking.iter().map(|r| r.ranking_score).sum();
-        if total <= 0.0 {
-            return Vec::new();
-        }
-        let mut set = Vec::new();
-        let mut cumulative = 0.0;
-        for row in ranking {
-            set.push(row.node.clone());
-            cumulative += row.ranking_score;
-            if cumulative / total >= self.top_cpu_time {
-                break;
-            }
-        }
-        set
+        let scores: Vec<(&str, f64)> = ranking
+            .iter()
+            .map(|r| (r.node.as_str(), r.ranking_score))
+            .collect();
+        crate::opt::combo::working_set_from(&scores, self.top_cpu_time)
     }
     /// Apply `combo` to `dag`, then optionally push predicates into it.
     async fn build_trial(&self, dag: &mut Dag, combo: &[String]) -> Result<(), OptimizerError> {

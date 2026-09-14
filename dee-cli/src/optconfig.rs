@@ -76,9 +76,14 @@ pub enum CliSubtreeCostMethod {
     Operators,
 }
 
-/// Which measure the HMP search minimizes.
+/// Which measure a materialization search minimizes.
+///
+/// Shared by `--hmp-objective` and `--nodefusion-objective`: the two searches
+/// face the same tension, one over Views made into tables and one over CTEs
+/// inside a fused query, and spelling the setting two ways would invite them to
+/// drift apart.
 #[derive(clap::ValueEnum, Clone, Debug)]
-pub enum CliHmpObjective {
+pub enum CliObjective {
     /// Wall clock. Orders candidates by predicted makespan and promotes a
     /// trial that beats the incumbent's runtime.
     Makespan,
@@ -136,7 +141,7 @@ pub struct OptimizerArgs {
     pub hmp_dup_cost_model: Option<CliSubtreeCostMethod>,
     /// HMP: which measure the search minimizes.
     #[arg(long)]
-    pub hmp_objective: Option<CliHmpObjective>,
+    pub hmp_objective: Option<CliObjective>,
     /// HMP: candidate combinations to price before spending any DAG run.
     #[arg(long)]
     pub hmp_search_budget: Option<usize>,
@@ -200,6 +205,39 @@ pub struct OptimizerArgs {
     /// made plain. Comma separated; a bare table name matches a qualified ID.
     #[arg(long, value_delimiter = ',')]
     pub nodefusion_materialize_ctes_override: Option<Vec<String>>,
+    /// NodeFusion: choose the materialized CTE set by measurement instead of by
+    /// rule -- the adaptive variant. Measures a baseline fusion, ranks candidate
+    /// sets, and trials them one per DAG run. Incompatible with
+    /// --nodefusion-naive-materialize-ctes.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    pub nodefusion_adaptive_materialize_ctes: Option<bool>,
+    /// NodeFusion: which measure the adaptive search minimizes.
+    #[arg(long)]
+    pub nodefusion_objective: Option<CliObjective>,
+    /// NodeFusion: how many candidate CTE sets the adaptive search may price
+    /// before spending DAG runs. EXPLAIN-only, so far cheaper than measuring.
+    #[arg(long)]
+    pub nodefusion_search_budget: Option<usize>,
+    /// NodeFusion: DAG executions the adaptive search may spend, baseline
+    /// included.
+    #[arg(long)]
+    pub nodefusion_max_runs: Option<usize>,
+    /// NodeFusion: the share of total ranking score the adaptive working set
+    /// covers, in (0, 1].
+    #[arg(long)]
+    pub nodefusion_top_share: Option<f64>,
+    /// NodeFusion: how the adaptive search prices a region of a fused plan.
+    #[arg(long)]
+    pub nodefusion_cost_model: Option<CliSubtreeCostMethod>,
+    /// NodeFusion: what spooling a MATERIALIZED CTE costs, in seconds per byte.
+    /// Replaces the modelled rate outright.
+    #[arg(long)]
+    pub nodefusion_spool_seconds_per_byte: Option<f64>,
+    /// NodeFusion: what spooling a MATERIALIZED CTE costs, as a fraction of
+    /// writing the same rows to a table. Defaults per backend -- a modelled
+    /// guess rather than a measurement.
+    #[arg(long)]
+    pub nodefusion_spool_cost_factor: Option<f64>,
 
     /// Capture a resource timeseries for every candidate run.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
@@ -285,6 +323,39 @@ impl OptimizerArgs {
                 .as_ref()
                 .map(|v| json!(v)),
         );
+        set(
+            "nodefusion_adaptive_materialize_ctes",
+            self.nodefusion_adaptive_materialize_ctes.map(|v| json!(v)),
+        );
+        set(
+            "nodefusion_objective",
+            self.nodefusion_objective.as_ref().map(|o| match o {
+                CliObjective::Makespan => json!("makespan"),
+                CliObjective::QueryTime => json!("query_time"),
+            }),
+        );
+        set(
+            "nodefusion_search_budget",
+            self.nodefusion_search_budget.map(|v| json!(v)),
+        );
+        set("nodefusion_max_runs", self.nodefusion_max_runs.map(|v| json!(v)));
+        set("nodefusion_top_share", self.nodefusion_top_share.map(|v| json!(v)));
+        set(
+            "nodefusion_cost_model",
+            self.nodefusion_cost_model.as_ref().map(|m| match m {
+                CliSubtreeCostMethod::LearnedCost => json!("learned_cost"),
+                CliSubtreeCostMethod::Cardinality => json!("cardinality"),
+                CliSubtreeCostMethod::Operators => json!("operators"),
+            }),
+        );
+        set(
+            "nodefusion_spool_seconds_per_byte",
+            self.nodefusion_spool_seconds_per_byte.map(|v| json!(v)),
+        );
+        set(
+            "nodefusion_spool_cost_factor",
+            self.nodefusion_spool_cost_factor.map(|v| json!(v)),
+        );
 
         set("hmp_downstream_cost", self.hmp_downstream_cost.map(|v| json!(v)));
         set("hmp_max_runs", self.hmp_max_runs.map(|v| json!(v)));
@@ -314,8 +385,8 @@ impl OptimizerArgs {
         set(
             "hmp_objective",
             self.hmp_objective.as_ref().map(|o| match o {
-                CliHmpObjective::Makespan => json!("makespan"),
-                CliHmpObjective::QueryTime => json!("query_time"),
+                CliObjective::Makespan => json!("makespan"),
+                CliObjective::QueryTime => json!("query_time"),
             }),
         );
         set("hmp_search_budget", self.hmp_search_budget.map(|v| json!(v)));
@@ -372,12 +443,50 @@ impl OptimizerArgs {
             self.hmp_show_nodes.map(|v| if v { json!("") } else { Value::Null }),
         );
 
-        Ok(if config.is_empty() {
+        let resolved = if config.is_empty() {
             None
         } else {
             Some(Value::Object(config))
-        })
+        };
+
+        // Refuse a config that contradicts itself here, where whoever typed the
+        // flags is still at the keyboard. The passes check again -- a config
+        // stored on a DAG before a rule existed still has to be refused -- but
+        // by then the error surfaces in a server log rather than in front of the
+        // person who can fix it.
+        //
+        // Only a *complete* object can be judged: these flags are a patch over
+        // whatever the DAG already has, so a lone `--nodefusion-adaptive...`
+        // here says nothing about what it will end up beside. Validating fills
+        // the gaps from the defaults, which is what a partial patch will land
+        // on if the DAG has nothing of its own.
+        if let Some(value) = &resolved {
+            let merged: dee::opt::OptimizerConfig = serde_json::from_value(
+                merge_over_defaults(value.clone())?,
+            )
+            .map_err(|e| format!("optimizer config: {e}"))?;
+            merged.validate()?;
+        }
+
+        Ok(resolved)
     }
+}
+
+/// `patch` laid over a serialized default config, so a partial patch can be
+/// decoded into a whole `OptimizerConfig` and checked.
+///
+/// `OptimizerConfig` is `deny_unknown_fields`, so this also catches a
+/// misspelled key in a `--optimizer-config` file -- which previously reached
+/// the server and was rejected there.
+fn merge_over_defaults(patch: Value) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut base = serde_json::to_value(dee::opt::OptimizerConfig::default())?;
+    let (Some(base_map), Some(patch_map)) = (base.as_object_mut(), patch.as_object()) else {
+        return Ok(patch);
+    };
+    for (k, v) in patch_map {
+        base_map.insert(k.clone(), v.clone());
+    }
+    Ok(base)
 }
 
 const PASSES: [(&str, &str); 5] = [
@@ -492,5 +601,69 @@ mod tests {
             Harness::parse_from(["dee"]).optimizer.to_json().unwrap().is_none(),
             "an empty invocation sent a config"
         );
+    }
+
+    #[test]
+    fn test_the_adaptive_flags_reach_the_server_under_their_config_names() {
+        let config = config_from(&[
+            "--enable",
+            "nodefusion",
+            "--nodefusion-adaptive-materialize-ctes",
+            "--nodefusion-objective",
+            "query_time",
+            "--nodefusion-max-runs",
+            "3",
+            "--nodefusion-spool-cost-factor",
+            "0.2",
+        ]);
+        assert_eq!(config["nodefusion_adaptive_materialize_ctes"], json!(true));
+        // The wire spelling, not clap's kebab-case: the same string the stored
+        // config, the benchmark YAML and `HmpObjective`'s serde all use.
+        assert_eq!(config["nodefusion_objective"], json!("query_time"));
+        assert_eq!(config["nodefusion_max_runs"], json!(3));
+        assert_eq!(config["nodefusion_spool_cost_factor"], json!(0.2));
+    }
+
+    #[test]
+    fn test_an_incompatible_pair_is_refused_at_the_command_line() {
+        // Refused where whoever typed it is still at the keyboard, rather than
+        // in a server log after the run failed.
+        let err = Harness::parse_from([
+            "dee",
+            "--enable",
+            "nodefusion",
+            "--nodefusion-adaptive-materialize-ctes",
+            "--nodefusion-naive-materialize-ctes",
+        ])
+        .optimizer
+        .to_json()
+        .expect_err("the pair must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("nodefusion_naive_materialize_ctes"),
+            "the message has to name what to change; got {message}"
+        );
+    }
+
+    #[test]
+    fn test_a_misspelled_key_in_a_config_file_is_caught_here_now() {
+        // A side effect of validating a *whole* config at this boundary: the
+        // merged object has to decode into `OptimizerConfig`, which is
+        // `deny_unknown_fields`, so a typo in `--optimizer-config` is caught
+        // before it reaches the server.
+        let dir = std::env::temp_dir().join("dee-optconfig-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.json");
+        std::fs::write(&path, r#"{"hmp_max_run": 3}"#).unwrap();
+        let err = Harness::parse_from([
+            "dee",
+            "--optimizer-config",
+            path.to_str().unwrap(),
+        ])
+        .optimizer
+        .to_json()
+        .expect_err("a misspelled key must be refused");
+        assert!(err.to_string().contains("hmp_max_run"), "got {err}");
+        let _ = std::fs::remove_file(&path);
     }
 }

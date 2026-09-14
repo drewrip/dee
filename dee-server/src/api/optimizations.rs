@@ -86,11 +86,6 @@ pub async fn register(
         ))
     })?;
 
-    let step_phase = match &body.step_phase {
-        Some(raw) => raw.parse::<StepPhase>().map_err(ServerError::BadRequest)?,
-        None => info.default_step_phase,
-    };
-
     let mut config = crate::api::optimize::resolve_config(dag.optimizer_config.clone(), body.config)?;
     crate::api::reject_server_side_paths(&config)?;
     // Pass selection is decided by which optimizations are registered, so the
@@ -101,6 +96,18 @@ pub async fn register(
     for pass in registry::names() {
         config.set_pass(pass, pass == body.name);
     }
+
+    // What this optimization *is*, under the config it will actually run with.
+    // `nodefusion` is a `Once` rewrite by default and a `Continuous` search
+    // under `nodefusion_adaptive_materialize_ctes`, so the registry's static
+    // entry is the answer for a pass with nothing set and not the answer here.
+    // Recording the static one would file a search as a rewrite, and the
+    // stepper would then skip it on every run.
+    let (optimization_type, default_phase) = (info.behaviour)(&config);
+    let step_phase = match &body.step_phase {
+        Some(raw) => raw.parse::<StepPhase>().map_err(ServerError::BadRequest)?,
+        None => default_phase,
+    };
 
     // Let the optimization build whatever it keeps state in. Doing this before
     // recording the registration means a registration never names tables that
@@ -128,7 +135,7 @@ pub async fn register(
         registrations::Register {
             dag_id: dag.dag_id.clone(),
             name: body.name.clone(),
-            optimization_type: info.optimization_type,
+            optimization_type,
             step_phase,
             config: config.clone(),
             tables: tables.clone(),
@@ -141,7 +148,7 @@ pub async fn register(
         Json(RegistrationView {
             dag: name,
             name: body.name,
-            optimization_type: info.optimization_type.as_str().to_string(),
+            optimization_type: optimization_type.as_str().to_string(),
             step_phase: step_phase.as_str().to_string(),
             tables,
             active: true,

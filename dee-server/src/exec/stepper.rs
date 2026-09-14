@@ -106,12 +106,6 @@ where
     let mut steppers = Vec::new();
 
     for row in registered {
-        // A `Once` optimization is invoked explicitly, not around runs. It
-        // being registered says what a DAG is under; it does not make every
-        // run re-apply a rewrite that is already in the stored definition.
-        if row.optimization_type() != OptimizationType::Continuous {
-            continue;
-        }
         let config = row.config.clone().unwrap_or_default();
         let Some(mut optimization) =
             registry::build::<C, E>(&row.name, conn.clone(), engine.clone(), &config)
@@ -124,9 +118,27 @@ where
         };
         optimization.set_step_phase(row.step_phase());
 
+        // Both facts come off the *built* pass rather than off the stored row.
+        // For every optimization but one they are the same answer; `nodefusion`
+        // is a `Once` rewrite by default and a `Continuous` search under
+        // `nodefusion_adaptive_materialize_ctes`, and a row written from the
+        // registry's static entry can only carry one of them. Reading the row
+        // would drop an adaptive search here as "not continuous" and it would
+        // never be stepped at all.
+        //
+        // A `Once` optimization is invoked explicitly, not around runs. Its
+        // being registered says what a DAG is under; it does not make every run
+        // re-apply a rewrite that is already in the stored definition.
+        if optimization.optimization_type() != OptimizationType::Continuous {
+            continue;
+        }
+        // The pass's own answer after `set_step_phase`, so a pass that has only
+        // one coherent phase keeps it even when the row disagrees.
+        let step_phase = optimization.step_phase();
+
         steppers.push(Stepper {
             name: row.name.clone(),
-            step_phase: row.step_phase(),
+            step_phase,
             optimization,
             store: Arc::new(ScopedStore::new(state.store.clone(), &row.name)),
         });
@@ -147,9 +159,16 @@ where
     C: Connector + Send + Sync + 'static,
     E: Executor<C> + Send + Sync + 'static,
 {
+    // NodeFusion is here for its adaptive search only -- a rule-driven fusion
+    // reads no plans. It costs nothing to name it unconditionally, because a
+    // rule-driven fusion is `Once` and so is never in this list at all: `build`
+    // drops it. Getting this wrong in the other direction is the expensive
+    // mistake -- a search with no plans ranks nothing and converges on its
+    // baseline, which looks exactly like a search that found nothing worth
+    // doing.
     steppers
         .iter()
-        .any(|s| matches!(s.name.as_str(), "hmp" | "omp"))
+        .any(|s| matches!(s.name.as_str(), "hmp" | "omp" | "nodefusion"))
 }
 
 /// Step every optimization whose phase includes `side`.

@@ -517,6 +517,48 @@ impl LearnedCostModel {
         Some(rows_written * width * spb)
     }
 
+    /// What spooling this plan's result into a `MATERIALIZED` CTE costs, in
+    /// seconds.
+    ///
+    /// # Why this is a fraction of the write constant rather than its own
+    ///
+    /// A materialized CTE is not a table write. There is no catalog entry, no
+    /// durability guarantee, and on an engine that keeps the spool in memory,
+    /// no IO at all --- but it is not free either: the rows have to be
+    /// buffered somewhere before the readers scan them, and on an engine that
+    /// spills that buffer to disk the cost approaches a write. So it is a
+    /// per-byte sink cost of the same shape as a write, at a different rate.
+    ///
+    /// Nothing measures that rate yet. `observe_write` can fit the write
+    /// constant because a `CREATE TABLE AS` shows up as its own operator with
+    /// its own timing; a CTE materialization does not separate out that way in
+    /// either backend's plan. Until it does, `factor` is the caller's estimate
+    /// of the ratio, and its per-backend default lives in
+    /// [`crate::opt::common::default_spool_factor`] --- **a modelled guess,
+    /// not a measurement**, which is why it is a tunable and not a constant
+    /// buried here.
+    ///
+    /// `None` when the write path has no constant or the payload has no width.
+    /// Not a cost of zero: a caller that needs a total has to decide for itself
+    /// whether to proceed without this term, the same contract
+    /// [`Self::write_cost`] has.
+    pub fn spool_cost(
+        &self,
+        path: &str,
+        roots: &[PlanNode],
+        rows_spooled: f64,
+        factor: f64,
+    ) -> Option<f64> {
+        if factor <= 0.0 {
+            // An engine whose spool really is free. Zero because the caller
+            // said so, which is a different thing from not being able to price
+            // it --- and the difference decides whether the candidate is
+            // rankable at all.
+            return Some(0.0);
+        }
+        Some(self.write_cost(path, roots, rows_spooled)? * factor)
+    }
+
     /// [`PlanNode::input_bytes`], but with the model's learned widths standing
     /// in where the plan has none.
     ///

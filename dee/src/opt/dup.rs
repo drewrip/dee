@@ -185,6 +185,26 @@ pub trait SubtreeCost: Send + Sync {
     fn write_cost(&self, _path: &str, _roots: &[PlanNode], _rows: f64) -> Option<f64> {
         None
     }
+
+    /// What spooling this region's `rows` into a `MATERIALIZED` CTE costs.
+    ///
+    /// A CTE spool is a sink of the same shape as a write at a different rate,
+    /// so the default is the write cost scaled by `factor` --- see
+    /// [`LearnedCostModel::spool_cost`] for why the ratio is a caller's
+    /// estimate rather than something fitted. A model that cannot price a
+    /// write cannot price a spool either, and says `None` rather than zero.
+    fn spool_cost(
+        &self,
+        path: &str,
+        roots: &[PlanNode],
+        rows: f64,
+        factor: f64,
+    ) -> Option<f64> {
+        if factor <= 0.0 {
+            return Some(0.0);
+        }
+        Some(self.write_cost(path, roots, rows)? * factor)
+    }
 }
 
 /// Seconds, via the learned seconds-per-byte constants.
@@ -197,6 +217,10 @@ impl SubtreeCost for LearnedSubtreeCost<'_> {
 
     fn write_cost(&self, path: &str, roots: &[PlanNode], rows: f64) -> Option<f64> {
         self.0.write_cost(path, roots, rows)
+    }
+
+    fn spool_cost(&self, path: &str, roots: &[PlanNode], rows: f64, factor: f64) -> Option<f64> {
+        self.0.spool_cost(path, roots, rows, factor)
     }
 }
 
