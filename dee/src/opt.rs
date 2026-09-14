@@ -775,30 +775,25 @@ pub struct OptimizerConfig {
     pub profile_iterations: bool,
     pub run_pushdown_pass: bool,
     pub run_parallelism_pass: bool,
-    /// Fuse every Table node into one query. See [`crate::opt::nodefusion`].
+    /// Share View work that several Tables repeat through one rollup node.
+    /// See [`crate::opt::nodefusion`].
     pub run_nodefusion_pass: bool,
-    /// NodeFusion: emit inlined *View* CTEs `AS MATERIALIZED`.
+    /// No longer read: the rollup materializes exactly the CTEs with two or
+    /// more readers inside it, and
+    /// [`Self::nodefusion_materialize_ctes_override`] names a different set.
     ///
-    /// Does not apply to an inlined Table's CTE, which is materialized on its
-    /// own account -- a Table was authored as a materialization barrier, and a
-    /// plain CTE that several downstream CTEs read may be unfolded into each of
-    /// them, which is the duplication the pass exists to remove.
+    /// Kept so a stored config that still carries it decodes, since this
+    /// struct refuses unknown fields. Never serialized.
+    #[serde(default, skip_serializing)]
     pub nodefusion_materialize_ctes: bool,
-    /// NodeFusion: materialize an inlined View CTE that more than one Table
-    /// node reads.
-    ///
-    /// Naive on purpose. It counts how many Tables reach the View through the
-    /// fused graph and materializes it above one, without pricing what the
-    /// View costs or what sharing it would save -- the floor a cost-based rule
-    /// has to beat. Narrower than `nodefusion_materialize_ctes`, which turns
-    /// on every View regardless, and subsumed by it when both are set.
+    /// No longer read; see [`Self::nodefusion_materialize_ctes`].
+    #[serde(default, skip_serializing)]
     pub nodefusion_naive_materialize_ctes: bool,
     /// NodeFusion: the exact set of node IDs whose CTEs are materialized.
     ///
-    /// When set it overrides both `nodefusion_materialize_ctes` and the Table
-    /// default, so it is also the way to make an intermediate Table's CTE
-    /// plain. A name matches either as the full node ID or as its bare table
-    /// name. `None` leaves the defaults in charge.
+    /// When set it replaces the rollup's rule -- two or more readers inside
+    /// the rollup -- with exactly this set. A name matches either as the full
+    /// node ID or as its bare table name. `None` leaves the rule in charge.
     pub nodefusion_materialize_ctes_override: Option<Vec<String>>,
     /// NodeFusion: choose the materialized-CTE set by measurement rather than
     /// by rule -- the `adaptive` variant.
@@ -809,13 +804,9 @@ pub struct OptimizerConfig {
     /// promotes the winner -- the same shape HMP has, over CTEs inside one
     /// fused query instead of over Views made into tables.
     ///
-    /// **Incompatible with [`Self::nodefusion_naive_materialize_ctes`]**, which
-    /// is the reader-count floor this exists to beat; running both would mean
-    /// the search's own baseline had the rule already applied, so it would be
-    /// measuring the wrong control. Also incompatible with
-    /// [`Self::nodefusion_materialize_ctes_override`], which pins the exact set
-    /// the search exists to find. Both are rejected by [`Self::validate`]
-    /// rather than silently resolved.
+    /// **Incompatible with [`Self::nodefusion_materialize_ctes_override`]**,
+    /// which pins the exact set the search exists to find. Rejected by
+    /// [`Self::validate`] rather than silently resolved.
     pub nodefusion_adaptive_materialize_ctes: bool,
     /// NodeFusion: which measure the adaptive search minimizes.
     ///
@@ -1215,16 +1206,6 @@ impl OptimizerConfig {
         self
     }
 
-    pub fn with_nodefusion_materialize_ctes(mut self, materialize: bool) -> Self {
-        self.nodefusion_materialize_ctes = materialize;
-        self
-    }
-
-    pub fn with_nodefusion_naive_materialize_ctes(mut self, materialize: bool) -> Self {
-        self.nodefusion_naive_materialize_ctes = materialize;
-        self
-    }
-
     pub fn with_nodefusion_materialize_ctes_override(mut self, nodes: Option<Vec<String>>) -> Self {
         self.nodefusion_materialize_ctes_override = nodes;
         self
@@ -1284,16 +1265,6 @@ impl OptimizerConfig {
     pub fn validate(&self) -> Result<(), String> {
         let mut problems: Vec<String> = Vec::new();
 
-        if self.nodefusion_adaptive_materialize_ctes && self.nodefusion_naive_materialize_ctes {
-            problems.push(
-                "nodefusion_adaptive_materialize_ctes and \
-                 nodefusion_naive_materialize_ctes are incompatible: the naive \
-                 reader-count rule is the floor the adaptive search exists to \
-                 beat, and applying it to the search's own baseline would make \
-                 every candidate a comparison against the wrong control. Pick one"
-                    .to_string(),
-            );
-        }
         if self.nodefusion_adaptive_materialize_ctes
             && self.nodefusion_materialize_ctes_override.is_some()
         {
@@ -1302,15 +1273,6 @@ impl OptimizerConfig {
                  nodefusion_materialize_ctes_override are incompatible: the \
                  override pins the exact set the search exists to find, so the \
                  search would spend DAG runs re-deriving a fixed answer"
-                    .to_string(),
-            );
-        }
-        if self.nodefusion_adaptive_materialize_ctes && self.nodefusion_materialize_ctes {
-            problems.push(
-                "nodefusion_adaptive_materialize_ctes and \
-                 nodefusion_materialize_ctes are incompatible: the global switch \
-                 materializes every View CTE regardless of what the search \
-                 decides, leaving it nothing to decide"
                     .to_string(),
             );
         }

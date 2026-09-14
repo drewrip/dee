@@ -567,8 +567,8 @@ pub fn landing_pad_name(node_id: &str) -> String {
     // pad in the same catalog/schema.
     let prefix = schema_prefix(node_id);
     let base = &node_id[prefix.len()..];
-    if base.starts_with('"') {
-        format!("{prefix}\"lp_{}\"", base.trim_matches('"'))
+    if let Some(inner) = base.strip_prefix('"').and_then(|b| b.strip_suffix('"')) {
+        format!("{prefix}\"lp_{inner}\"")
     } else {
         format!("{prefix}lp_{base}")
     }
@@ -578,18 +578,32 @@ pub fn landing_pad_name(node_id: &str) -> String {
 ///
 /// Examples:
 ///   `"warehouse"."main"."foo"` → `"warehouse"."main".`
+///   `wh.main.foo`              → `wh.main.`
+///   `"we.ird".foo`             → `"we.ird".`
 ///   `"foo"`                    → `` (empty — no prefix)
+///
+/// The prefix is returned exactly as spelled in `node_id` (quoting preserved),
+/// and a `.` inside a quoted segment is not a separator — the same rule as
+/// `split_qualified_identifier` in the executor, which cannot be reused here
+/// because it strips the quotes.
 ///
 /// The landing pad inherits this prefix so it lands in the same catalog/schema.
 pub(crate) fn schema_prefix(node_id: &str) -> String {
-    // Qualified identifiers join segments with `"."`.  Find the last occurrence
-    // of that separator and return everything up to and including it.
-    if let Some(pos) = node_id.rfind("\".\"") {
-        // pos is the index of `"` before the last `.`
-        // include the closing `"` and the `.`: advance by 2 to end after `".`
-        format!("{}\".", &node_id[..pos])
-    } else {
-        String::new()
+    // Find the last `.` outside double quotes and return everything up to and
+    // including it. A doubled `""` inside a quoted segment toggles twice, so it
+    // needs no special case.
+    let mut in_quotes = false;
+    let mut last_sep = None;
+    for (i, b) in node_id.bytes().enumerate() {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b'.' if !in_quotes => last_sep = Some(i),
+            _ => {}
+        }
+    }
+    match last_sep {
+        Some(pos) => node_id[..=pos].to_string(),
+        None => String::new(),
     }
 }
 
@@ -598,6 +612,7 @@ pub(crate) fn schema_prefix(node_id: &str) -> String {
 ///
 /// Examples:
 ///   (`"warehouse"."main"."foo"`, `dee_fused`) -> `"warehouse"."main"."dee_fused"`
+///   (`analytics.orders`, `dee_fused`)         -> `analytics.dee_fused`
 ///   (`foo`, `dee_fused`)                      -> `dee_fused`
 ///
 /// The prefix is inherited for the same reason [`landing_pad_name`] inherits
@@ -986,5 +1001,72 @@ mod tests {
         assert_eq!(dialect_for_db("bigquery"), DialectType::BigQuery);
         assert_eq!(dialect_for_db("default"), DialectType::Generic);
         assert_eq!(dialect_for_db("unknown"), DialectType::DuckDB);
+    }
+
+    /// Each case: (node id, schema prefix, landing pad name, fused node name).
+    const QUALIFIED_ID_CASES: &[(&str, &str, &str, &str)] = &[
+        ("foo", "", "lp_foo", "dee_fused"),
+        ("\"foo\"", "", "\"lp_foo\"", "\"dee_fused\""),
+        ("schema.foo", "schema.", "schema.lp_foo", "schema.dee_fused"),
+        (
+            "cat.schema.foo",
+            "cat.schema.",
+            "cat.schema.lp_foo",
+            "cat.schema.dee_fused",
+        ),
+        (
+            "\"cat\".\"schema\".\"foo\"",
+            "\"cat\".\"schema\".",
+            "\"cat\".\"schema\".\"lp_foo\"",
+            "\"cat\".\"schema\".\"dee_fused\"",
+        ),
+        (
+            "\"we.ird\".\"foo\"",
+            "\"we.ird\".",
+            "\"we.ird\".\"lp_foo\"",
+            "\"we.ird\".\"dee_fused\"",
+        ),
+        (
+            "cat.\"My Schema\".foo",
+            "cat.\"My Schema\".",
+            "cat.\"My Schema\".lp_foo",
+            "cat.\"My Schema\".dee_fused",
+        ),
+        (
+            "\"cat\".schema.\"foo\"",
+            "\"cat\".schema.",
+            "\"cat\".schema.\"lp_foo\"",
+            "\"cat\".schema.\"dee_fused\"",
+        ),
+    ];
+
+    #[test]
+    fn test_schema_prefix_handles_quoted_and_unquoted_ids() {
+        for (id, prefix, _, _) in QUALIFIED_ID_CASES {
+            assert_eq!(schema_prefix(id), *prefix, "schema_prefix({id})");
+        }
+    }
+
+    #[test]
+    fn test_landing_pad_name_stays_beside_its_node() {
+        for (id, _, lp, _) in QUALIFIED_ID_CASES {
+            assert_eq!(landing_pad_name(id), *lp, "landing_pad_name({id})");
+        }
+        // A doubled quote at the end of a quoted base is part of the name.
+        assert_eq!(
+            landing_pad_name("s.\"foo \"\"bar\"\"\""),
+            "s.\"lp_foo \"\"bar\"\"\""
+        );
+    }
+
+    #[test]
+    fn test_fused_node_name_stays_beside_its_sibling() {
+        for (id, _, _, fused) in QUALIFIED_ID_CASES {
+            assert_eq!(
+                fused_node_name(id, "dee_fused"),
+                *fused,
+                "fused_node_name({id})"
+            );
+        }
     }
 }

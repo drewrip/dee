@@ -1,76 +1,73 @@
-//! NodeFusion -- collapse the DAG's Table nodes into one fused query.
+//! NodeFusion -- share the View work several Tables repeat, through one rollup.
 //!
 //! A dee DAG executes as one relation per node: every View is created as a
-//! view and every Table as its own `CREATE TABLE ... AS`. Work shared between
-//! two Tables is therefore planned -- and usually scanned -- once per Table
-//! that reaches it. That duplication is what HMP and OMP spend measured DAG
-//! runs deciding how to materialize away.
+//! view and every Table as its own `CREATE TABLE ... AS`, so a Table built on
+//! Views re-executes their SQL. When several Tables share upstream Views the
+//! same work runs once per Table -- the duplication HMP and OMP spend measured
+//! DAG runs deciding how to materialize away.
 //!
-//! This pass attacks the same duplication structurally, and for free. It
-//! builds one new node `f` that reproduces the whole upstream DAG as a `WITH`
-//! chain and emits every Table's rows in a single `UNION ALL`, so the engine
-//! sees one query and can share a CTE across every consumer inside it. Each
-//! original Table node becomes a cheap projection out of `f`:
+//! This pass removes it structurally, following the rollup spec (`SRS.md`):
+//!
+//! 1. Count how many times each View's SQL runs across the stored builds --
+//!    paths, not references -- and share every View that runs twice or more,
+//!    together with the Views between it and a table.
+//! 2. Paste the shared models into one new node, a `TempTable` whose query is a
+//!    `WITH` chain, and stack the rows each reader needs into one `UNION ALL`
+//!    discriminated by `kind`.
+//! 3. Point each reader at the rollup. A Table whose query moved in becomes a
+//!    projection of its kind; any other keeps its own SQL and reads the kind
+//!    through a CTE of its own.
 //!
 //! ```sql
-//! -- node f (TempTable, depends on nothing)
-//! WITH n_v1 AS (<v1 sql>),
-//!      n_t0 AS MATERIALIZED (<t0 sql, refs to v1 rewritten to n_v1>),
-//!      n_v2 AS (<v2 sql, refs to t0 rewritten to n_t0>),
-//!      n_t1 AS (<t1 sql, refs to v2 rewritten to n_v2>)
-//! SELECT 0 AS kind, a AS "k0_a", b AS "k0_b", CAST(NULL AS VARCHAR) AS "k1_c" FROM n_t0
+//! -- node dee_fused (TempTable)
+//! WITH n_stg AS (<stg sql>),
+//!      n_facts AS MATERIALIZED (<facts sql, its reference to stg now n_stg>),
+//!      n_by_region_v AS (<by_region_v sql>),
+//!      n_totals AS (<totals sql>)
+//! SELECT 1 AS kind, "region", "d", CAST(NULL AS BIGINT) AS "n", ... FROM n_by_region_v
 //! UNION ALL
-//! SELECT 1 AS kind, CAST(NULL AS INTEGER) AS "k0_a", CAST(NULL AS VARCHAR) AS "k0_b", c AS "k1_c" FROM n_t1
+//! SELECT 2 AS kind, CAST(NULL AS VARCHAR) AS "region", ..., "n", "s" FROM n_totals
+//! ORDER BY kind
 //!
-//! -- node t0                              -- node t1
-//! SELECT "k0_a" AS a, "k0_b" AS b         SELECT "k1_c" AS c
-//! FROM <f> WHERE kind = 0                 FROM <f> WHERE kind = 1
+//! -- node rpt_region: keeps its SQL          -- node totals: its query moved in
+//! WITH dee_k1_by_region_v AS (               SELECT "n" AS "n", "s" AS "s"
+//!   SELECT "region" AS "region", "d" AS "d"  FROM dee_fused WHERE kind = 2
+//!   FROM dee_fused WHERE kind = 1)
+//! SELECT * FROM dee_k1_by_region_v AS by_region_v
 //! ```
 //!
-//! The branches of a `UNION ALL` must agree on their row shape and the Tables
-//! do not, so the fused relation's schema is a `kind` discriminator followed
-//! by every Table's columns concatenated in `kind` order, each branch filling
-//! the columns that are not its own with NULL.
+//! Which models are shared, the rollup's query and every reader's rewrite live
+//! in [`rollup`]. This module plans under a materialization rule, installs the
+//! result, and runs the adaptive search over that rule.
 //!
-//! Like Pushdown, this is a pure rewrite: it measures nothing, runs the DAG
-//! zero times, and decides everything from the DAG in front of it.
+//! # What is preserved
 //!
-//! # What is fused, and what is not
+//! Every relation the DAG created is still created, under the same name and as
+//! the same kind of relation, with the same columns, types and rows. Views are
+//! never rewritten. A Table whose query decides its stored order or reads the
+//! clock -- `ORDER BY`, `LIMIT`, `current_timestamp`, `random()` -- keeps its
+//! query and runs it itself, so its stored order and its timestamps stay its
+//! own. Each branch fills the other kinds' columns with NULLs cast to the
+//! engine's own type, read off the engine: PostgreSQL resolves `UNION` types
+//! pairwise, and two leading untyped NULLs resolve to text.
 //!
-//! Every `Table` node is fused, *including* a Table that feeds another Table.
-//! An intermediate Table gets a CTE as well as a `kind` branch, so it is
-//! computed once inside `f`, read from that CTE by whatever is downstream of
-//! it, and still delivered as its own relation. Its CTE is materialized by
-//! default, because it is read by both its own branch and whatever is
-//! downstream of it; a Table that feeds nothing is read once and is not. That is also what keeps the
-//! graph acyclic: everything upstream of any Table ends up inside `f`, so `f`
-//! itself depends on nothing but the warehouse's own source tables.
+//! # What is materialized
 //!
-//! `TempTable` nodes are not fused. They are the landing pads HMP and OMP
-//! create, and their whole purpose is to be a materialization barrier the
-//! search placed deliberately; folding one into a CTE would silently undo the
-//! decision that put it there. A TempTable anywhere upstream of a Table makes
-//! the DAG unfusable rather than partly fused, because a partial fusion would
-//! have to leave that Table out and the point is to share work across all of
-//! them.
+//! A CTE is emitted `AS MATERIALIZED` when two or more CTEs or output branches
+//! read it inside the rollup. `nodefusion_materialize_ctes_override` names a
+//! different set, and the adaptive search measures candidate sets against the
+//! rule.
 //!
-//! # What fusion changes
+//! # What is left alone
 //!
-//! The rows a Table holds, its columns and their types are all preserved
-//! exactly -- that is the contract, and the tests check it against a real
-//! engine. What is not preserved is the *order* those rows are stored in: a
-//! Table whose query ends in `ORDER BY` gets that ordering applied inside its
-//! CTE and then loses it passing through the `UNION ALL`. A SQL table is an
-//! unordered relation and a consumer that cares must order for itself, so this
-//! breaks nothing that was guaranteed -- but a DAG that was quietly relying on
-//! `CREATE TABLE AS ... ORDER BY` laying rows down in order will notice.
-//!
-//! View nodes are left in the graph and are still created as views. A view is
-//! a definition rather than a computation, so the duplication costs nothing,
-//! and keeping them is what lets a sink view -- or any consumer that was not
-//! fused -- go on binding to the name it was written against.
+//! A DAG where no View runs twice has nothing to share and is left exactly as
+//! it was. A View that reads a stored node -- a Table, or a `TempTable` a
+//! materialization search placed -- stays outside the rollup, since that node
+//! is itself built from it; it is pasted into the stored builds that read it.
+//! A reader whose query cannot be rewritten on the parsed AST keeps reading
+//! what it read before, and the report names it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -86,19 +83,23 @@ use crate::{
         Optimization, OptimizerConfig, OptimizerError,
         combo::{ComboCoster, ComboScore, CostedCombo, Objective, canonical_order},
         common::{
-            bare_table_name, default_spool_factor, dialect_for_db, fused_node_name,
-            rewrite_node_refs, supports_materialized_hint,
+            bare_table_name, default_spool_factor, dialect_for_db, supports_materialized_hint,
         },
         dup::{SubtreeCost, SubtreeCostMethod},
         explain::{render_card_grid, render_ranked_table},
         learned::LearnedCostModel,
-        report::{IterationStat, NodeFusionDetail, PassDetail, PassOutcome},
+        report::{
+            IterationStat, NodeFusionCte, NodeFusionDetail, NodeFusionKind, PassDetail,
+            PassOutcome,
+        },
         step::{
             BudgetMetric, OptimizationType, RegisterContext, StepContext, StepOutcome, StepPhase,
         },
         store::{OptStore, Registration},
     },
 };
+
+mod rollup;
 
 /// The bare name of the fused node, before the schema prefix it inherits from
 /// the nodes it stands in front of.
@@ -112,19 +113,9 @@ const KIND_COLUMN: &str = "kind";
 // ---------------------------------------------------------------------------
 
 pub struct NodeFusionPass {
-    /// Emit inlined *View* CTEs `AS MATERIALIZED`. Never applies to an inlined
-    /// Table's CTE, which is materialized on its own account.
-    materialize_ctes: bool,
-    /// Materialize an inlined *View* CTE that more than one Table reads.
-    ///
-    /// Naive on purpose: it counts how many Table nodes reach the View through
-    /// the fused graph and materializes it above one, without pricing what the
-    /// View costs or what sharing it would save. That is the whole point of
-    /// having it -- a floor to measure a cost-based rule against.
-    naive_materialize_ctes: bool,
-    /// When set, the exact set of node IDs whose CTEs are materialized --
-    /// overriding both `materialize_ctes` and the Table default, so this is
-    /// also how an intermediate Table's CTE is made plain.
+    /// When set, the exact set of node IDs whose CTEs are materialized,
+    /// replacing the rollup's own rule (two or more readers inside it). A name
+    /// matches either as the full node ID or as its bare table name.
     materialize_override: Option<Vec<String>>,
     /// Choose the materialized set by measurement instead of by rule -- the
     /// `adaptive` variant. See [`NodeFusionState`].
@@ -181,16 +172,19 @@ struct SearchExplain {
 struct ExplainData {
     outcome: String,
     fused_id: Option<String>,
+    /// `exec(V)` for every View, sorted by node ID.
+    exec: Vec<(String, usize)>,
     /// The `WITH` chain, in emission order.
     ctes: Vec<ExplainCte>,
-    /// `(kind, node id, column count)` in kind order.
-    tables: Vec<(usize, String, usize)>,
-    fused_columns: usize,
+    kinds: Vec<NodeFusionKind>,
+    /// The rollup's columns after `kind`, with the engine's type for each.
+    columns: Vec<(String, String)>,
+    untouched: Vec<(String, String)>,
 }
 
 struct ExplainCte {
     node_id: String,
-    role: &'static str,
+    reason: String,
     cte_name: String,
     readers: usize,
     materialized: bool,
@@ -198,14 +192,8 @@ struct ExplainCte {
 }
 
 impl NodeFusionPass {
-    pub fn new(
-        materialize_ctes: bool,
-        naive_materialize_ctes: bool,
-        materialize_override: Option<Vec<String>>,
-    ) -> Self {
+    pub fn new(materialize_override: Option<Vec<String>>) -> Self {
         Self {
-            materialize_ctes,
-            naive_materialize_ctes,
             materialize_override,
             adaptive: false,
             objective: Objective::default(),
@@ -223,11 +211,15 @@ impl NodeFusionPass {
     }
 
     pub fn from_config(config: &OptimizerConfig) -> Self {
-        let mut pass = Self::new(
-            config.nodefusion_materialize_ctes,
-            config.nodefusion_naive_materialize_ctes,
-            config.nodefusion_materialize_ctes_override.clone(),
-        );
+        let mut pass = Self::new(config.nodefusion_materialize_ctes_override.clone());
+        if config.nodefusion_materialize_ctes || config.nodefusion_naive_materialize_ctes {
+            warn!(
+                "nodefusion: nodefusion_materialize_ctes and nodefusion_naive_materialize_ctes \
+                 are no longer read. The rollup materializes exactly the CTEs with two or more \
+                 readers inside it; use nodefusion_materialize_ctes_override to name a \
+                 different set"
+            );
+        }
         pass.adaptive = config.nodefusion_adaptive_materialize_ctes;
         pass.objective = config.nodefusion_objective;
         // At least one, matching HMP: a budget of zero would price nothing and
@@ -253,31 +245,11 @@ impl NodeFusionPass {
     /// obeyed. Refusing is the only safe answer -- picking one of the two
     /// would mean the pass quietly did something the config did not ask for.
     fn check_config(&self) -> Result<(), OptimizerError> {
-        if !self.adaptive {
-            return Ok(());
-        }
-        if self.naive_materialize_ctes {
-            return Err(OptimizerError::Config(
-                "nodefusion: the adaptive search and the naive reader-count rule are \
-                 incompatible -- the naive rule is the floor the search exists to beat, \
-                 and applying it to the search's own baseline would compare every \
-                 candidate against the wrong control"
-                    .into(),
-            ));
-        }
-        if self.materialize_override.is_some() {
+        if self.adaptive && self.materialize_override.is_some() {
             return Err(OptimizerError::Config(
                 "nodefusion: the adaptive search and an explicit materialize-CTE override \
                  are incompatible -- the override pins the exact set the search exists to \
                  find"
-                    .into(),
-            ));
-        }
-        if self.materialize_ctes {
-            return Err(OptimizerError::Config(
-                "nodefusion: the adaptive search and nodefusion_materialize_ctes are \
-                 incompatible -- the global switch materializes every View CTE regardless \
-                 of what the search decides"
                     .into(),
             ));
         }
@@ -304,19 +276,19 @@ impl std::fmt::Display for NotFusable {
 // Planning
 // ---------------------------------------------------------------------------
 
-/// One CTE in the fused query's `WITH` chain.
+/// One CTE in the rollup's `WITH` chain.
 #[derive(Debug, Clone)]
 struct CtePlan {
     node_id: String,
     cte_name: String,
     materialized: bool,
-    /// A Table's CTE also becomes a branch of the `UNION ALL`; a View's does not.
+    /// A Table's own query, moved into the rollup (spec step 3.3).
     is_table: bool,
     /// The other CTEs this one reads. The `WITH` chain is a DAG of its own, and
     /// this is its edge set -- what the adaptive search walks to find the path a
     /// materialized CTE puts a barrier on. See [`barrier_chain`].
     reads: Vec<String>,
-    /// How many CTEs and `UNION ALL` branches read this one.
+    /// How many CTEs and output branches read this one inside the rollup.
     ///
     /// More than one is what makes its `MATERIALIZED` flag *decidable*: a CTE
     /// read once is unfolded once whatever the hint says, so there is nothing
@@ -326,41 +298,18 @@ struct CtePlan {
     decidable: bool,
 }
 
-/// One Table node's branch of the fused `UNION ALL`, and the projection that
-/// reads it back out.
-#[derive(Debug, Clone)]
-struct TablePlan {
-    node_id: String,
-    kind: usize,
-    cte_name: String,
-    /// `(column name in the node's own schema, its name in the fused
-    /// relation)`, in the node's schema order.
-    columns: Vec<(String, String)>,
-}
-
 #[derive(Debug, Clone)]
 struct FusionPlan {
-    fused_id: String,
-    /// The `WITH` chain, in a topological order of the fused nodes.
+    rollup: rollup::RollupPlan,
+    /// The `WITH` chain, in emission order.
     ctes: Vec<CtePlan>,
-    /// The Tables, in `kind` order.
-    tables: Vec<TablePlan>,
-    /// Every column of the fused relation after `kind`, in `kind` order.
-    fused_columns: Vec<String>,
+    /// The CTEs emitted `AS MATERIALIZED`.
+    materialized: BTreeSet<String>,
 }
 
 impl FusionPlan {
     /// The CTEs whose `MATERIALIZED` flag the adaptive search gets to choose,
-    /// in the chain's own order.
-    ///
-    /// A CTE read more than once inside the fused query, whether it came from a
-    /// View or from an intermediate Table. Both directions are in play: a
-    /// shared View is a promotion from the plain default, and an intermediate
-    /// Table -- materialized by default because it was authored as a barrier --
-    /// is a demotion. That is a deliberate widening of what the rules can
-    /// express, and the reason the default is only a default: a barrier the
-    /// author put there to stop a *table* being recomputed is not obviously the
-    /// right barrier inside a single query, and the search is what settles it.
+    /// in the chain's own order: those read more than once inside the rollup.
     fn decidable(&self) -> Vec<String> {
         self.ctes
             .iter()
@@ -371,345 +320,160 @@ impl FusionPlan {
 
     /// The set currently marked `AS MATERIALIZED`.
     fn materialized_set(&self) -> HashSet<String> {
-        self.ctes
-            .iter()
-            .filter(|c| c.materialized)
-            .map(|c| c.node_id.clone())
-            .collect()
+        self.materialized.iter().cloned().collect()
     }
 }
 
-/// What decides whether one CTE is emitted `AS MATERIALIZED`.
+/// What decides which CTEs are emitted `AS MATERIALIZED`.
 ///
 /// Split out of the pass so the adaptive search can plan the same DAG under a
-/// set it is pricing without building a second pass to hold the setting. The
-/// two arms are the two ways the question gets answered: by the configured
-/// rules, or by naming the set outright.
+/// set it is pricing without building a second pass to hold the setting.
 #[derive(Debug, Clone, Copy)]
 enum MaterializeRule<'a> {
-    /// The configured rules: the Table default, plus the global and naive
-    /// switches, unless an override names the set.
-    Configured {
-        all_views: bool,
-        naive: bool,
-        over: Option<&'a [String]>,
-    },
-    /// Exactly this set among the decidable CTEs; an undecidable CTE keeps the
-    /// default it would have had.
-    ///
-    /// Every CTE whose default is `MATERIALIZED` is decidable -- that is only
-    /// ever an intermediate Table, which by definition has more than one reader
-    /// -- so in practice this is the exact set full stop. Spelled as "among the
-    /// decidable" anyway, because relying on that coincidence would make the
-    /// search silently wrong the day a new default is added.
+    /// The rollup's rule -- two or more readers inside it -- unless an override
+    /// names the set.
+    Configured { over: Option<&'a [String]> },
+    /// Exactly this set.
     Exact(&'a HashSet<String>),
 }
 
+/// Whether an override names `node_id`, as the full ID or its bare table name,
+/// so `"wh"."main"."orders"` can be asked for as `orders`.
+fn override_matches(list: &[String], node_id: &str) -> bool {
+    list.iter()
+        .any(|n| n == node_id || bare_table_name(n) == bare_table_name(node_id))
+}
+
+impl MaterializeRule<'_> {
+    fn choose(&self, plan: &rollup::RollupPlan) -> BTreeSet<String> {
+        let members = plan.selection.order.iter();
+        match self {
+            MaterializeRule::Exact(set) => members.filter(|id| set.contains(*id)).cloned().collect(),
+            MaterializeRule::Configured { over: Some(list) } => members
+                .filter(|id| override_matches(list, id))
+                .cloned()
+                .collect(),
+            MaterializeRule::Configured { over: None } => plan.selection.default_materialized(),
+        }
+    }
+}
+
 impl NodeFusionPass {
-    /// Decide what to fuse under the pass's own configuration.
+    /// Decide what to share under the pass's own configuration.
     fn plan(&self, dag: &Dag) -> Result<FusionPlan, NotFusable> {
         plan_fusion(
             dag,
             MaterializeRule::Configured {
-                all_views: self.materialize_ctes,
-                naive: self.naive_materialize_ctes,
                 over: self.materialize_override.as_deref(),
             },
         )
     }
-
-    /// Whether `node_id`'s CTE is emitted `AS MATERIALIZED` under this pass's
-    /// configuration. See [`MaterializeRule::wants`], where the rule lives.
-    ///
-    /// Test-only: the rewrite itself goes through `MaterializeRule` directly.
-    /// Kept because the tests that pin the rule's behaviour ask the question at
-    /// the level a reader thinks about it -- of a configured pass, not of a rule
-    /// value assembled by hand.
-    #[cfg(test)]
-    fn wants_materialized(
-        &self,
-        node_id: &str,
-        intermediate_table: bool,
-        shared_view: bool,
-    ) -> bool {
-        MaterializeRule::Configured {
-            all_views: self.materialize_ctes,
-            naive: self.naive_materialize_ctes,
-            over: self.materialize_override.as_deref(),
-        }
-        .wants(node_id, intermediate_table, shared_view)
-    }
 }
 
-impl MaterializeRule<'_> {
-    /// Whether `node_id`'s CTE is emitted `AS MATERIALIZED`.
-    ///
-    /// Under [`MaterializeRule::Configured`] with no override, an
-    /// *intermediate* Table's CTE is materialized -- a Table that feeds another
-    /// fused node -- and everything else follows the global default. That Table
-    /// was authored as a materialization barrier, and a plain CTE read by both
-    /// its own `UNION ALL` branch and whatever is downstream of it is free to
-    /// unfold a copy into each, which is the duplication this pass exists to
-    /// remove. A Table that feeds nothing is read exactly once, by its own
-    /// branch, so materializing it would buy nothing and is left to the global
-    /// default like any other CTE.
-    ///
-    /// `naive` adds the Views more than one Table reaches -- `shared_view`. It
-    /// is the narrower of the two global switches and is subsumed by
-    /// `all_views`, which turns on every View regardless.
-    ///
-    /// An override names the exact set instead, so it is also the way to make
-    /// an intermediate Table's CTE plain. A name matches either as the full
-    /// node ID or as its bare table name, so `"wh"."main"."orders"` can be
-    /// asked for as `orders`.
-    ///
-    /// [`MaterializeRule::Exact`] is the search's arm and is the set full stop.
-    /// It needs no default branch for an undecidable CTE because every default
-    /// that says `MATERIALIZED` is an intermediate Table, and an intermediate
-    /// Table always has more than one reader and so is always decidable --- so
-    /// an undecidable CTE's default is plain, and "not in the set" is already
-    /// that.
-    fn wants(&self, node_id: &str, intermediate_table: bool, shared_view: bool) -> bool {
-        match self {
-            MaterializeRule::Exact(set) => set.contains(node_id),
-            MaterializeRule::Configured {
-                over: Some(list), ..
-            } => list
-                .iter()
-                .any(|n| n == node_id || bare_table_name(n) == bare_table_name(node_id)),
-            MaterializeRule::Configured {
-                all_views, naive, ..
-            } => intermediate_table || *all_views || (*naive && shared_view),
-        }
-    }
-}
-
-/// Decide what to fuse, or why this DAG cannot be.
+/// Decide what the rollup shares and which of its CTEs are materialized, or
+/// why this DAG has nothing to share.
 ///
 /// A free function rather than a method because the adaptive search plans the
 /// same DAG dozens of times under different materialization sets, and it has no
 /// business constructing a pass to do it.
 fn plan_fusion(dag: &Dag, rule: MaterializeRule<'_>) -> Result<FusionPlan, NotFusable> {
-    {
-        let dialect = dialect_for_db(&dag.db);
-        let topo = dag.nodes.topological_sort();
-        if topo.len() < dag.nodes.num_nodes() {
-            return Err(NotFusable(
-                "the graph does not topologically sort, so there is no order to emit CTEs in"
-                    .into(),
-            ));
-        }
-
-        // Sorted by ID, not by topological position. A `kind` is a label
-        // rather than an ordering, and the fused query's text has to be a
-        // function of the DAG alone: `Graph::topological_sort` breaks ties
-        // between independent nodes in `HashMap` iteration order, which varies
-        // per process, so kinds taken from it would renumber run to run. dee's
-        // DAGs are content-addressed, so a rewrite that is not byte-stable
-        // mints a new version every time it runs over the same definition.
-        let mut tables: Vec<String> = dag
-            .nodes
-            .nodes()
-            .filter(|n| n.materialize == MaterializeMode::Table)
-            .map(|n| n.id.clone())
-            .collect();
-        tables.sort();
-        // One Table fused with itself is strictly worse than not fusing: the
-        // fused node computes exactly what the node did, and the node then
-        // copies it back out.
-        if tables.len() < 2 {
-            return Err(NotFusable(format!(
-                "{} Table node(s); fusion needs at least two to share anything",
-                tables.len()
-            )));
-        }
-
-        // Everything the Tables read, transitively -- the Tables included,
-        // since each one's own query becomes a CTE too.
-        let closure = upstream_closure(dag, &tables);
-        for id in &closure {
-            let Some(node) = dag.nodes.get(id.clone()) else {
-                return Err(NotFusable(format!("node '{id}' is not in the graph")));
-            };
-            if node.materialize == MaterializeMode::TempTable {
-                return Err(NotFusable(format!(
-                    "'{id}' is a TempTable upstream of a Table. A materialization search put it \
-                     there on purpose, and folding it into a CTE would undo that decision"
-                )));
-            }
-        }
-
-        // A name for the fused node in the same catalog/schema as the nodes
-        // that will read it, and not one already taken.
-        let fused_id = {
-            let sibling = &tables[0];
-            let mut candidate = fused_node_name(sibling, FUSED_BASE);
-            let mut n = 2;
-            while dag.nodes.get(candidate.clone()).is_some() {
-                candidate = fused_node_name(sibling, &format!("{FUSED_BASE}_{n}"));
-                n += 1;
-                if n > 64 {
-                    return Err(NotFusable(
-                        "could not find a free node ID for the fused node".into(),
-                    ));
-                }
-            }
-            candidate
-        };
-
-        // CTE names. Node IDs are qualified identifiers and a CTE name is a
-        // single one, so the bare names are what is available -- and two
-        // schemas may spell the same bare name, hence the dedupe.
-        let mut taken: HashSet<String> = HashSet::new();
-        let mut cte_names: HashMap<String, String> = HashMap::new();
-        for id in &closure {
-            let base = format!("n_{}", bare_table_name(id));
-            let mut name = base.clone();
-            let mut n = 2;
-            while !taken.insert(name.clone()) {
-                name = format!("{base}_{n}");
-                n += 1;
-            }
-            cte_names.insert(id.clone(), name);
-        }
-
-        // The fused relation's columns: every Table's schema, concatenated in
-        // kind order, each prefixed by its kind so two Tables spelling the
-        // same column name stay distinct.
-        let mut fused_columns: Vec<String> = Vec::new();
-        let mut fused_taken: HashSet<String> = HashSet::new();
-        let mut table_plans: Vec<TablePlan> = Vec::new();
-        for (kind, id) in tables.iter().enumerate() {
-            let node = dag.nodes.get(id.clone()).expect("checked above");
-            let Some(schema) = node.schema.as_ref() else {
-                return Err(NotFusable(format!(
-                    "'{id}' has no resolved schema; call resolve_schemas before NodeFusion"
-                )));
-            };
-            let fields = schema.flattened_fields();
-            if fields.is_empty() {
-                return Err(NotFusable(format!("'{id}' resolved to a schema with no columns")));
-            }
-            let mut columns = Vec::with_capacity(fields.len());
-            for field in fields {
-                let base = format!("k{kind}_{}", field.name());
-                let mut name = base.clone();
-                let mut n = 2;
-                while !fused_taken.insert(name.clone()) {
-                    name = format!("{base}_{n}");
-                    n += 1;
-                }
-                fused_columns.push(name.clone());
-                columns.push((field.name().clone(), name));
-            }
-            table_plans.push(TablePlan {
+    let rollup = rollup::plan_rollup(dag)?;
+    // Nothing to decide where the dialect ignores the hint.
+    let hint = supports_materialized_hint(dialect_for_db(&dag.db));
+    let materialized = if hint {
+        rule.choose(&rollup)
+    } else {
+        BTreeSet::new()
+    };
+    let members: HashSet<&String> = rollup.selection.order.iter().collect();
+    let ctes = rollup
+        .selection
+        .order
+        .iter()
+        .map(|id| {
+            let mut reads: Vec<String> = dag
+                .nodes
+                .get(id.clone())
+                .map(|n| {
+                    n.depends_on
+                        .iter()
+                        .filter(|d| members.contains(d))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            reads.sort();
+            let readers = rollup.selection.readers.get(id).copied().unwrap_or(0);
+            CtePlan {
                 node_id: id.clone(),
-                kind,
-                cte_name: cte_names[id].clone(),
-                columns,
-            });
-        }
-
-        // Which fused nodes another fused node reads. A Table in here is an
-        // *intermediate* Table: something downstream of it was fused too, so
-        // its CTE is read by more than its own `UNION ALL` branch.
-        let mut feeds_another: HashSet<&String> = HashSet::new();
-        for id in &closure {
-            if let Some(node) = dag.nodes.get(id.clone()) {
-                for dep in &node.depends_on {
-                    if let Some(dep) = closure.get(dep) {
-                        feeds_another.insert(dep);
-                    }
-                }
+                cte_name: rollup.cte_names[id].clone(),
+                materialized: materialized.contains(id),
+                is_table: matches!(
+                    rollup.selection.members.get(id),
+                    Some(rollup::CteReason::TableQuery { .. })
+                ),
+                reads,
+                readers,
+                // A CTE read once is computed exactly once either way, so both
+                // settings produce the same work and the search would be
+                // spending runs on a coin flip.
+                decidable: hint && readers > 1,
             }
-        }
-
-        // How many Tables reach each fused node. The naive materialization
-        // rule reads off this: a View more than one Table reaches is a View
-        // whose work the fused query would otherwise do more than once.
-        let readers = table_readers(dag, &tables, &closure);
-
-        // The `WITH` chain is emitted in a topological order, so a CTE is
-        // always defined before the CTE that reads it -- and in a *stable*
-        // one, so the same DAG always produces the same text.
-        let table_set: HashSet<&String> = tables.iter().collect();
-        let hint = supports_materialized_hint(dialect);
-        // How many CTEs and branches read each one. A Table reads itself for
-        // its own `UNION ALL` branch, which `table_readers` already counts, so
-        // this is the number of places the fused query would have to compute it
-        // if its CTE were unfolded rather than shared.
-        let ctes: Vec<CtePlan> = stable_topological_order(dag, &closure)
-            .iter()
-            .map(|id| {
-                let is_table = table_set.contains(id);
-                let intermediate_table = is_table && feeds_another.contains(id);
-                let reader_count = readers.get(id).copied().unwrap_or(0);
-                let shared_view = !is_table && reader_count > 1;
-                let reads: Vec<String> = dag
-                    .nodes
-                    .get(id.clone())
-                    .map(|n| {
-                        let mut deps: Vec<String> = n
-                            .depends_on
-                            .iter()
-                            .filter(|d| closure.contains(*d))
-                            .cloned()
-                            .collect();
-                        deps.sort();
-                        deps
-                    })
-                    .unwrap_or_default();
-                CtePlan {
-                    node_id: id.clone(),
-                    cte_name: cte_names[id].clone(),
-                    materialized: hint
-                        && rule.wants(id, intermediate_table, shared_view),
-                    is_table,
-                    reads,
-                    readers: reader_count,
-                    // Nothing to decide where the dialect ignores the hint, and
-                    // nothing to decide for a CTE read once: it is computed
-                    // exactly once either way, so both settings produce the same
-                    // work and the search would be spending runs on a coin flip.
-                    decidable: hint && reader_count > 1,
-                }
-            })
-            .collect();
-
-        Ok(FusionPlan {
-            fused_id,
-            ctes,
-            tables: table_plans,
-            fused_columns,
         })
+        .collect();
+    Ok(FusionPlan {
+        rollup,
+        ctes,
+        materialized,
+    })
+}
+
+/// Why a model is in the rollup, in words.
+fn describe_reason(reason: &rollup::CteReason) -> String {
+    match reason {
+        rollup::CteReason::Repeated { exec } => format!("its SQL runs {exec} times"),
+        rollup::CteReason::OnPath => "on a path from a shared model to a table".to_string(),
+        rollup::CteReason::Upstream => "read by a shared model".to_string(),
+        rollup::CteReason::TableQuery { parent } => {
+            format!("a table query over the shared {}", bare_table_name(parent))
+        }
+    }
+}
+
+fn describe_consumer(consumer: &rollup::KindConsumer) -> String {
+    match consumer {
+        rollup::KindConsumer::Own(id) => format!("{id} (its own query)"),
+        rollup::KindConsumer::Direct(id) => format!("{id} (reads it)"),
+        rollup::KindConsumer::Pasted(id) => format!("{id} (pasted into its readers)"),
     }
 }
 
 impl NodeFusionPass {
-
-
     /// Rewrite `dag` in place under this pass's configuration. Returns what
     /// happened, for the report.
-    pub fn rewrite(&mut self, dag: &mut Dag) -> Result<PassOutcome, OptimizerError> {
+    ///
+    /// Needs the connection the DAG will run on: each kind's columns are read
+    /// off the engine, so a branch can fill another kind's columns with a NULL
+    /// of exactly the right type.
+    pub async fn rewrite<C>(&mut self, conn: &C, dag: &mut Dag) -> Result<PassOutcome, OptimizerError>
+    where
+        C: Connector + Send + Sync,
+    {
         // Cloned rather than borrowed: the rule holds a slice of
         // `materialize_override`, and `rewrite_under` needs `&mut self` for the
         // explain data it fills in.
         let over = self.materialize_override.clone();
-        let rule = MaterializeRule::Configured {
-            all_views: self.materialize_ctes,
-            naive: self.naive_materialize_ctes,
-            over: over.as_deref(),
-        };
-        self.rewrite_under(dag, rule)
+        self.rewrite_under(conn, dag, MaterializeRule::Configured { over: over.as_deref() })
+            .await
     }
 
     /// The CTEs the adaptive search would be allowed to decide about on `dag`:
-    /// those read more than once inside the fused query.
+    /// those read more than once inside the rollup.
     ///
     /// Public so tooling can enumerate the configurations the search can reach
     /// without reimplementing the reader count -- in particular the
     /// `nodefusion_validate` example, which checks every one of them against a
-    /// real warehouse. Empty when the DAG cannot be fused at all.
+    /// real warehouse. Empty when the DAG has nothing to share.
     pub fn decidable_ctes(&self, dag: &Dag) -> Vec<String> {
         self.plan(dag).map(|p| p.decidable()).unwrap_or_default()
     }
@@ -722,131 +486,123 @@ impl NodeFusionPass {
     /// semantic-equivalence check has to exercise. It is *not* the same arm as
     /// `nodefusion_materialize_ctes_override`, which also matches bare table
     /// names; checking the override instead would leave this path unchecked.
-    pub fn rewrite_with(
+    pub async fn rewrite_with<C>(
         &mut self,
+        conn: &C,
         dag: &mut Dag,
         set: &HashSet<String>,
-    ) -> Result<PassOutcome, OptimizerError> {
-        self.rewrite_under(dag, MaterializeRule::Exact(set))
+    ) -> Result<PassOutcome, OptimizerError>
+    where
+        C: Connector + Send + Sync,
+    {
+        self.rewrite_under(conn, dag, MaterializeRule::Exact(set)).await
     }
 
-    fn rewrite_under(
+    async fn rewrite_under<C>(
         &mut self,
+        conn: &C,
         dag: &mut Dag,
         rule: MaterializeRule<'_>,
-    ) -> Result<PassOutcome, OptimizerError> {
+    ) -> Result<PassOutcome, OptimizerError>
+    where
+        C: Connector + Send + Sync,
+    {
         let plan = match plan_fusion(dag, rule) {
             Ok(plan) => plan,
             Err(why) => return Ok(self.not_fused(why)),
         };
-
-        let dialect = dialect_for_db(&dag.db);
-        let FusedSql {
-            sql: fused_sql,
-            verbatim_bodies,
-        } = match build_fused_sql(dag, &plan, dialect) {
-            Ok(built) => built,
+        let columns = match rollup::resolve_kind_columns(conn, dag, &plan.rollup).await {
+            Ok(columns) => columns,
+            Err(why) => return Ok(self.not_fused(why)),
+        };
+        let emitted = match rollup::emit(dag, &plan.rollup, &columns, &plan.materialized) {
+            Ok(emitted) => emitted,
             Err(why) => return Ok(self.not_fused(why)),
         };
 
-        // Parse what we assembled before handing it to the executor, so a
-        // malformed fused query is a failed optimization rather than a DAG
-        // that only breaks at run time. This can only be asked when every body
-        // was rewritten -- each of those round-tripped through the parser, so a
-        // failure here is the frame. A body carried through verbatim may be
-        // one the parser cannot read at all (that is why it was carried
-        // through), and it would fail this check while saying nothing about
-        // the frame. The engine is the authority on those either way.
-        if verbatim_bodies == 0 {
-            polyglot_sql::parse_one(&fused_sql, dialect).map_err(|e| {
-                OptimizerError::Exec(format!(
-                    "nodefusion built a fused query that does not parse ({e}); \
-                     refusing to install it"
-                ))
-            })?;
-        } else {
-            debug!(
-                "nodefusion: {verbatim_bodies} CTE bod(ies) are used as authored, so the \
-                 assembled query was not parse-checked"
-            );
+        // Have the engine plan the rollup before installing it, so a query it
+        // rejects is a failed optimization rather than a DAG that only breaks
+        // at run time. The engine is the authority here: CTE bodies that name
+        // no other member are carried through as authored, and may use syntax
+        // the parser does not cover.
+        if let Err(e) = conn.column_types(&emitted.fused_sql).await {
+            return Err(OptimizerError::Exec(format!(
+                "nodefusion built a rollup the engine rejects ({e}); refusing to install it"
+            )));
         }
+        debug!(
+            "nodefusion: {} of {} CTE bod(ies) used as authored",
+            emitted.verbatim_bodies,
+            plan.ctes.len()
+        );
 
-        // The fused node reads nothing but the warehouse's own source tables:
-        // everything upstream of a Table is inside it now.
-        dag.nodes
-            .add_node(TransformNode {
-                id: plan.fused_id.clone(),
-                query_text: fused_sql,
-                materialize: MaterializeMode::TempTable,
-                depends_on: HashSet::new(),
-                schema: None,
+        // On a copy, so a rewrite that leaves the graph inconsistent leaves the
+        // DAG exactly as it was.
+        let mut next = dag.clone();
+        rollup::install(&mut next, &emitted)
+            .map_err(|e| OptimizerError::Exec(format!("nodefusion: {e}")))?;
+        *dag = next;
+
+        let sel = &plan.rollup.selection;
+        let mut exec: Vec<(String, usize)> = sel.exec.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        exec.sort();
+        let kinds: Vec<NodeFusionKind> = sel
+            .kinds
+            .iter()
+            .map(|k| NodeFusionKind {
+                kind: k.kind,
+                cte: k.cte.clone(),
+                consumers: k.consumers.iter().map(describe_consumer).collect(),
+                pushed_filter: emitted
+                    .pushed
+                    .iter()
+                    .find(|(n, _)| *n == k.kind)
+                    .map(|(_, p)| p.clone()),
             })
-            .map_err(|e| OptimizerError::Exec(format!("nodefusion: adding the fused node: {e}")))?;
-
-        for table in &plan.tables {
-            let projection = table
-                .columns
-                .iter()
-                .map(|(original, fused)| format!("\"{fused}\" AS \"{original}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let node = dag
-                .nodes
-                .get_mut(table.node_id.clone())
-                .expect("planned from this graph");
-            node.query_text = format!(
-                "SELECT {projection} FROM {} WHERE {KIND_COLUMN} = {}",
-                plan.fused_id, table.kind
-            );
-            // The node's own schema is unchanged -- the projection puts every
-            // column back under its original name, in its original order -- so
-            // it is deliberately left alone for whatever reads it next.
-            node.depends_on = HashSet::from([plan.fused_id.clone()]);
-        }
-
-        dag.nodes.check().map_err(|e| {
-            OptimizerError::Exec(format!("nodefusion produced an inconsistent graph: {e}"))
-        })?;
-
+            .collect();
+        let columns: Vec<(String, String)> = emitted
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.ty.clone()))
+            .collect();
         let views_inlined = plan.ctes.iter().filter(|c| !c.is_table).count();
-        let materialized = plan.ctes.iter().filter(|c| c.materialized).count();
         let outcome = format!(
-            "fused {} Table node(s) and {views_inlined} inlined View(s) into '{}'",
-            plan.tables.len(),
-            plan.fused_id
+            "shared {} model(s) through '{}', read back as {} kind(s) by {} rewritten node(s)",
+            plan.ctes.len(),
+            emitted.fused_id,
+            kinds.len(),
+            emitted.rewrites.len()
         );
         debug!("nodefusion: {outcome}");
 
         self.explain_data = Some(ExplainData {
             outcome: outcome.clone(),
-            fused_id: Some(plan.fused_id.clone()),
+            fused_id: Some(emitted.fused_id.clone()),
+            exec: exec.clone(),
             ctes: plan
                 .ctes
                 .iter()
                 .map(|c| ExplainCte {
                     node_id: c.node_id.clone(),
-                    role: if c.is_table { "Table" } else { "View" },
+                    reason: describe_reason(&sel.members[&c.node_id]),
                     cte_name: c.cte_name.clone(),
                     readers: c.readers,
                     materialized: c.materialized,
                     decidable: c.decidable,
                 })
                 .collect(),
-            tables: plan
-                .tables
-                .iter()
-                .map(|t| (t.kind, t.node_id.clone(), t.columns.len()))
-                .collect(),
-            fused_columns: plan.fused_columns.len(),
+            kinds: kinds.clone(),
+            columns: columns.clone(),
+            untouched: emitted.untouched.clone(),
         });
 
         let mut record = PassOutcome::empty().with_detail(PassDetail::NodeFusion(
             NodeFusionDetail {
-                fused_node: Some(plan.fused_id.clone()),
-                tables_fused: plan.tables.len(),
+                fused_node: Some(emitted.fused_id.clone()),
+                tables_fused: emitted.rewrites.len(),
                 views_inlined,
-                materialized_ctes: materialized,
-                fused_columns: plan.fused_columns.len(),
+                materialized_ctes: emitted.materialized.len(),
+                fused_columns: emitted.columns.len(),
                 outcome,
                 adaptive: self.adaptive,
                 objective: self.adaptive.then(|| self.objective.as_str().to_string()),
@@ -865,10 +621,25 @@ impl NodeFusionPass {
                     .as_ref()
                     .map(|s| s.candidates.len())
                     .unwrap_or(0),
+                exec_counts: exec,
+                ctes: plan
+                    .ctes
+                    .iter()
+                    .map(|c| NodeFusionCte {
+                        node: c.node_id.clone(),
+                        reason: describe_reason(&sel.members[&c.node_id]),
+                        readers: c.readers,
+                        materialized: c.materialized,
+                    })
+                    .collect(),
+                kinds,
+                columns,
+                pushed_filters: emitted.pushed.clone(),
+                untouched: emitted.untouched.clone(),
             },
         ));
-        // One change: the DAG became one fused node. The Tables rewritten to
-        // read it are that change's consequence, not separate decisions.
+        // One change: the DAG gained a rollup. The nodes rewritten to read it
+        // are that change's consequence, not separate decisions.
         record.changes_applied = 1;
         record.candidates_considered = 1;
         record.working_set_size = plan.ctes.len() as u32;
@@ -883,9 +654,11 @@ impl NodeFusionPass {
         self.explain_data = Some(ExplainData {
             outcome: outcome.clone(),
             fused_id: None,
+            exec: Vec::new(),
             ctes: Vec::new(),
-            tables: Vec::new(),
-            fused_columns: 0,
+            kinds: Vec::new(),
+            columns: Vec::new(),
+            untouched: Vec::new(),
         });
         PassOutcome::empty().with_detail(PassDetail::NodeFusion(NodeFusionDetail {
             fused_node: None,
@@ -899,6 +672,12 @@ impl NodeFusionPass {
             baseline_runtime_ms: None,
             final_runtime_ms: None,
             candidates_costed: 0,
+            exec_counts: Vec::new(),
+            ctes: Vec::new(),
+            kinds: Vec::new(),
+            columns: Vec::new(),
+            pushed_filters: Vec::new(),
+            untouched: Vec::new(),
         }))
     }
 
@@ -999,7 +778,7 @@ impl NodeFusionPass {
             r#"<div class="panel">
           <h2>The adaptive search</h2>
           {why}
-          <div class="subtle">Candidate sets of CTEs to mark <code>AS MATERIALIZED</code>, priced by EXPLAINing the fused query with each set applied and ordered by the objective. <b>Work removed</b> is relative to the default rule, higher is better; <b>Path</b> is the longest chain through the WITH clause with that set materialized, lower is better. The two disagree because materializing removes repeated computation and inserts a barrier, which is why the objective picks both the order candidates are trialled in and the test each has to pass. The spool term behind both is modelled rather than measured.</div>
+          <div class="subtle">Candidate sets of CTEs to mark <code>AS MATERIALIZED</code>, priced by EXPLAINing the rollup with each set applied and ordered by the objective. <b>Work removed</b> is relative to the default rule, higher is better; <b>Path</b> is the longest chain through the WITH clause with that set materialized, lower is better. The two disagree because materializing removes repeated computation and inserts a barrier, which is why the objective picks both the order candidates are trialled in and the test each has to pass. The spool term behind both is modelled rather than measured.</div>
           {cards}
           {table}
         </div>"#
@@ -1015,7 +794,7 @@ impl NodeFusionPass {
         let cards = render_card_grid(&[
             ("Outcome", data.outcome.clone()),
             (
-                "Fused node",
+                "Rollup node",
                 data.fused_id.clone().unwrap_or_else(|| "-".into()),
             ),
             ("CTEs", data.ctes.len().to_string()),
@@ -1023,8 +802,16 @@ impl NodeFusionPass {
                 "Materialized CTEs",
                 data.ctes.iter().filter(|c| c.materialized).count().to_string(),
             ),
-            ("Fused columns", data.fused_columns.to_string()),
+            ("Kinds", data.kinds.len().to_string()),
+            ("Rollup columns", data.columns.len().to_string()),
         ]);
+
+        let exec_rows: Vec<Vec<String>> = data
+            .exec
+            .iter()
+            .map(|(id, n)| vec![id.clone(), n.to_string()])
+            .collect();
+        let exec_table = render_ranked_table(&["View", "Executions"], &exec_rows);
 
         let cte_rows: Vec<Vec<String>> = data
             .ctes
@@ -1034,7 +821,7 @@ impl NodeFusionPass {
                 vec![
                     (i + 1).to_string(),
                     cte.node_id.clone(),
-                    cte.role.to_string(),
+                    cte.reason.clone(),
                     cte.cte_name.clone(),
                     cte.readers.to_string(),
                     if cte.materialized { "MATERIALIZED" } else { "plain" }.to_string(),
@@ -1046,34 +833,70 @@ impl NodeFusionPass {
             })
             .collect();
         let cte_table = render_ranked_table(
-            &["#", "Node", "Role", "CTE", "Readers", "Hint", "Decided by"],
+            &["#", "Model", "Why it is shared", "CTE", "Readers", "Hint", "Decided by"],
             &cte_rows,
         );
 
         let search_panel = self.search_panel();
 
         let kind_rows: Vec<Vec<String>> = data
-            .tables
+            .kinds
             .iter()
-            .map(|(kind, node_id, cols)| {
-                vec![kind.to_string(), node_id.clone(), cols.to_string()]
+            .map(|k| {
+                vec![
+                    k.kind.to_string(),
+                    k.cte.clone(),
+                    k.consumers.join("; "),
+                    k.pushed_filter.clone().unwrap_or_else(|| "-".into()),
+                ]
             })
             .collect();
-        let kind_table = render_ranked_table(&["kind", "Table", "Columns"], &kind_rows);
+        let kind_table = render_ranked_table(&["kind", "Model", "Read by", "Pushed filter"], &kind_rows);
+
+        let column_rows: Vec<Vec<String>> = data
+            .columns
+            .iter()
+            .map(|(name, ty)| vec![name.clone(), ty.clone()])
+            .collect();
+        let column_table = render_ranked_table(&["Column", "Type"], &column_rows);
+
+        let untouched = if data.untouched.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<div class="subtle"><b>Left reading what they read before:</b> {}</div>"#,
+                data.untouched
+                    .iter()
+                    .map(|(node, why)| format!("{node} ({why})"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
 
         format!(
             r#"<div class="section-stack">
         {cards}
         {search_panel}
         <div class="panel">
+          <h2>Executions</h2>
+          <div class="subtle">How many times each View's SQL runs across the stored builds: the sum, over its readers, of 1 for a table and the reader's own count for a view. Paths, not references. A View that runs twice or more is what the rollup shares.</div>
+          {exec_table}
+        </div>
+        <div class="panel">
           <h2>The WITH chain</h2>
-          <div class="subtle">Emitted in the graph's own topological order, so every CTE is defined before the CTE that reads it. A Table's CTE is materialized by default -- it was authored as a materialization barrier, and a plain CTE read by several downstream CTEs may be unfolded into each of them, which is the duplication this pass removes.</div>
+          <div class="subtle">Every shared model, in topological order, and why it is in the rollup. A CTE is materialized when two or more CTEs or output branches read it inside the rollup.</div>
           {cte_table}
         </div>
         <div class="panel">
-          <h2>The UNION ALL</h2>
-          <div class="subtle">One branch per Table, discriminated by <code>kind</code>. The fused relation's columns are these schemas concatenated in kind order; each branch fills the columns that are not its own with NULL, and each Table reads its own back out under their original names.</div>
+          <h2>Kinds</h2>
+          <div class="subtle">The shared models something outside the rollup reads, one <code>UNION ALL</code> branch each. A table whose own query moved in becomes a projection of its kind; any other reader keeps its SQL and reads the kind through a CTE of its own. Views are never rewritten.</div>
+          {untouched}
           {kind_table}
+        </div>
+        <div class="panel">
+          <h2>Rollup columns</h2>
+          <div class="subtle">After <code>kind</code>. A column shared by name and type appears once; a clash is renamed <code>model__column</code> and aliased back. Each branch fills the others with NULLs cast to the engine's own type.</div>
+          {column_table}
         </div>
       </div>"#
         )
@@ -1290,7 +1113,10 @@ struct CteProfile {
 struct FusedComboCoster<'a, C> {
     conn: &'a C,
     dag: &'a Dag,
-    dialect: DialectType,
+    /// The rollup being priced and its kinds' column types, resolved once:
+    /// neither depends on which CTEs are materialized.
+    plan: &'a rollup::RollupPlan,
+    columns: &'a rollup::KindColumns,
     coster: &'a dyn SubtreeCost,
     /// Per-CTE standalone cost, keyed by node id.
     profiles: &'a HashMap<String, CteProfile>,
@@ -1412,8 +1238,10 @@ where
 
     /// The compute the engine's plan implies for `set`.
     async fn compute_of(&self, set: &HashSet<String>) -> Option<f64> {
-        let plan = plan_fusion(self.dag, MaterializeRule::Exact(set)).ok()?;
-        let FusedSql { sql, .. } = build_fused_sql(self.dag, &plan, self.dialect).ok()?;
+        let materialized: BTreeSet<String> = set.iter().cloned().collect();
+        let sql = rollup::emit(self.dag, self.plan, self.columns, &materialized)
+            .ok()?
+            .fused_sql;
         let raw = match self.conn.explain(&sql).await {
             Ok(Some(raw)) => raw,
             Ok(None) => return None,
@@ -1750,6 +1578,7 @@ impl NodeFusionPass {
         conn: &C,
         dag: &Dag,
         plan: &FusionPlan,
+        columns: &rollup::KindColumns,
         coster: &dyn SubtreeCost,
         model: &LearnedCostModel,
         dialect: DialectType,
@@ -1757,9 +1586,8 @@ impl NodeFusionPass {
     where
         C: Connector + Send + Sync,
     {
-        let all: HashSet<String> = plan.ctes.iter().map(|c| c.node_id.clone()).collect();
-        let probe = plan_fusion(dag, MaterializeRule::Exact(&all)).ok()?;
-        let FusedSql { sql, .. } = build_fused_sql(dag, &probe, dialect).ok()?;
+        let all: BTreeSet<String> = plan.ctes.iter().map(|c| c.node_id.clone()).collect();
+        let sql = rollup::emit(dag, &plan.rollup, columns, &all).ok()?.fused_sql;
         let raw = match conn.explain(&sql).await {
             Ok(Some(raw)) => raw,
             Ok(None) => {
@@ -1774,7 +1602,7 @@ impl NodeFusionPass {
         let roots = conn.parse_plan(&raw)?;
 
         let mut profiles: HashMap<String, CteProfile> = HashMap::new();
-        for cte in &probe.ctes {
+        for cte in &plan.ctes {
             let Some(region) = crate::plan::find_subplan(&roots, &cte.cte_name) else {
                 debug!(
                     "nodefusion: '{}' has no region in the probe plan; sets naming it will be \
@@ -1833,19 +1661,28 @@ impl NodeFusionPass {
     {
         let dialect = dialect_for_db(&dag.db);
         let Ok(plan) = self.plan(dag) else {
-            return SearchSetup::nothing("this DAG cannot be fused, so there is no WITH chain to search");
+            return SearchSetup::nothing("this DAG has nothing for a rollup to share, so there is no WITH chain to search");
         };
         let decidable = plan.decidable();
         if decidable.is_empty() {
             return SearchSetup::nothing(
-                "no CTE in the fused query has more than one reader, so every one of them is \
+                "no CTE in the rollup has more than one reader, so every one of them is \
                  computed once whichever way the hint goes",
             );
         }
 
+        let columns = match rollup::resolve_kind_columns(conn, dag, &plan.rollup).await {
+            Ok(columns) => columns,
+            Err(why) => {
+                return SearchSetup::nothing(&format!(
+                    "the rollup's column types could not be resolved: {why}"
+                ));
+            }
+        };
+
         let coster = self.cost_model.coster(model);
         let Some(profiles) = self
-            .profile_ctes(conn, dag, &plan, coster.as_ref(), model, dialect)
+            .profile_ctes(conn, dag, &plan, &columns, coster.as_ref(), model, dialect)
             .await
         else {
             return SearchSetup::nothing(
@@ -1858,7 +1695,8 @@ impl NodeFusionPass {
         let fused = FusedComboCoster {
             conn,
             dag,
-            dialect,
+            plan: &plan.rollup,
+            columns: &columns,
             coster: coster.as_ref(),
             profiles: &profiles,
             chain: &plan.ctes,
@@ -1984,12 +1822,20 @@ impl NodeFusionPass {
     }
 
     /// Fuse `dag` under `set`, or under the default rule when `set` is `None`.
-    fn apply(&mut self, dag: &mut Dag, set: Option<&[String]>) -> Result<PassOutcome, OptimizerError> {
+    async fn apply<C>(
+        &mut self,
+        conn: &C,
+        dag: &mut Dag,
+        set: Option<&[String]>,
+    ) -> Result<PassOutcome, OptimizerError>
+    where
+        C: Connector + Send + Sync,
+    {
         match set {
-            None => self.rewrite(dag),
+            None => self.rewrite(conn, dag).await,
             Some(members) => {
                 let exact: HashSet<String> = members.iter().cloned().collect();
-                self.rewrite_with(dag, &exact)
+                self.rewrite_with(conn, dag, &exact).await
             }
         }
     }
@@ -2006,6 +1852,7 @@ impl NodeFusionPass {
             // Not registered, or registered and never stepped.
             return Ok(StepOutcome::Idle);
         };
+        let conn = Arc::clone(&ctx.conn);
 
         match state.phase.as_str() {
             // Unlike HMP, the baseline is *not* the DAG as it stands. HMP's
@@ -2015,7 +1862,7 @@ impl NodeFusionPass {
             // "win" for reasons that have nothing to do with which CTEs are
             // materialized.
             "baseline" => {
-                let record = self.apply(ctx.dag, None)?;
+                let record = self.apply(conn.as_ref(), ctx.dag, None).await?;
                 Ok(StepOutcome::Trial {
                     label: "fusion under the default rule (baseline)".to_string(),
                     budget_ms: None,
@@ -2032,7 +1879,7 @@ impl NodeFusionPass {
                     // never happened, or one whose `After` step was missed.
                     // Propose it again rather than moving on, so the candidate
                     // is measured rather than silently skipped.
-                    let record = self.apply(ctx.dag, Some(&in_flight.set))?;
+                    let record = self.apply(conn.as_ref(), ctx.dag, Some(&in_flight.set)).await?;
                     return Ok(StepOutcome::Trial {
                         label: describe_set(&in_flight.set),
                         budget_ms: None,
@@ -2064,7 +1911,11 @@ impl NodeFusionPass {
                     let candidate = state.candidates[state.cursor].clone();
                     state.cursor += 1;
                     let mut trial = ctx.dag.clone();
-                    if self.apply(&mut trial, Some(&candidate.set)).is_err() {
+                    if self
+                        .apply(conn.as_ref(), &mut trial, Some(&candidate.set))
+                        .await
+                        .is_err()
+                    {
                         continue;
                     }
                     let sig = crate::opt::hmp::dag_signature(&trial);
@@ -2077,7 +1928,9 @@ impl NodeFusionPass {
                         sig,
                         makespan_s: candidate.makespan_s,
                     });
-                    let record = self.apply(ctx.dag, Some(&candidate.set))?;
+                    let record = self
+                        .apply(conn.as_ref(), ctx.dag, Some(&candidate.set))
+                        .await?;
                     self.save_state(ctx.store, ctx.dag_id, &state).await?;
                     return Ok(StepOutcome::Trial {
                         label: describe_set(&candidate.set),
@@ -2113,7 +1966,8 @@ impl NodeFusionPass {
     {
         state.phase = "converged".to_string();
         let best = state.best_set.clone();
-        let record = self.apply(ctx.dag, best.as_deref())?;
+        let conn = Arc::clone(&ctx.conn);
+        let record = self.apply(conn.as_ref(), ctx.dag, best.as_deref()).await?;
         debug!(
             "nodefusion: converged on {}",
             best.as_deref().map(describe_set).unwrap_or_else(|| "the default rule".into())
@@ -2469,28 +2323,6 @@ impl NodeFusionPass {
     }
 }
 
-/// Every node `tables` read, transitively, plus `tables` themselves.
-fn upstream_closure(dag: &Dag, tables: &[String]) -> HashSet<String> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = tables.to_vec();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        if let Some(node) = dag.nodes.get(id) {
-            // A dependency that is not a node is one of the warehouse's own
-            // source tables, which the fused query reads by name like any
-            // other query does.
-            for dep in &node.depends_on {
-                if dag.nodes.get(dep.clone()).is_some() {
-                    stack.push(dep.clone());
-                }
-            }
-        }
-    }
-    seen
-}
-
 /// A topological order of `closure` that depends only on the graph, never on
 /// how a `HashMap` happened to iterate.
 ///
@@ -2529,166 +2361,6 @@ fn stable_topological_order(dag: &Dag, closure: &HashSet<String>) -> Vec<String>
         }
     }
     order
-}
-
-/// How many of `tables` reach each node of `closure`, following dependencies
-/// transitively.
-///
-/// "Reach" is deliberately plain: the walk does not stop at an intermediate
-/// Table, so a View above one is counted for every Table downstream of it even
-/// though that Table's own CTE, being materialized, already shares the View
-/// once. Modelling that is what a cost-based rule would do; this is the naive
-/// floor it gets measured against.
-///
-/// A Table reaches itself, which is why the naive rule is only ever consulted
-/// for Views -- every Table would otherwise have at least one reader and the
-/// rule would say nothing.
-fn table_readers(
-    dag: &Dag,
-    tables: &[String],
-    closure: &HashSet<String>,
-) -> HashMap<String, usize> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for table in tables {
-        let mut seen: HashSet<&String> = HashSet::new();
-        let mut stack: Vec<&String> = vec![table];
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            *counts.entry(id.clone()).or_insert(0) += 1;
-            if let Some(node) = dag.nodes.get(id.clone()) {
-                for dep in &node.depends_on {
-                    if let Some(dep) = closure.get(dep) {
-                        stack.push(dep);
-                    }
-                }
-            }
-        }
-    }
-    counts
-}
-
-/// Assemble the fused node's query text.
-///
-/// Each CTE body is the node's own query with its references to other fused
-/// nodes rewritten to their CTE names. That rewrite happens on the parsed AST
-/// ([`rewrite_node_refs`]), and a body that cannot be rewritten there fails the
-/// pass rather than falling back to text substitution -- the same rule
-/// [`make_temp`](crate::opt::common::make_temp) follows, and for the same
-/// reason: a substring match inside a string literal would hand the engine a
-/// query that means something else.
-///
-/// The frame around those bodies -- the `WITH` chain, the branches, their
-/// projections -- is assembled as text. Nothing in it comes from user SQL: the
-/// identifiers are generated here and the literals are the integers this pass
-/// chose, so there is no substring to match wrongly. The result is parsed
-/// before it is installed.
-fn build_fused_sql(
-    dag: &Dag,
-    plan: &FusionPlan,
-    dialect: DialectType,
-) -> Result<FusedSql, NotFusable> {
-    // Only fused nodes are rewritten; a reference to anything else is a
-    // reference to a real relation and must survive untouched.
-    let mapping: HashMap<String, String> = plan
-        .ctes
-        .iter()
-        .map(|c| (c.node_id.clone(), c.cte_name.clone()))
-        .collect();
-
-    // Bodies used exactly as authored, never round-tripped through the parser.
-    // Counted because the assembled query can only be parse-checked when there
-    // are none: a body the parser could not read makes the whole query
-    // unreadable to it too, and that says nothing about the frame.
-    let mut verbatim = 0usize;
-    let mut cte_sql: Vec<String> = Vec::with_capacity(plan.ctes.len());
-    for cte in &plan.ctes {
-        let node = dag
-            .nodes
-            .get(cte.node_id.clone())
-            .ok_or_else(|| NotFusable(format!("'{}' vanished from the graph", cte.node_id)))?;
-        // A body that names no fused node needs no rewriting, and is used
-        // exactly as authored. That is not only cheaper than a parse and
-        // regenerate that would change nothing -- it is what lets a DAG fuse
-        // when a leaf staging view uses syntax the parser does not cover. Most
-        // nodes with no fused dependencies are exactly those.
-        let names_a_fused_node = node.depends_on.iter().any(|dep| mapping.contains_key(dep));
-        if !names_a_fused_node {
-            verbatim += 1;
-        }
-        let body = if names_a_fused_node {
-            rewrite_node_refs(&node.query_text, &mapping, dialect).ok_or_else(|| {
-                // Refusing to fall back to text substitution, which would
-                // silently change what the query means. Not an error: a node
-                // the parser cannot read is a fact about this DAG, the same
-                // kind of fact as a TempTable in the closure, and the honest
-                // response is to leave the DAG alone and name the node.
-                NotFusable(format!(
-                    "'{}' reads a node that would become a CTE, but its query cannot be \
-                     rewritten at the AST level -- the parser does not cover it, and \
-                     substituting the reference textually could change what the query means",
-                    cte.node_id
-                ))
-            })?
-        } else {
-            node.query_text.clone()
-        };
-        let hint = if cte.materialized { " MATERIALIZED" } else { "" };
-        let name = &cte.cte_name;
-        cte_sql.push(format!("{name} AS{hint} ({body})"));
-    }
-
-    // One branch per Table: its own columns read from its CTE, every other
-    // Table's columns filled with a NULL of the right type.
-    let mut branches: Vec<String> = Vec::with_capacity(plan.tables.len());
-    for table in &plan.tables {
-        let own: HashMap<&str, &str> = table
-            .columns
-            .iter()
-            .map(|(original, fused)| (fused.as_str(), original.as_str()))
-            .collect();
-        let mut projection: Vec<String> = vec![format!("{} AS {KIND_COLUMN}", table.kind)];
-        for fused in &plan.fused_columns {
-            match own.get(fused.as_str()) {
-                Some(original) => projection.push(format!("\"{original}\" AS \"{fused}\"")),
-                // An untyped NULL, deliberately. Every fused column belongs to
-                // exactly one Table and is selected from that Table's CTE in
-                // exactly one branch, so set-operation type resolution gives
-                // the column that branch's type -- which is the type the
-                // unfused node produced, exactly.
-                //
-                // Casting instead is what this used to do, and it was worse:
-                // the only type available to cast to is the one read back off
-                // the node's *Arrow* schema, and that round trip is lossy.
-                // DuckDB's HUGEINT arrives as Decimal128(38, 0) and would have
-                // gone back as DECIMAL(38,0), quietly changing the delivered
-                // table's column type.
-                None => projection.push(format!("NULL AS \"{fused}\"")),
-            }
-        }
-        branches.push(format!(
-            "SELECT {} FROM {}",
-            projection.join(", "),
-            table.cte_name
-        ));
-    }
-
-    Ok(FusedSql {
-        sql: format!(
-            "WITH {}\n{}",
-            cte_sql.join(",\n     "),
-            branches.join("\nUNION ALL\n")
-        ),
-        verbatim_bodies: verbatim,
-    })
-}
-
-/// The assembled fused query, and how many of its CTE bodies were used exactly
-/// as authored rather than rewritten.
-struct FusedSql {
-    sql: String,
-    verbatim_bodies: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -2855,7 +2527,8 @@ where
         // fine and would otherwise be obeyed.
         self.check_config()?;
         if !self.adaptive {
-            let record = self.rewrite(ctx.dag)?;
+            let conn = Arc::clone(&ctx.conn);
+            let record = self.rewrite(conn.as_ref(), ctx.dag).await?;
             return Ok(StepOutcome::Rewrote {
                 record: Box::new(record),
             });
@@ -2889,7 +2562,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Helpers -- a real in-memory DuckDB and the real SimpleEngine, so these
-    // tests exercise the same path a run does. A fused query that only looks
+    // tests exercise the same path a run does. A rollup that only looks
     // right is not evidence of anything; one the engine executes to the same
     // rows is.
     // ------------------------------------------------------------------
@@ -2912,8 +2585,9 @@ mod tests {
     fn make_dag(nodes: Vec<TransformNode>) -> Dag {
         let mut graph = Graph::new(HashMap::new());
         for n in nodes {
-            graph.add_node(n).unwrap();
+            graph.add_node_unchecked(n);
         }
+        graph.check().unwrap();
         Dag {
             db: "DuckDB".to_string(),
             nodes: graph,
@@ -2944,8 +2618,8 @@ mod tests {
     ///     └─ stg (View) ──┬──► by_region (Table)
     ///                     └──► totals    (Table)
     ///
-    /// `stg` is read by both Tables, which is exactly the duplication fusion
-    /// is meant to collapse into one shared CTE.
+    /// `stg` runs once for each Table, which is exactly the repetition the
+    /// rollup exists to remove.
     fn two_table_dag() -> Dag {
         make_dag(vec![
             node(
@@ -2969,456 +2643,53 @@ mod tests {
         ])
     }
 
-    /// An order-independent fingerprint of a relation: its row count and the
-    /// sum of the hashes of its rows, so a rewrite that reorders rows is not
-    /// mistaken for one that changes them.
-    fn fingerprint(conn: &DuckDBConnection, relation: &str) -> (i64, i64) {
-        let c = conn.pool.get().unwrap();
-        let n: i64 = c
-            .query_row(&format!("SELECT count(*) FROM {relation}"), [], |r| r.get(0))
-            .unwrap();
-        let h: i64 = c
-            .query_row(
-                &format!(
-                    "SELECT coalesce((sum(hash(t)::HUGEINT) % 1000000007)::BIGINT, 0) \
-                     FROM {relation} AS t"
-                ),
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        (n, h)
-    }
-
-    /// The relation's columns as `name type`, in order.
+    /// A shared chain with a CTE read twice inside the rollup:
     ///
-    /// The types matter as much as the rows: a fused branch that filled a
-    /// column with a *cast* NULL rather than an untyped one used to turn
-    /// DuckDB's HUGEINT into DECIMAL(38,0), because the only type available to
-    /// cast to is the one read back off the node's Arrow schema and that round
-    /// trip is lossy. The rows were identical; the delivered table was not.
-    fn columns(conn: &DuckDBConnection, relation: &str) -> Vec<String> {
-        let c = conn.pool.get().unwrap();
-        let mut stmt = c
-            .prepare(&format!(
-                "SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM {relation})"
-            ))
-            .unwrap();
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(format!("{} {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .unwrap();
-        rows.map(|r| r.unwrap()).collect()
-    }
-
-    /// Run `dag`, fingerprint each of `relations`, then drop everything it made.
-    async fn run_and_fingerprint(
-        conn: &Arc<DuckDBConnection>,
-        dag: &Dag,
-        relations: &[&str],
-    ) -> Vec<(Vec<String>, (i64, i64))> {
-        let engine = SimpleEngine::new(Arc::clone(conn)).unwrap();
-        engine.run(dag).await.expect("the DAG should run");
-        let out = relations
-            .iter()
-            .map(|r| (columns(conn, r), fingerprint(conn, r)))
-            .collect();
-        engine.cleanup(dag).await.unwrap();
-        out
-    }
-
-    async fn resolved(conn: &Arc<DuckDBConnection>, dag: &mut Dag) {
-        let engine = SimpleEngine::new(Arc::clone(conn)).unwrap();
-        engine.resolve_schemas(dag).await.expect("schemas resolve");
-    }
-
-    // ------------------------------------------------------------------
-    // End to end: the fused DAG produces the same relations
-    // ------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_fused_dag_produces_the_same_tables() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-
-        let baseline_dag = two_table_dag();
-        let baseline = run_and_fingerprint(&conn, &baseline_dag, &["by_region", "totals"]).await;
-
-        let mut dag = two_table_dag();
-        resolved(&conn, &mut dag).await;
-        let mut pass = NodeFusionPass::new(false, false, None);
-        pass.rewrite(&mut dag).expect("the DAG should fuse");
-
-        let fused = run_and_fingerprint(&conn, &dag, &["by_region", "totals"]).await;
-
-        assert_eq!(
-            baseline, fused,
-            "fusion must not change a Table's columns or its rows"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_the_rewritten_dag_has_the_shape_fusion_promises() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-        let mut dag = two_table_dag();
-        resolved(&conn, &mut dag).await;
-
-        NodeFusionPass::new(false, false, None)
-            .rewrite(&mut dag)
-            .expect("the DAG should fuse");
-
-        let fused = dag.nodes.get("dee_fused".to_string()).expect("fused node");
-        assert_eq!(fused.materialize, MaterializeMode::TempTable);
-        assert!(
-            fused.depends_on.is_empty(),
-            "everything upstream of a Table is inside the fused node, so it depends on nothing"
-        );
-        assert!(fused.query_text.contains("UNION ALL"));
-
-        for table in ["by_region", "totals"] {
-            let node = dag.nodes.get(table.to_string()).unwrap();
-            assert_eq!(node.materialize, MaterializeMode::Table);
-            assert_eq!(
-                node.depends_on,
-                HashSet::from(["dee_fused".to_string()]),
-                "a fused Table reads the fused node and nothing else"
-            );
-            assert!(node.query_text.contains("WHERE kind = "));
-        }
-
-        // The View stays in the graph, and stays a View.
-        let stg = dag.nodes.get("stg".to_string()).expect("the View is kept");
-        assert_eq!(stg.materialize, MaterializeMode::View);
-    }
-
-    #[tokio::test]
-    async fn test_fusion_preserves_column_types() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-
-        // `sum(order_id)` is a HUGEINT, which reaches an Arrow schema as
-        // Decimal128(38, 0) and cannot be told apart from a real
-        // DECIMAL(38,0) on the way back. The branches fill a foreign column
-        // with an untyped NULL precisely so that round trip never happens.
-        let dag_of = || {
-            make_dag(vec![
-                node(
-                    "stg",
-                    "SELECT order_id, region, amount FROM orders",
-                    MaterializeMode::View,
-                    &[],
-                ),
-                node(
-                    "wide",
-                    "SELECT sum(order_id) AS id_sum, region, \
-                     count(*) > 0 AS any_rows, max(amount) AS biggest \
-                     FROM stg GROUP BY region",
-                    MaterializeMode::Table,
-                    &["stg"],
-                ),
-                node(
-                    "narrow",
-                    "SELECT count(*) AS n FROM stg",
-                    MaterializeMode::Table,
-                    &["stg"],
-                ),
-            ])
-        };
-
-        let baseline = run_and_fingerprint(&conn, &dag_of(), &["wide", "narrow"]).await;
-
-        let mut dag = dag_of();
-        resolved(&conn, &mut dag).await;
-        NodeFusionPass::new(false, false, None).rewrite(&mut dag).unwrap();
-        let fused = run_and_fingerprint(&conn, &dag, &["wide", "narrow"]).await;
-
-        assert_eq!(
-            baseline, fused,
-            "a fused Table must keep its column types, not only its rows"
-        );
-        assert!(
-            baseline[0].0.iter().any(|c| c.contains("HUGEINT")),
-            "the fixture must actually exercise HUGEINT -- got {:?}",
-            baseline[0].0
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // A Table above a Table
-    // ------------------------------------------------------------------
-
-    /// DAG layout:
+    ///   orders ─► stg ─► facts ─┬─► by_region_v (View) ─► rpt_region (Table)
+    ///                           └────────────────────────► totals     (Table)
     ///
-    ///   orders ─► stg (View) ─► base (Table) ─► enriched (View) ─► rollup (Table)
-    ///
-    /// `base` feeds `rollup` through a View, so it is inlined as a CTE *and*
-    /// still delivered as its own relation.
-    fn layered_dag() -> Dag {
+    /// `facts` runs twice, so it and `stg` are shared; `by_region_v` is on the
+    /// path to a table. `totals` reads `facts`, which `by_region_v` also reads
+    /// inside the rollup, so its own query moves in -- and `facts` then has two
+    /// readers there and is the one CTE the rule materializes.
+    fn shared_chain_dag() -> Dag {
         make_dag(vec![
+            node("stg", "SELECT order_id, region, amount FROM orders", MaterializeMode::View, &[]),
             node(
-                "stg",
-                "SELECT order_id, region, amount FROM orders",
+                "facts",
+                "SELECT order_id, region, amount * 2 AS doubled FROM stg",
                 MaterializeMode::View,
-                &[],
-            ),
-            node(
-                "base",
-                "SELECT region, sum(amount) AS total FROM stg GROUP BY region",
-                MaterializeMode::Table,
                 &["stg"],
             ),
             node(
-                "enriched",
-                "SELECT region, total, total * 2 AS doubled FROM base",
+                "by_region_v",
+                "SELECT region, sum(doubled) AS d FROM facts GROUP BY region",
                 MaterializeMode::View,
-                &["base"],
+                &["facts"],
             ),
             node(
-                "rollup",
-                "SELECT sum(doubled) AS all_doubled FROM enriched",
+                "rpt_region",
+                "SELECT * FROM by_region_v",
                 MaterializeMode::Table,
-                &["enriched"],
+                &["by_region_v"],
+            ),
+            node(
+                "totals",
+                "SELECT count(*) AS n, sum(doubled) AS s FROM facts",
+                MaterializeMode::Table,
+                &["facts"],
             ),
         ])
     }
 
-    #[tokio::test]
-    async fn test_a_table_feeding_a_table_is_inlined_and_still_delivered() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-
-        let baseline_dag = layered_dag();
-        let baseline = run_and_fingerprint(&conn, &baseline_dag, &["base", "rollup"]).await;
-
-        let mut dag = layered_dag();
-        resolved(&conn, &mut dag).await;
-        let mut pass = NodeFusionPass::new(false, false, None);
-        pass.rewrite(&mut dag).expect("the DAG should fuse");
-
-        let fused_sql = dag
-            .nodes
-            .get("dee_fused".to_string())
-            .unwrap()
-            .query_text
-            .clone();
-        assert!(
-            fused_sql.contains("n_base AS MATERIALIZED ("),
-            "an inlined Table's CTE is materialized by default -- got:\n{fused_sql}"
-        );
-        assert!(
-            fused_sql.contains("n_stg AS ("),
-            "an inlined View's CTE is plain by default -- got:\n{fused_sql}"
-        );
-        assert!(
-            dag.nodes
-                .get("base".to_string())
-                .unwrap()
-                .query_text
-                .contains("WHERE kind = "),
-            "the intermediate Table still gets a kind of its own"
-        );
-
-        let fused = run_and_fingerprint(&conn, &dag, &["base", "rollup"]).await;
-        assert_eq!(baseline, fused);
-    }
-
-    #[tokio::test]
-    async fn test_the_rewrite_is_a_function_of_the_dag_alone() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-
-        // The same logical DAG, built by inserting its nodes in two different
-        // orders. `Graph` is a `HashMap`, so that is enough to change how it
-        // iterates -- and the fused query must not notice. dee's DAGs are
-        // content-addressed: a rewrite that is not byte-stable mints a new
-        // version every time it is re-run over an unchanged definition.
-        let build = |reverse: bool| {
-            let mut nodes = vec![
-                node(
-                    "stg",
-                    "SELECT order_id, region, amount FROM orders",
-                    MaterializeMode::View,
-                    &[],
-                ),
-                node(
-                    "by_region",
-                    "SELECT region, count(*) AS n FROM stg GROUP BY region",
-                    MaterializeMode::Table,
-                    &["stg"],
-                ),
-                node(
-                    "totals",
-                    "SELECT count(*) AS n FROM stg",
-                    MaterializeMode::Table,
-                    &["stg"],
-                ),
-                node(
-                    "biggest",
-                    "SELECT max(amount) AS m FROM stg",
-                    MaterializeMode::Table,
-                    &["stg"],
-                ),
-            ];
-            if reverse {
-                nodes.reverse();
-            }
-            // Inserted in the given order and only checked afterwards:
-            // `add_node` refuses a node whose dependency is not in the graph
-            // yet, which is the very ordering this test needs to vary.
-            let mut graph = Graph::new(HashMap::new());
-            for n in nodes {
-                graph.add_node_unchecked(n);
-            }
-            graph.check().unwrap();
-            Dag {
-                db: "DuckDB".to_string(),
-                nodes: graph,
-                sources: vec![SourceNode {
-                    name: "orders".to_string(),
-                    schema: Arc::new(duckdb::arrow::datatypes::Schema::empty()),
-                }],
-                max_parallelism: None,
-            }
-        };
-
-        async fn fuse(conn: &Arc<DuckDBConnection>, mut dag: Dag) -> Vec<(String, String)> {
-            resolved(conn, &mut dag).await;
-            NodeFusionPass::new(false, false, None)
-                .rewrite(&mut dag)
-                .unwrap();
-            let mut texts: Vec<(String, String)> = dag
-                .nodes
-                .nodes()
-                .map(|n| (n.id.clone(), n.query_text.clone()))
-                .collect();
-            texts.sort();
-            texts
-        }
-
-        assert_eq!(
-            fuse(&conn, build(false)).await,
-            fuse(&conn, build(true)).await,
-            "the fused query and every rewritten Table must be byte-identical"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_kinds_are_assigned_in_sorted_node_id_order() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-        let mut dag = layered_dag();
-        resolved(&conn, &mut dag).await;
-
-        let plan = NodeFusionPass::new(false, false, None).plan(&dag).unwrap();
-        let by_kind: Vec<&str> = plan.tables.iter().map(|t| t.node_id.as_str()).collect();
-        assert_eq!(
-            by_kind,
-            vec!["base", "rollup"],
-            "a kind is a label, not an ordering, so it follows the one total order \
-             the DAG has: its node IDs"
-        );
-        assert_eq!(plan.tables[0].kind, 0);
-        assert_eq!(plan.tables[1].kind, 1);
-    }
-
-    #[tokio::test]
-    async fn test_ctes_are_emitted_in_a_topological_order() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-        let mut dag = layered_dag();
-        resolved(&conn, &mut dag).await;
-
-        let plan = NodeFusionPass::new(false, false, None).plan(&dag).unwrap();
-        let order: Vec<&str> = plan.ctes.iter().map(|c| c.node_id.as_str()).collect();
-        assert_eq!(order, vec!["stg", "base", "enriched", "rollup"]);
-    }
-
-    // ------------------------------------------------------------------
-    // The materialization knobs
-    // ------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_the_global_default_materializes_views_and_not_only_tables() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-        let mut dag = layered_dag();
-        resolved(&conn, &mut dag).await;
-
-        let plan = NodeFusionPass::new(true, false, None).plan(&dag).unwrap();
-        let materialized: HashSet<&str> = plan
-            .ctes
-            .iter()
-            .filter(|c| c.materialized)
-            .map(|c| c.node_id.as_str())
-            .collect();
-        assert_eq!(
-            materialized,
-            HashSet::from(["stg", "base", "enriched", "rollup"]),
-            "the global default turns on everything the intermediate-Table rule did not"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_only_a_table_that_feeds_another_is_materialized_by_default() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-
-        // `base` feeds `rollup`, so its CTE is read by its own UNION ALL
-        // branch and by `enriched` -- two readers, and a plain CTE may be
-        // unfolded into each. `rollup` feeds nothing and is read once.
-        let mut layered = layered_dag();
-        resolved(&conn, &mut layered).await;
-        let plan = NodeFusionPass::new(false, false, None).plan(&layered).unwrap();
-        let materialized: Vec<&str> = plan
-            .ctes
-            .iter()
-            .filter(|c| c.materialized)
-            .map(|c| c.node_id.as_str())
-            .collect();
-        assert_eq!(materialized, vec!["base"]);
-
-        // And where no Table feeds another, nothing is materialized at all.
-        let mut flat = two_table_dag();
-        resolved(&conn, &mut flat).await;
-        let plan = NodeFusionPass::new(false, false, None).plan(&flat).unwrap();
-        assert!(
-            plan.ctes.iter().all(|c| !c.materialized),
-            "a Table read only by its own branch gains nothing from MATERIALIZED"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_an_override_is_the_exact_set_and_can_demote_a_table() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-        let mut dag = layered_dag();
-        resolved(&conn, &mut dag).await;
-
-        // `base` is a Table and would be materialized by default; naming only
-        // `stg` takes it back off.
-        let plan = NodeFusionPass::new(true, false, Some(vec!["stg".to_string()]))
-            .plan(&dag)
-            .unwrap();
-        let materialized: Vec<&str> = plan
-            .ctes
-            .iter()
-            .filter(|c| c.materialized)
-            .map(|c| c.node_id.as_str())
-            .collect();
-        assert_eq!(materialized, vec!["stg"]);
-    }
-
-    /// DAG layout, built so the naive rule has both answers to give:
+    /// DAG layout:
     ///
     ///   orders ─► shared (View) ─┬─► mid (View) ─► tbl_a (Table)
     ///                            └────────────────► tbl_b (Table)
     ///          └─► lonely (View) ──────────────────► tbl_b (Table)
     ///
-    /// `shared` is reached by both Tables; `mid` by only `tbl_a` and `lonely`
-    /// by only `tbl_b`.
-    ///
+    /// `shared` runs twice and `mid` is on its path to a table; `lonely` runs
+    /// once and stays outside the rollup.
     fn shared_view_dag() -> Dag {
         make_dag(vec![
             node(
@@ -3454,117 +2725,372 @@ mod tests {
         ])
     }
 
+    /// DAG layout:
+    ///
+    ///   orders ─► stg (View) ─► base (Table) ─► enriched (View) ─► rollup (Table)
+    ///
+    /// Every View runs once: `enriched` reads the stored `base`, not `stg`'s SQL.
+    fn layered_dag() -> Dag {
+        make_dag(vec![
+            node(
+                "stg",
+                "SELECT order_id, region, amount FROM orders",
+                MaterializeMode::View,
+                &[],
+            ),
+            node(
+                "base",
+                "SELECT region, sum(amount) AS total FROM stg GROUP BY region",
+                MaterializeMode::Table,
+                &["stg"],
+            ),
+            node(
+                "enriched",
+                "SELECT region, total, total * 2 AS doubled FROM base",
+                MaterializeMode::View,
+                &["base"],
+            ),
+            node(
+                "rollup",
+                "SELECT sum(doubled) AS all_doubled FROM enriched",
+                MaterializeMode::Table,
+                &["enriched"],
+            ),
+        ])
+    }
+
+    /// An order-independent fingerprint of a relation: its row count and the
+    /// sum of the hashes of its rows, so a rewrite that reorders rows is not
+    /// mistaken for one that changes them.
+    fn fingerprint(conn: &DuckDBConnection, relation: &str) -> (i64, i64) {
+        let c = conn.pool.get().unwrap();
+        let n: i64 = c
+            .query_row(&format!("SELECT count(*) FROM {relation}"), [], |r| r.get(0))
+            .unwrap();
+        let h: i64 = c
+            .query_row(
+                &format!(
+                    "SELECT coalesce((sum(hash(t)::HUGEINT) % 1000000007)::BIGINT, 0) \
+                     FROM {relation} AS t"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (n, h)
+    }
+
+    /// The relation's columns as `name type`, in order.
+    ///
+    /// The types matter as much as the rows: a NULL fill cast to a type read
+    /// back off a node's Arrow schema used to turn DuckDB's HUGEINT into
+    /// DECIMAL(38,0). The rows were identical; the delivered table was not.
+    fn columns(conn: &DuckDBConnection, relation: &str) -> Vec<String> {
+        let c = conn.pool.get().unwrap();
+        let mut stmt = c
+            .prepare(&format!(
+                "SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM {relation})"
+            ))
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(format!("{} {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// Run `dag`, fingerprint each of `relations`, then drop everything it made.
+    async fn run_and_fingerprint(
+        conn: &Arc<DuckDBConnection>,
+        dag: &Dag,
+        relations: &[&str],
+    ) -> Vec<(Vec<String>, (i64, i64))> {
+        let engine = SimpleEngine::new(Arc::clone(conn)).unwrap();
+        engine.run(dag).await.expect("the DAG should run");
+        let out = relations
+            .iter()
+            .map(|r| (columns(conn, r), fingerprint(conn, r)))
+            .collect();
+        engine.cleanup(dag).await.unwrap();
+        out
+    }
+
+    async fn fuse(conn: &Arc<DuckDBConnection>, dag: &mut Dag) -> PassOutcome {
+        NodeFusionPass::new(None)
+            .rewrite(conn.as_ref(), dag)
+            .await
+            .expect("the rewrite should not error")
+    }
+
+    fn detail(record: &PassOutcome) -> &NodeFusionDetail {
+        let PassDetail::NodeFusion(detail) = &record.detail else {
+            panic!("expected a NodeFusion detail");
+        };
+        detail
+    }
+
+    // ------------------------------------------------------------------
+    // End to end: the rewritten DAG produces the same relations
+    // ------------------------------------------------------------------
+
     #[tokio::test]
-    async fn test_the_naive_rule_materializes_only_views_more_than_one_table_reads() {
+    async fn test_fused_dag_produces_the_same_tables() {
         let conn = in_memory_conn().await;
         setup_orders(&conn).await;
-        let mut dag = shared_view_dag();
-        resolved(&conn, &mut dag).await;
 
-        let plan = NodeFusionPass::new(false, true, None).plan(&dag).unwrap();
-        let materialized: HashSet<&str> = plan
-            .ctes
-            .iter()
-            .filter(|c| c.materialized)
-            .map(|c| c.node_id.as_str())
-            .collect();
+        let baseline = run_and_fingerprint(&conn, &two_table_dag(), &["by_region", "totals"]).await;
+
+        // Deliberately not schema-resolved: the rollup's column types come from
+        // the engine, not from the nodes' Arrow schemas.
+        let mut dag = two_table_dag();
+        let record = fuse(&conn, &mut dag).await;
+        assert_eq!(record.changes_applied, 1, "{}", detail(&record).outcome);
+
+        let fused = run_and_fingerprint(&conn, &dag, &["by_region", "totals"]).await;
         assert_eq!(
-            materialized,
-            HashSet::from(["shared"]),
-            "only the View both Tables reach; `mid` and `lonely` have one reader each"
+            baseline, fused,
+            "the rollup must not change a Table's columns or its rows"
         );
-
-        // Off, it materializes nothing here: no Table feeds another.
-        let plan = NodeFusionPass::new(false, false, None).plan(&dag).unwrap();
-        assert!(plan.ctes.iter().all(|c| !c.materialized));
     }
 
     #[tokio::test]
-    async fn test_the_naive_rule_counts_readers_through_intermediate_views() {
+    async fn test_the_rewritten_dag_has_the_shape_the_rollup_promises() {
         let conn = in_memory_conn().await;
         setup_orders(&conn).await;
-        // In `layered_dag`, `stg` is read by `base` and -- through `base` and
-        // `enriched` -- by `rollup`. Reachability is transitive and does not
-        // stop at the intermediate Table, which is the naive part.
-        let mut dag = layered_dag();
-        resolved(&conn, &mut dag).await;
+        let mut dag = two_table_dag();
+        fuse(&conn, &mut dag).await;
 
-        let plan = NodeFusionPass::new(false, true, None).plan(&dag).unwrap();
-        let materialized: HashSet<&str> = plan
-            .ctes
-            .iter()
-            .filter(|c| c.materialized)
-            .map(|c| c.node_id.as_str())
-            .collect();
+        let fused = dag.nodes.get("dee_fused".to_string()).expect("rollup node");
+        assert_eq!(fused.materialize, MaterializeMode::TempTable);
+        assert!(
+            fused.depends_on.is_empty(),
+            "the rollup reads nothing but the warehouse's sources"
+        );
+        assert!(fused.query_text.trim_end().ends_with("ORDER BY kind"));
+
+        for table in ["by_region", "totals"] {
+            let node = dag.nodes.get(table.to_string()).unwrap();
+            assert_eq!(node.materialize, MaterializeMode::Table);
+            assert_eq!(
+                node.depends_on,
+                HashSet::from(["dee_fused".to_string()]),
+                "a rewritten Table reads the rollup and nothing else"
+            );
+            assert!(node.query_text.contains("WHERE kind = "), "{}", node.query_text);
+        }
+
+        // The View stays in the graph, stays a View, and is not rewritten.
+        let stg = dag.nodes.get("stg".to_string()).expect("the View is kept");
+        assert_eq!(stg.materialize, MaterializeMode::View);
         assert_eq!(
-            materialized,
-            HashSet::from(["stg", "base"]),
-            "`stg` by the naive rule, `base` because it feeds another Table; \
-             `enriched` is reached by `rollup` alone"
+            stg.query_text,
+            two_table_dag().nodes.get("stg".to_string()).unwrap().query_text
         );
     }
 
     #[tokio::test]
-    async fn test_the_naive_rule_does_not_change_what_the_dag_produces() {
+    async fn test_fusion_preserves_column_types() {
         let conn = in_memory_conn().await;
         setup_orders(&conn).await;
 
+        // `sum(order_id)` is a HUGEINT, which reaches an Arrow schema as
+        // Decimal128(38, 0) and cannot be told apart from a real
+        // DECIMAL(38,0) on the way back.
+        let dag_of = || {
+            make_dag(vec![
+                node(
+                    "stg",
+                    "SELECT order_id, region, amount FROM orders",
+                    MaterializeMode::View,
+                    &[],
+                ),
+                node(
+                    "wide",
+                    "SELECT sum(order_id) AS id_sum, region, \
+                     count(*) > 0 AS any_rows, max(amount) AS biggest \
+                     FROM stg GROUP BY region",
+                    MaterializeMode::Table,
+                    &["stg"],
+                ),
+                node(
+                    "narrow",
+                    "SELECT count(*) AS n FROM stg",
+                    MaterializeMode::Table,
+                    &["stg"],
+                ),
+            ])
+        };
+
+        let baseline = run_and_fingerprint(&conn, &dag_of(), &["wide", "narrow"]).await;
+
+        let mut dag = dag_of();
+        fuse(&conn, &mut dag).await;
+        let fused = run_and_fingerprint(&conn, &dag, &["wide", "narrow"]).await;
+
+        assert_eq!(
+            baseline, fused,
+            "a rewritten Table must keep its column types, not only its rows"
+        );
+        assert!(
+            baseline[0].0.iter().any(|c| c.contains("HUGEINT")),
+            "the fixture must actually exercise HUGEINT -- got {:?}",
+            baseline[0].0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_table_query_moves_in_and_a_shared_cte_is_materialized() {
+        let conn = in_memory_conn().await;
+        setup_orders(&conn).await;
+        let relations = ["rpt_region", "totals"];
+        let baseline = run_and_fingerprint(&conn, &shared_chain_dag(), &relations).await;
+
+        let mut dag = shared_chain_dag();
+        let record = fuse(&conn, &mut dag).await;
+        assert_eq!(detail(&record).materialized_ctes, 1);
+
+        let sql = dag.nodes.get("dee_fused".to_string()).unwrap().query_text.clone();
+        assert!(sql.contains("n_facts AS MATERIALIZED ("), "{sql}");
+        assert!(sql.contains("n_stg AS ("), "a CTE read once is plain: {sql}");
+
+        let totals = dag.nodes.get("totals".to_string()).unwrap();
+        assert!(
+            totals.query_text.starts_with("SELECT ") && totals.query_text.contains("WHERE kind = "),
+            "a Table query becomes a projection of its kind: {}",
+            totals.query_text
+        );
+
+        let fused = run_and_fingerprint(&conn, &dag, &relations).await;
+        assert_eq!(baseline, fused);
+    }
+
+    #[tokio::test]
+    async fn test_a_view_outside_the_rollup_is_still_read_where_it_was() {
+        let conn = in_memory_conn().await;
+        setup_orders(&conn).await;
         let baseline = run_and_fingerprint(&conn, &shared_view_dag(), &["tbl_a", "tbl_b"]).await;
 
         let mut dag = shared_view_dag();
-        resolved(&conn, &mut dag).await;
-        NodeFusionPass::new(false, true, None).rewrite(&mut dag).unwrap();
+        fuse(&conn, &mut dag).await;
+        let tbl_b = dag.nodes.get("tbl_b".to_string()).unwrap();
+        assert!(tbl_b.depends_on.contains("dee_fused"), "{:?}", tbl_b.depends_on);
         assert!(
-            dag.nodes
-                .get("dee_fused".to_string())
-                .unwrap()
-                .query_text
-                .contains("n_shared AS MATERIALIZED ("),
-            "the shared View should carry the hint"
+            tbl_b.depends_on.contains("lonely"),
+            "`lonely` runs once and is not shared, so `tbl_b` keeps reading it: {:?}",
+            tbl_b.depends_on
         );
 
         let fused = run_and_fingerprint(&conn, &dag, &["tbl_a", "tbl_b"]).await;
-        assert_eq!(baseline, fused, "a materialization hint changes plans, not rows");
+        assert_eq!(baseline, fused);
     }
 
+    #[tokio::test]
+    async fn test_the_rewrite_is_a_function_of_the_dag_alone() {
+        let conn = in_memory_conn().await;
+        setup_orders(&conn).await;
+
+        // The same logical DAG, built by inserting its nodes in two different
+        // orders. `Graph` is a `HashMap`, so that is enough to change how it
+        // iterates -- and the rewrite must not notice. dee's DAGs are
+        // content-addressed: a rewrite that is not byte-stable mints a new
+        // version every time it is re-run over an unchanged definition.
+        let build = |reverse: bool| {
+            let mut nodes = vec![
+                node(
+                    "stg",
+                    "SELECT order_id, region, amount FROM orders",
+                    MaterializeMode::View,
+                    &[],
+                ),
+                node(
+                    "by_region",
+                    "SELECT region, count(*) AS n FROM stg GROUP BY region",
+                    MaterializeMode::Table,
+                    &["stg"],
+                ),
+                node(
+                    "totals",
+                    "SELECT count(*) AS n FROM stg",
+                    MaterializeMode::Table,
+                    &["stg"],
+                ),
+                node(
+                    "biggest",
+                    "SELECT max(amount) AS m FROM stg",
+                    MaterializeMode::Table,
+                    &["stg"],
+                ),
+            ];
+            if reverse {
+                nodes.reverse();
+            }
+            make_dag(nodes)
+        };
+
+        async fn texts(conn: &Arc<DuckDBConnection>, mut dag: Dag) -> Vec<(String, String)> {
+            fuse(conn, &mut dag).await;
+            let mut texts: Vec<(String, String)> = dag
+                .nodes
+                .nodes()
+                .map(|n| (n.id.clone(), n.query_text.clone()))
+                .collect();
+            texts.sort();
+            texts
+        }
+
+        assert_eq!(
+            texts(&conn, build(false)).await,
+            texts(&conn, build(true)).await,
+            "the rollup and every rewritten Table must be byte-identical"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Which CTEs are materialized
+    // ------------------------------------------------------------------
+
     #[test]
-    fn test_the_global_switch_subsumes_the_naive_one() {
-        let all = NodeFusionPass::new(true, false, None);
-        let naive = NodeFusionPass::new(false, true, None);
-        // A View no second Table reaches: on under the global switch, off
-        // under the naive rule.
-        assert!(all.wants_materialized("v", false, false));
-        assert!(!naive.wants_materialized("v", false, false));
-        // And an override still names the exact set, ignoring both.
-        let overridden = NodeFusionPass::new(true, true, Some(vec!["other".into()]));
-        assert!(!overridden.wants_materialized("v", true, true));
+    fn test_an_override_is_the_exact_set() {
+        let dag = shared_chain_dag();
+        let default = NodeFusionPass::new(None).plan(&dag).unwrap();
+        assert_eq!(
+            default.materialized,
+            BTreeSet::from(["facts".to_string()]),
+            "the rule: two or more readers inside the rollup"
+        );
+
+        let over = NodeFusionPass::new(Some(vec!["stg".to_string()]))
+            .plan(&dag)
+            .unwrap();
+        assert_eq!(
+            over.materialized,
+            BTreeSet::from(["stg".to_string()]),
+            "naming only `stg` takes `facts` back off"
+        );
     }
 
     #[test]
     fn test_an_override_matches_a_bare_name_against_a_qualified_id() {
-        let pass = NodeFusionPass::new(false, false, Some(vec!["orders".to_string()]));
-        assert!(pass.wants_materialized("\"wh\".\"main\".\"orders\"", false, false));
-        assert!(!pass.wants_materialized("\"wh\".\"main\".\"other\"", true, true));
+        let list = vec!["orders".to_string()];
+        assert!(override_matches(&list, "\"wh\".\"main\".\"orders\""));
+        assert!(!override_matches(&list, "\"wh\".\"main\".\"other\""));
     }
 
     // ------------------------------------------------------------------
     // The DAGs that are left alone
     // ------------------------------------------------------------------
 
-    async fn assert_not_fused(dag: &mut Dag, expect: &str) {
-        let before: Vec<(String, String)> = dag
+    async fn assert_not_fused(conn: &Arc<DuckDBConnection>, dag: &mut Dag, expect: &str) {
+        let mut before: Vec<(String, String)> = dag
             .nodes
             .nodes()
             .map(|n| (n.id.clone(), n.query_text.clone()))
             .collect();
         let n_before = dag.nodes.num_nodes();
 
-        let mut pass = NodeFusionPass::new(false, false, None);
-        let record = pass.rewrite(dag).expect("an unfusable DAG is not an error");
-
-        let PassDetail::NodeFusion(detail) = &record.detail else {
-            panic!("expected a NodeFusion detail");
-        };
+        let record = fuse(conn, dag).await;
+        let detail = detail(&record);
         assert!(
             detail.outcome.contains(expect),
             "expected an outcome mentioning '{expect}', got '{}'",
@@ -3573,20 +3099,20 @@ mod tests {
         assert_eq!(detail.tables_fused, 0);
         assert_eq!(record.changes_applied, 0);
         assert_eq!(dag.nodes.num_nodes(), n_before, "no node was added");
-        let after: Vec<(String, String)> = dag
+        let mut after: Vec<(String, String)> = dag
             .nodes
             .nodes()
             .map(|n| (n.id.clone(), n.query_text.clone()))
             .collect();
-        let mut before = before;
-        let mut after = after;
         before.sort();
         after.sort();
         assert_eq!(before, after, "an unfusable DAG must be left exactly as it was");
     }
 
+    const NOTHING_SHARED: &str = "nothing for a rollup to share";
+
     #[tokio::test]
-    async fn test_a_single_table_is_not_worth_fusing() {
+    async fn test_a_view_read_once_is_not_worth_sharing() {
         let conn = in_memory_conn().await;
         setup_orders(&conn).await;
         let mut dag = make_dag(vec![
@@ -3598,14 +3124,22 @@ mod tests {
                 &["stg"],
             ),
         ]);
-        resolved(&conn, &mut dag).await;
-        assert_not_fused(&mut dag, "at least two").await;
+        assert_not_fused(&conn, &mut dag, NOTHING_SHARED).await;
     }
 
     #[tokio::test]
-    async fn test_a_temp_table_upstream_of_a_table_blocks_fusion() {
+    async fn test_a_table_feeding_a_table_through_views_shares_nothing() {
         let conn = in_memory_conn().await;
         setup_orders(&conn).await;
+        assert_not_fused(&conn, &mut layered_dag(), NOTHING_SHARED).await;
+    }
+
+    #[tokio::test]
+    async fn test_sharing_only_a_temp_table_is_left_alone() {
+        let conn = in_memory_conn().await;
+        setup_orders(&conn).await;
+        // A TempTable is stored once already, and a materialization search put
+        // it there on purpose.
         let mut dag = make_dag(vec![
             node("pad", "SELECT * FROM orders", MaterializeMode::TempTable, &[]),
             node(
@@ -3621,19 +3155,29 @@ mod tests {
                 &["pad"],
             ),
         ]);
-        resolved(&conn, &mut dag).await;
-        assert_not_fused(&mut dag, "TempTable").await;
+        assert_not_fused(&conn, &mut dag, NOTHING_SHARED).await;
     }
 
     #[tokio::test]
-    async fn test_a_node_the_parser_cannot_read_blocks_fusion_only_if_it_reads_a_cte() {
+    async fn test_fusing_an_already_fused_dag_finds_nothing_left() {
+        let conn = in_memory_conn().await;
+        setup_orders(&conn).await;
+        let mut dag = two_table_dag();
+        fuse(&conn, &mut dag).await;
+
+        // Every Table now reads the rollup, so no View runs more than once.
+        assert_not_fused(&conn, &mut dag, NOTHING_SHARED).await;
+    }
+
+    #[tokio::test]
+    async fn test_a_node_the_parser_cannot_read() {
         let conn = in_memory_conn().await;
         setup_orders(&conn).await;
 
         // `extract('year' from d)` is DuckDB-valid and polyglot-sql cannot
-        // parse it. Here it sits in a leaf staging view that names no fused
-        // node, so nothing needs rewriting and it is carried through exactly
-        // as authored.
+        // parse it. Here it sits in a shared leaf View that names no other
+        // shared model, so nothing needs rewriting and it is carried through
+        // exactly as authored.
         let mut dag = make_dag(vec![
             node(
                 "stg",
@@ -3655,10 +3199,7 @@ mod tests {
                 &["stg"],
             ),
         ]);
-        resolved(&conn, &mut dag).await;
-        NodeFusionPass::new(false, false, None)
-            .rewrite(&mut dag)
-            .expect("an unparseable leaf is carried through verbatim");
+        fuse(&conn, &mut dag).await;
         let fused = dag.nodes.get("dee_fused".to_string()).unwrap();
         assert!(
             fused.query_text.contains("extract('year'"),
@@ -3666,59 +3207,51 @@ mod tests {
             fused.query_text
         );
         let engine = SimpleEngine::new(Arc::clone(&conn)).unwrap();
-        engine.run(&dag).await.expect("and the fused DAG still runs");
+        engine.run(&dag).await.expect("and the rewritten DAG still runs");
         engine.cleanup(&dag).await.unwrap();
 
-        // The same syntax in a node that *does* read a CTE cannot be rewritten,
-        // and blocks fusion rather than being substituted textually.
-        let mut dag = make_dag(vec![
-            node(
-                "stg",
-                "SELECT order_id, region, amount FROM orders",
-                MaterializeMode::View,
-                &[],
-            ),
-            node(
-                "by_region",
-                "SELECT region, count(*) AS n, \
-                 extract('year' from DATE '2024-03-01') AS yr FROM stg GROUP BY region",
-                MaterializeMode::Table,
-                &["stg"],
-            ),
-            node(
-                "totals",
-                "SELECT count(*) AS n FROM stg",
-                MaterializeMode::Table,
-                &["stg"],
-            ),
-        ]);
-        resolved(&conn, &mut dag).await;
-        assert_not_fused(&mut dag, "cannot be rewritten at the AST level").await;
-    }
-
-    #[tokio::test]
-    async fn test_an_unresolved_schema_blocks_fusion() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-        // Deliberately not resolved: the fused relation's columns come from
-        // these schemas, and guessing them would be worse than not fusing.
-        let mut dag = two_table_dag();
-        assert_not_fused(&mut dag, "no resolved schema").await;
-    }
-
-    #[tokio::test]
-    async fn test_fusing_an_already_fused_dag_is_refused() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-        let mut dag = two_table_dag();
-        resolved(&conn, &mut dag).await;
-        NodeFusionPass::new(false, false, None).rewrite(&mut dag).unwrap();
-
-        // The fused node is a TempTable and every Table now reads it, so the
-        // second pass sees a TempTable upstream of a Table and declines. It
-        // must decline rather than fuse again: a second fusion would wrap the
-        // projections in another UNION ALL and gain nothing.
-        assert_not_fused(&mut dag, "TempTable").await;
+        // The same syntax in a consumer cannot be rewritten, and is left
+        // reading the real View rather than substituted textually. The other
+        // consumer still shares.
+        let build = || {
+            make_dag(vec![
+                node(
+                    "stg",
+                    "SELECT order_id, region, amount FROM orders",
+                    MaterializeMode::View,
+                    &[],
+                ),
+                node(
+                    "by_region",
+                    "SELECT region, count(*) AS n, \
+                     extract('year' from DATE '2024-03-01') AS yr FROM stg GROUP BY region",
+                    MaterializeMode::Table,
+                    &["stg"],
+                ),
+                node(
+                    "totals",
+                    "SELECT count(*) AS n FROM stg",
+                    MaterializeMode::Table,
+                    &["stg"],
+                ),
+            ])
+        };
+        let baseline = run_and_fingerprint(&conn, &build(), &["by_region", "totals"]).await;
+        let mut dag = build();
+        let record = fuse(&conn, &mut dag).await;
+        let d = detail(&record);
+        assert_eq!(d.untouched.len(), 1, "{:?}", d.untouched);
+        assert_eq!(d.untouched[0].0, "by_region");
+        let by_region = dag.nodes.get("by_region".to_string()).unwrap();
+        assert_eq!(by_region.depends_on, HashSet::from(["stg".to_string()]));
+        assert_eq!(
+            dag.nodes.get("totals".to_string()).unwrap().depends_on,
+            HashSet::from(["dee_fused".to_string()])
+        );
+        assert_eq!(
+            baseline,
+            run_and_fingerprint(&conn, &dag, &["by_region", "totals"]).await
+        );
     }
 
     // ------------------------------------------------------------------
@@ -3751,16 +3284,15 @@ mod tests {
                 &["\"wh\".\"stg\""],
             ),
         ]);
-        resolved(&conn, &mut dag).await;
 
-        NodeFusionPass::new(false, false, None).rewrite(&mut dag).unwrap();
+        fuse(&conn, &mut dag).await;
         assert!(
             dag.nodes.get("\"wh\".\"dee_fused\"".to_string()).is_some(),
-            "the fused node inherits the schema prefix of the Tables reading it"
+            "the rollup inherits the schema prefix of the nodes reading it"
         );
 
         let engine = SimpleEngine::new(Arc::clone(&conn)).unwrap();
-        engine.run(&dag).await.expect("the fused DAG runs");
+        engine.run(&dag).await.expect("the rewritten DAG runs");
         assert_eq!(fingerprint(&conn, "\"wh\".\"count_stg\"").0, 1);
         engine.cleanup(&dag).await.unwrap();
     }
@@ -3773,10 +3305,8 @@ mod tests {
     ///
     /// `with_all_disabled` first, because HMP and OMP are on by default and
     /// they are not neutral here: both materialize Views into `TempTable`
-    /// landing pads, and a TempTable upstream of a Table makes the DAG
-    /// unfusable by design -- the pass refuses to fold away a barrier a
-    /// materialization search placed deliberately. Leaving them on does not
-    /// make the test harder, it makes it measure a DAG that never gets fused.
+    /// landing pads, which are stored builds, so a View they materialize no
+    /// longer runs more than once and there is less for the rollup to share.
     fn adaptive_config() -> OptimizerConfig {
         OptimizerConfig::default()
             .with_all_disabled()
@@ -3785,41 +3315,20 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_and_naive_together_is_a_config_error() {
-        // The naive reader-count rule is the floor the search exists to beat.
-        // Applying it to the search's own baseline would make every candidate a
-        // comparison against the wrong control -- so this is refused rather than
-        // resolved in favour of whichever the pass happens to read first.
-        let config = adaptive_config().with_nodefusion_naive_materialize_ctes(true);
-        let problem = config.validate().expect_err("the pair must be refused");
+    fn adaptive_refuses_an_override_that_leaves_it_nothing_to_decide() {
+        // An override pins the exact set the search exists to find, so the
+        // runs would be spent re-deriving a fixed answer.
+        let config = adaptive_config()
+            .with_nodefusion_materialize_ctes_override(Some(vec!["stg".into()]));
         assert!(
-            problem.contains("nodefusion_naive_materialize_ctes"),
-            "the message has to name both settings; got {problem}"
+            config.validate().is_err(),
+            "a search with nothing to decide must be refused"
         );
-
         // And again at the pass, which is the backstop for a config row stored
-        // before the rule existed: that row still decodes, and obeying it
-        // silently is the failure this guards.
+        // before the rule existed.
         let pass = NodeFusionPass::from_config(&config);
         let err = pass.check_config().expect_err("the pass must refuse too");
         assert!(matches!(err, OptimizerError::Config(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn adaptive_refuses_the_settings_that_would_leave_it_nothing_to_decide() {
-        // An override pins the exact set the search exists to find, and the
-        // global switch turns every View on regardless of what it decides.
-        // Either way the runs would be spent re-deriving a fixed answer.
-        for config in [
-            adaptive_config()
-                .with_nodefusion_materialize_ctes_override(Some(vec!["stg".into()])),
-            adaptive_config().with_nodefusion_materialize_ctes(true),
-        ] {
-            assert!(
-                config.validate().is_err(),
-                "a search with nothing to decide must be refused"
-            );
-        }
         // The plain adaptive config is fine, or the assertions above prove
         // nothing.
         adaptive_config().validate().expect("adaptive alone is valid");
@@ -3831,17 +3340,6 @@ mod tests {
         // like a search that ran and found nothing.
         let config = OptimizerConfig::default().with_nodefusion_adaptive_materialize_ctes(true);
         assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn the_naive_rule_alone_is_still_valid() {
-        // The floor has to remain reachable, or there is nothing to measure
-        // the search against.
-        OptimizerConfig::default()
-            .with_nodefusion_pass()
-            .with_nodefusion_naive_materialize_ctes(true)
-            .validate()
-            .expect("naive on its own is the control cell");
     }
 
     #[test]
@@ -3862,89 +3360,50 @@ mod tests {
         assert_eq!(kind(&adaptive_config()), OptimizationType::Continuous);
     }
 
-    #[tokio::test]
-    async fn only_a_cte_with_more_than_one_reader_is_the_searchs_to_decide() {
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-        let mut dag = two_table_dag();
-        resolved(&conn, &mut dag).await;
-
-        let plan = NodeFusionPass::new(false, false, None).plan(&dag).unwrap();
-        let decidable = plan.decidable();
-
-        // `stg` is read by both Tables, so materializing it is a real question.
+    #[test]
+    fn only_a_cte_with_more_than_one_reader_is_the_searchs_to_decide() {
+        let plan = NodeFusionPass::new(None).plan(&shared_chain_dag()).unwrap();
         assert_eq!(
-            decidable,
-            vec!["stg".to_string()],
-            "only the shared View is decidable; got {decidable:?}"
+            plan.decidable(),
+            vec!["facts".to_string()],
+            "only `facts` is read twice inside the rollup"
         );
-        // The two leaf Tables are read exactly once each -- by their own
-        // `UNION ALL` branch -- so they are computed once whichever way the hint
-        // goes. A search that trialled them would be spending DAG runs on a
-        // coin flip.
-        for leaf in ["by_region", "totals"] {
-            let cte = plan.ctes.iter().find(|c| c.node_id == leaf).unwrap();
-            assert_eq!(cte.readers, 1);
-            assert!(!cte.decidable, "{leaf} is read once and has nothing to decide");
+        // Everything else is read exactly once -- by one CTE or its own output
+        // branch -- so it is computed once whichever way the hint goes. A
+        // search that trialled it would be spending DAG runs on a coin flip.
+        for id in ["stg", "by_region_v", "totals"] {
+            let cte = plan.ctes.iter().find(|c| c.node_id == id).unwrap();
+            assert_eq!(cte.readers, 1, "{id}");
+            assert!(!cte.decidable, "{id} is read once and has nothing to decide");
         }
     }
 
     #[tokio::test]
-    async fn an_intermediate_tables_cte_is_the_searchs_to_demote() {
+    async fn the_empty_set_is_a_configuration_and_delivers_the_same_rows() {
+        // The search may move the hint around; it may not change what the DAG
+        // produces. And the empty set -- every CTE plain -- is a configuration
+        // it can install, not an absence.
         let conn = in_memory_conn().await;
         setup_orders(&conn).await;
-        let mut dag = layered_dag();
-        resolved(&conn, &mut dag).await;
+        let relations = ["rpt_region", "totals"];
+        let baseline = run_and_fingerprint(&conn, &shared_chain_dag(), &relations).await;
 
-        let plan = NodeFusionPass::new(false, false, None).plan(&dag).unwrap();
-        let base = plan.ctes.iter().find(|c| c.node_id == "base").unwrap();
-
-        // Materialized by default -- it was authored as a barrier -- but
-        // decidable, which is the widening that pricing Tables as well as Views
-        // buys. Whether a barrier that made sense between two *tables* is the
-        // right barrier inside a single query is exactly what the search is for.
-        assert!(base.materialized, "the default still materializes it");
-        assert!(base.decidable, "and the search still gets to disagree");
-        assert!(base.readers > 1);
-
-        // And the search can actually express the demotion: the empty set is a
-        // configuration, not an absence.
-        let mut plain = NodeFusionPass::new(false, false, None);
+        let mut dag = shared_chain_dag();
         let empty: HashSet<String> = HashSet::new();
-        let mut demoted = dag.clone();
-        plain.rewrite_with(&mut demoted, &empty).unwrap();
-        let sql = demoted
-            .nodes
-            .get("dee_fused".to_string())
-            .unwrap()
-            .query_text
-            .clone();
+        NodeFusionPass::new(None)
+            .rewrite_with(conn.as_ref(), &mut dag, &empty)
+            .await
+            .unwrap();
+        let sql = dag.nodes.get("dee_fused".to_string()).unwrap().query_text.clone();
         assert!(
             !sql.contains("MATERIALIZED"),
             "the empty set means every CTE plain; got {sql}"
         );
-    }
 
-    #[tokio::test]
-    async fn a_demoted_intermediate_table_still_delivers_the_same_rows() {
-        // The search may move the hint around; it may not change what the DAG
-        // produces. Same standard the naive rule is held to.
-        let conn = in_memory_conn().await;
-        setup_orders(&conn).await;
-
-        let baseline = run_and_fingerprint(&conn, &layered_dag(), &["base", "rollup"]).await;
-
-        let mut dag = layered_dag();
-        resolved(&conn, &mut dag).await;
-        let empty: HashSet<String> = HashSet::new();
-        NodeFusionPass::new(false, false, None)
-            .rewrite_with(&mut dag, &empty)
-            .unwrap();
-        let fused = run_and_fingerprint(&conn, &dag, &["base", "rollup"]).await;
-
+        let fused = run_and_fingerprint(&conn, &dag, &relations).await;
         assert_eq!(
             baseline, fused,
-            "demoting the intermediate Table's CTE changes the plan, never the rows"
+            "demoting the shared CTE changes the plan, never the rows"
         );
     }
 
@@ -4185,6 +3644,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_legacy_config_row_with_the_retired_switches_still_decodes() {
+        // They are no longer read, but a stored config that carries them must
+        // not start failing to decode -- `OptimizerConfig` refuses unknown
+        // fields.
+        let raw = serde_json::json!({
+            "run_nodefusion_pass": true,
+            "nodefusion_materialize_ctes": true,
+            "nodefusion_naive_materialize_ctes": true,
+        });
+        let mut merged = serde_json::to_value(OptimizerConfig::default()).unwrap();
+        for (k, v) in raw.as_object().unwrap() {
+            merged[k] = v.clone();
+        }
+        let config: OptimizerConfig = serde_json::from_value(merged).expect("the old row decodes");
+        let pass = NodeFusionPass::from_config(&config);
+        assert!(pass.materialize_override.is_none());
+    }
+
     // ------------------------------------------------------------------
     // The search, driven end to end
     // ------------------------------------------------------------------
@@ -4220,17 +3698,19 @@ mod tests {
         .unwrap();
     }
 
-    /// A join-and-aggregate View that three Tables read.
+    /// A join View that four stored builds read, one of them through a View.
     ///
     ///   events ─┐
     ///           ├─► enriched (View) ──┬──► by_region  (Table)
     ///   customers┘                    ├──► by_channel (Table)
-    ///                                 └──► top_spend  (Table)
+    ///                                 ├──► top_spend  (Table)
+    ///                                 └──► enriched_us (View) ─► us_count (Table)
     ///
-    /// Three readers of one expensive computation is the shape fusion exists
-    /// for and the shape a materialization decision can actually move: plain,
-    /// the fused query is free to unfold the join into each branch; materialized,
-    /// it runs once. That is a difference the search should be able to see.
+    /// `enriched` runs four times, and `enriched_us` reads it inside the
+    /// rollup, so `by_region` and `by_channel` move their queries in and
+    /// `enriched` ends up with several readers there -- the one CTE whose
+    /// materialization is a real question. `top_spend` orders and limits, so
+    /// it keeps its own query.
     fn wide_dag() -> Dag {
         let mut dag = make_dag(vec![
             node(
@@ -4240,6 +3720,12 @@ mod tests {
                  WHERE e.value > 1",
                 MaterializeMode::View,
                 &[],
+            ),
+            node(
+                "enriched_us",
+                "SELECT event_id, value FROM enriched WHERE region = 'US'",
+                MaterializeMode::View,
+                &["enriched"],
             ),
             node(
                 "by_region",
@@ -4260,6 +3746,12 @@ mod tests {
                 MaterializeMode::Table,
                 &["enriched"],
             ),
+            node(
+                "us_count",
+                "SELECT count(*) AS n, sum(value) AS total FROM enriched_us",
+                MaterializeMode::Table,
+                &["enriched_us"],
+            ),
         ]);
         dag.sources = vec![
             SourceNode {
@@ -4273,6 +3765,8 @@ mod tests {
         ];
         dag
     }
+
+    const WIDE_RELATIONS: [&str; 4] = ["by_region", "by_channel", "top_spend", "us_count"];
 
     /// Run the adaptive search to convergence against a real DuckDB, the way
     /// `dee optimize` does: the batch driver supplies the executions the search
@@ -4323,8 +3817,7 @@ mod tests {
     async fn the_search_converges_on_a_fused_dag_that_still_produces_the_same_rows() {
         let conn = in_memory_conn().await;
         setup_wide(&conn).await;
-        let relations = ["by_region", "by_channel", "top_spend"];
-        let expected = run_and_fingerprint(&conn, &wide_dag(), &relations).await;
+        let expected = run_and_fingerprint(&conn, &wide_dag(), &WIDE_RELATIONS).await;
         drop(conn);
 
         let (dag, report) = search_to_convergence(Objective::Makespan).await;
@@ -4358,7 +3851,7 @@ mod tests {
         // around, never the rows.
         let conn = in_memory_conn().await;
         setup_wide(&conn).await;
-        let actual = run_and_fingerprint(&conn, &dag, &relations).await;
+        let actual = run_and_fingerprint(&conn, &dag, &WIDE_RELATIONS).await;
         assert_eq!(
             expected, actual,
             "the searched materialization must not change what the DAG produces"
@@ -4410,10 +3903,9 @@ mod tests {
             Arc::clone(&engine),
             OptimizerConfig::default()
                 .with_all_disabled()
-                .with_nodefusion_pass()
-                .with_nodefusion_naive_materialize_ctes(true),
+                .with_nodefusion_pass(),
         );
-        let mut dag = layered_dag();
+        let mut dag = two_table_dag();
         let stores = MemoryStoreFactory::open().unwrap();
         let report = optimizer
             .run(&mut dag, "dag-rule", "pipeline", 1, &stores)
@@ -4422,11 +3914,10 @@ mod tests {
 
         assert_eq!(
             report.dag_runs_used, 0,
-            "a rule-driven fusion decides everything from the DAG in front of it"
+            "a rule-driven rollup decides everything from the DAG in front of it"
         );
         assert!(dag.nodes.get("dee_fused".to_string()).is_some());
     }
-
 
     #[tokio::test]
     async fn duckdb_plans_the_fused_query_the_same_with_and_without_the_hint() {
@@ -4443,21 +3934,23 @@ mod tests {
         // began distinguishing the two, and the search has a signal on it.
         let conn = in_memory_conn().await;
         setup_wide(&conn).await;
-        let engine = SimpleEngine::new(Arc::clone(&conn)).unwrap();
-        let mut dag = wide_dag();
-        engine.resolve_schemas(&mut dag).await.unwrap();
+        let dag = wide_dag();
 
-        let dialect = dialect_for_db(&dag.db);
-        let plan = NodeFusionPass::new(false, false, None).plan(&dag).unwrap();
+        let plan = NodeFusionPass::new(None).plan(&dag).unwrap();
         let decidable: HashSet<String> = plan.decidable().into_iter().collect();
         assert!(
             !decidable.is_empty(),
             "the fixture must have something the search could decide about"
         );
+        let columns = rollup::resolve_kind_columns(conn.as_ref(), &dag, &plan.rollup)
+            .await
+            .unwrap();
 
         let explain_of = async |set: &HashSet<String>| {
-            let p = plan_fusion(&dag, MaterializeRule::Exact(set)).unwrap();
-            let FusedSql { sql, .. } = build_fused_sql(&dag, &p, dialect).unwrap();
+            let materialized: BTreeSet<String> = set.iter().cloned().collect();
+            let sql = rollup::emit(&dag, &plan.rollup, &columns, &materialized)
+                .unwrap()
+                .fused_sql;
             // The SQL itself *does* differ -- that is the point of the hint.
             assert_eq!(sql.contains("AS MATERIALIZED"), !set.is_empty());
             conn.explain(&sql).await.unwrap().unwrap()
@@ -4483,7 +3976,7 @@ mod tests {
         assert_eq!(
             ops(&plain),
             ops(&hinted),
-            "DuckDB plans the decidable CTEs identically hinted or not, so the fused plan \
+            "DuckDB plans the decidable CTEs identically hinted or not, so the rollup's plan \
              carries no signal a cost-based rule could rank on"
         );
 
@@ -4510,9 +4003,7 @@ mod tests {
         setup_wide(&conn).await;
         let model = LearnedCostModel::new();
         let pass = NodeFusionPass::from_config(&adaptive_config());
-        let engine = SimpleEngine::new(Arc::clone(&conn)).unwrap();
-        let mut dag = wide_dag();
-        engine.resolve_schemas(&mut dag).await.unwrap();
+        let dag = wide_dag();
 
         let setup = pass.build_candidates(&*conn, &dag, &model).await;
         assert!(setup.candidates.is_empty());

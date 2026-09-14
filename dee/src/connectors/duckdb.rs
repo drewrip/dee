@@ -651,6 +651,27 @@ impl Connector for DuckDBConnection {
         Ok(Some(result))
     }
 
+    async fn column_types(
+        &self,
+        query_text: &str,
+    ) -> Result<Option<Vec<(String, String)>>, ConnectorError> {
+        let describe = format!("DESCRIBE SELECT * FROM (\n{query_text}\n) AS dee_describe");
+        self.blocking(move |conn| {
+            let mut stmt = conn.prepare(&describe).map_err(|e| {
+                ConnectorError::Execute(format!(
+                    "Failed to prepare describe: {e} - query_text:\n{describe}"
+                ))
+            })?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| ConnectorError::Execute(format!("Failed to execute describe: {e}")))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map(Some)
+                .map_err(|e| ConnectorError::Execute(format!("Failed to read describe: {e}")))
+        })
+        .await
+    }
+
     async fn explain(&self, query_text: &str) -> Result<Option<String>, ConnectorError> {
         let explain_query = format!("EXPLAIN (FORMAT JSON) {}", query_text);
         self.blocking(move |conn| {

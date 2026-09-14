@@ -326,6 +326,45 @@ pub struct NodeFusionDetail {
     /// and so not the same number as the DAG runs spent.
     #[serde(default)]
     pub candidates_costed: usize,
+    /// `exec(V)` for every View before the rewrite: how many times its SQL
+    /// ran across the stored builds. Sorted by node ID.
+    #[serde(default)]
+    pub exec_counts: Vec<(String, usize)>,
+    /// Every model in the rollup, in emission order, with why it is there.
+    #[serde(default)]
+    pub ctes: Vec<NodeFusionCte>,
+    /// The shared models something outside the rollup reads back.
+    #[serde(default)]
+    pub kinds: Vec<NodeFusionKind>,
+    /// The rollup's columns after `kind`, with the engine's type for each.
+    #[serde(default)]
+    pub columns: Vec<(String, String)>,
+    /// `(kind, predicate)` for every consumer filter applied in a kind's
+    /// branch.
+    #[serde(default)]
+    pub pushed_filters: Vec<(usize, String)>,
+    /// `(node, why)` for every consumer left reading what it read before.
+    #[serde(default)]
+    pub untouched: Vec<(String, String)>,
+}
+
+/// One model in NodeFusion's rollup.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeFusionCte {
+    pub node: String,
+    pub reason: String,
+    /// CTEs and output branches that read it inside the rollup.
+    pub readers: usize,
+    pub materialized: bool,
+}
+
+/// One kind: a shared model read back out of the rollup.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeFusionKind {
+    pub kind: usize,
+    pub cte: String,
+    pub consumers: Vec<String>,
+    pub pushed_filter: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

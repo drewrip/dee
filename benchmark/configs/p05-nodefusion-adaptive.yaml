@@ -1,18 +1,15 @@
-# NodeFusion's adaptive materialization against the naive floor, on p05_hr /
+# NodeFusion's adaptive materialization against its own rule, on p05_hr /
 # DuckDB / sf=1.
 #
-# The question this settles: NodeFusion has to decide which of the fused
-# query's CTEs to emit `AS MATERIALIZED`, and until now it decided by rule.
-# `nodefusion_naive_materialize_ctes` counts how many Tables reach a View and
-# materializes it above one -- reader counting, not pricing, and its own
-# documentation calls it "the floor a cost-based rule has to beat". This
-# measures whether the cost-based rule beats it.
+# The question this settles: the rollup has to decide which of its CTEs to
+# emit `AS MATERIALIZED`, and by default it decides by rule -- exactly the
+# CTEs with two or more readers inside it. This measures whether pricing the
+# choice beats the rule.
 #
 # Four cells:
 #
 #   unopt                     the DAG as dbt authored it
-#   nodefusion[naive=true]    the floor: a View CTE more than one Table reaches
-#                             is materialized, unpriced
+#   nodefusion                the rule, unpriced
 #   nodefusion[adaptive,
 #              objective=makespan]     the search, ordering and accepting on
 #                                      wall clock
@@ -21,8 +18,7 @@
 #                                      total node time
 #
 # The two adaptive cells are the point of running both objectives rather than
-# picking one. Inside a single fused query the same tension HMP has one level
-# up applies here: materializing a CTE stops the query recomputing it for every
+# picking one. Materializing a CTE stops the rollup recomputing it for every
 # reader (cutting total work) and inserts a barrier its readers wait on
 # (lengthening the path through the WITH chain). If the two objectives pick the
 # same set on this DAG, that is a finding and the config should say so rather
@@ -30,29 +26,24 @@
 #
 # # Reading this table
 #
-# **The adaptive cells are not free and the others are.** Every other
-# NodeFusion cell ever run spends zero DAG runs -- it is a pure rewrite, so
-# `payback` is immediate wherever it wins at all, and the only cost in the
-# table is `opt_wall_ms`. Adaptive gives that up: it measures a baseline fusion
-# and then one candidate per run, which is `nodefusion_max_runs + 1` executions
-# charged to the search. Comparing an adaptive cell to the naive cell on
-# `engine_wall_ms` alone credits it with a win it had to buy. Read `payback`.
+# **The adaptive cells are not free and the others are.** The rule-driven
+# cell spends zero DAG runs -- it is a pure rewrite, so `payback` is immediate
+# wherever it wins at all, and the only cost in the table is `opt_wall_ms`.
+# Adaptive gives that up: it measures a baseline and then one candidate per
+# run, which is `nodefusion_max_runs + 1` executions charged to the search.
+# Comparing an adaptive cell to the rule on `engine_wall_ms` alone credits it
+# with a win it had to buy. Read `payback`.
 #
 # `nodefusion_max_runs` is 3 rather than the default 1 because a search with
 # one run can only ever try its top-ranked candidate, which tests the ranking's
-# first place and nothing else. Three reaches far enough down the order for a
-# mis-ranked winner to still be found -- and, more usefully, for the gap
-# between predicted and measured order to be visible in `pass_iterations`.
+# first place and nothing else.
 #
 # # What the spool constant does to this
 #
-# The ranking leans on a modelled per-byte spool cost, not a fitted one: a CTE
-# materialization does not separate out in DuckDB's plan the way a
-# `CREATE TABLE AS` does, so there is nothing to fit it against yet. The
-# DuckDB default is 0.05 of the write constant, on the reasoning that DuckDB
-# buffers the CTE in its own memory. If adaptive loses to naive here, the spool
-# constant is the first thing to suspect -- sweep `nodefusion_spool_cost_factor`
-# before concluding the search is wrong.
+# The ranking leans on a modelled per-byte spool cost, not a fitted one. On
+# DuckDB the search usually finds nothing to rank: DuckDB already materializes
+# a CTE referenced more than once, which is exactly the set the search may
+# decide about. A postgres cell is where the search has a signal.
 #
 #   dee-bench run -c configs/p05-nodefusion-adaptive.yaml
 name: p05-nodefusion-adaptive
@@ -65,13 +56,12 @@ matrix:
   project: [p05_hr]
   backend: [duckdb]
   sf: [1]
-  variant: [unopt, nf_naive, nf_adaptive_makespan, nf_adaptive_query_time]
+  variant: [unopt, nf_rule, nf_adaptive_makespan, nf_adaptive_query_time]
 
 variants:
   unopt: {passes: []}
-  nf_naive:
+  nf_rule:
     passes: [nodefusion]
-    nodefusion_naive_materialize_ctes: true
   nf_adaptive_makespan:
     passes: [nodefusion]
     nodefusion_adaptive_materialize_ctes: true
@@ -86,11 +76,10 @@ variants:
     nodefusion_search_budget: 32
 
 # `nodefusion_objective` is written into the two adaptive variants rather than
-# swept in a `dee_opt` block, which is what p05-nodefusion.yaml does with the
-# naive switch. The difference is that matrix pruning is per *pass*, not per
-# setting: sweeping the objective would expand every nodefusion cell, and the
-# naive cell ignores the objective entirely, so the sweep would produce two
-# identical naive cells that only differ in a label. Four cells, not six.
+# swept in a `dee_opt` block. Matrix pruning is per *pass*, not per setting:
+# sweeping the objective would expand every nodefusion cell, and the rule cell
+# ignores the objective entirely, so the sweep would produce two identical rule
+# cells that only differ in a label. Four cells, not six.
 
 backends:
   duckdb:
@@ -98,4 +87,7 @@ backends:
     max_memory: 16GB
 
 execution:
-  repetitions: 5
+  # A p05 run at sf=1 takes about two seconds, so noise is the enemy and
+  # repetitions are cheap.
+  repetitions: 15
+  warmups: 2

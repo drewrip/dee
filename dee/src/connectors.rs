@@ -104,6 +104,22 @@ pub trait Connector {
         Ok(None)
     }
 
+    /// The columns `query_text` produces, as `(name, type)`, with each type
+    /// spelled the way this engine's own `CAST` accepts it -- precision, scale
+    /// and length included.
+    ///
+    /// Not the Arrow schema: that round trip is lossy (DuckDB's HUGEINT comes
+    /// back as `Decimal128(38, 0)`), and a NULL cast to the lossy type changes
+    /// the column it fills.
+    ///
+    /// `Ok(None)` when the connector cannot answer.
+    async fn column_types(
+        &self,
+        _query_text: &str,
+    ) -> Result<Option<Vec<(String, String)>>, ConnectorError> {
+        Ok(None)
+    }
+
     /// The plan this backend would use for `query_text`, in the backend's own
     /// JSON, without executing it.
     ///

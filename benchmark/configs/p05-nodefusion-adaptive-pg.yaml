@@ -1,0 +1,70 @@
+# NodeFusion on p05_hr / PostgreSQL / sf=1: the unoptimized DAG against the
+# rollup's own materialization rule and the adaptive search under each
+# objective.
+#
+# The PostgreSQL half of p05-nodefusion-adaptive.yaml, kept as its own run so
+# the DuckDB results stay where they are. The variants are identical.
+#
+# This is the backend the adaptive search is for. DuckDB already materializes
+# a CTE referenced more than once, so on DuckDB the search sees no difference
+# between hinted and plain plans and converges on the rule without pricing a
+# candidate. PostgreSQL inlines a CTE by default since 12, so `AS MATERIALIZED`
+# changes the plan and the two objectives can pick different sets.
+#
+# Read the adaptive cells on `payback`, not wall clock alone: each spends a
+# baseline run plus up to `nodefusion_max_runs` candidate runs searching.
+#
+# The container runs on port 55433 so it never touches a local server on 5432.
+#
+#   DAGBENCH_PG_UNLOGGED=0 dee-bench submit --fresh -c configs/p05-nodefusion-adaptive-pg.yaml
+name: p05-nodefusion-adaptive-pg
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/p05-nodefusion-adaptive-pg
+verbosity: detailed
+
+matrix:
+  project: [p05_hr]
+  backend: [postgres]
+  sf: [1]
+  variant: [unopt, nf_rule, nf_adaptive_makespan, nf_adaptive_query_time]
+
+variants:
+  unopt: {passes: []}
+  nf_rule:
+    passes: [nodefusion]
+  nf_adaptive_makespan:
+    passes: [nodefusion]
+    nodefusion_adaptive_materialize_ctes: true
+    nodefusion_objective: makespan
+    nodefusion_max_runs: 3
+    nodefusion_search_budget: 32
+  nf_adaptive_query_time:
+    passes: [nodefusion]
+    nodefusion_adaptive_materialize_ctes: true
+    nodefusion_objective: query_time
+    nodefusion_max_runs: 3
+    nodefusion_search_budget: 32
+
+backends:
+  postgres:
+    provider: container
+    image: postgres:18
+    port: 55433
+    cpus: 8
+    # 8g with work_mem 256MB crashed a backend in the unopt cell: it builds up
+    # to seven tables over ~60M source rows at once, each with parallel hash
+    # nodes. Crash recovery then truncated the UNLOGGED source tables and the
+    # later cells ran on empty data. Submit with DAGBENCH_PG_UNLOGGED=0.
+    memory: 12g
+    num_connections: 16
+    settings:
+      shared_buffers: 2GB
+      work_mem: 64MB
+      max_parallel_workers: 8
+
+execution:
+  repetitions: 15
+  warmups: 2
+  sample_interval_ms: 100
+  timeout_s: 3600

@@ -92,7 +92,7 @@ def label_variants(con) -> None:
     agree on project, backend, scale factor *and* variant and differ only in
     that parameter -- and one would silently overwrite the other in every chart
     and table. Rewriting `variant` as
-    ``nodefusion[nodefusion_naive_materialize_ctes=true]`` separates them
+    ``hmp[hmp_objective=makespan]`` separates them
     everywhere at once, and reads as the one thing that cell changed.
 
     Only settings that vary *within a variant* appear, so a run that sweeps

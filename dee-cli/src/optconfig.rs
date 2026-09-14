@@ -192,23 +192,15 @@ pub struct OptimizerArgs {
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
     pub parallelism_stop_on_narrowest_failure: Option<bool>,
 
-    /// NodeFusion: emit inlined View CTEs as materialized CTEs. Never applies
-    /// to an inlined Table's CTE, which is materialized on its own account.
-    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
-    pub nodefusion_materialize_ctes: Option<bool>,
-    /// NodeFusion: materialize an inlined View CTE that more than one Table
-    /// node reads. Naive: it counts readers rather than pricing them.
-    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
-    pub nodefusion_naive_materialize_ctes: Option<bool>,
     /// NodeFusion: the exact set of node IDs whose CTEs are materialized,
-    /// overriding every default -- so it is also how an inlined Table's CTE is
-    /// made plain. Comma separated; a bare table name matches a qualified ID.
+    /// replacing the rule of two or more readers inside the rollup. Comma
+    /// separated; a bare table name matches a qualified ID.
     #[arg(long, value_delimiter = ',')]
     pub nodefusion_materialize_ctes_override: Option<Vec<String>>,
     /// NodeFusion: choose the materialized CTE set by measurement instead of by
     /// rule -- the adaptive variant. Measures a baseline fusion, ranks candidate
     /// sets, and trials them one per DAG run. Incompatible with
-    /// --nodefusion-naive-materialize-ctes.
+    /// --nodefusion-materialize-ctes-override.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
     pub nodefusion_adaptive_materialize_ctes: Option<bool>,
     /// NodeFusion: which measure the adaptive search minimizes.
@@ -309,14 +301,6 @@ impl OptimizerArgs {
         set("omp_use_pushdown", self.omp_no_pushdown.map(|v| json!(!v)));
         set("hmp_use_pushdown", self.hmp_no_pushdown.map(|v| json!(!v)));
 
-        set(
-            "nodefusion_materialize_ctes",
-            self.nodefusion_materialize_ctes.map(|v| json!(v)),
-        );
-        set(
-            "nodefusion_naive_materialize_ctes",
-            self.nodefusion_naive_materialize_ctes.map(|v| json!(v)),
-        );
         set(
             "nodefusion_materialize_ctes_override",
             self.nodefusion_materialize_ctes_override
@@ -633,14 +617,15 @@ mod tests {
             "--enable",
             "nodefusion",
             "--nodefusion-adaptive-materialize-ctes",
-            "--nodefusion-naive-materialize-ctes",
+            "--nodefusion-materialize-ctes-override",
+            "stg",
         ])
         .optimizer
         .to_json()
         .expect_err("the pair must be refused");
         let message = err.to_string();
         assert!(
-            message.contains("nodefusion_naive_materialize_ctes"),
+            message.contains("nodefusion_materialize_ctes_override"),
             "the message has to name what to change; got {message}"
         );
     }

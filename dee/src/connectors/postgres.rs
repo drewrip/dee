@@ -548,6 +548,49 @@ impl Connector for PostgresConnection {
         Ok(Some(out))
     }
 
+    async fn column_types(
+        &self,
+        query_text: &str,
+    ) -> Result<Option<Vec<(String, String)>>, ConnectorError> {
+        // A prepared statement's column metadata carries the type but not its
+        // modifier, so `numeric(10,2)` would come back as `numeric` and a NULL
+        // cast to it would widen the column. `format_type` over `pg_attribute`
+        // has both, and needs a relation: a temporary view, inside a
+        // transaction that is rolled back, so nothing is left behind.
+        let fail = |what: &str, e: sqlx::Error| {
+            ConnectorError::Execute(format!("{what}: {e} - query_text:\n{query_text}"))
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| fail("couldn't begin a transaction", e))?;
+        sqlx::query(&format!(
+            "CREATE TEMPORARY VIEW dee_column_types_probe AS {query_text}"
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| fail("couldn't create the probe view", e))?;
+        let rows = sqlx::query(
+            "SELECT attname::text AS name, format_type(atttypid, atttypmod) AS ty \
+             FROM pg_attribute \
+             WHERE attrelid = 'dee_column_types_probe'::regclass AND attnum > 0 \
+               AND NOT attisdropped \
+             ORDER BY attnum",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| fail("couldn't read the probe view's columns", e))?;
+        tx.rollback()
+            .await
+            .map_err(|e| fail("couldn't roll back the probe transaction", e))?;
+        rows.iter()
+            .map(|r| Ok((r.try_get::<String, _>("name")?, r.try_get::<String, _>("ty")?)))
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map(Some)
+            .map_err(|e| fail("couldn't decode the probe view's columns", e))
+    }
+
     async fn explain(&self, query_text: &str) -> Result<Option<String>, ConnectorError> {
         // VERBOSE for the same reason the node plans ask for it: without it
         // there is no `Output`, and an aggregate cannot be told apart from

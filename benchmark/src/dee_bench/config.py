@@ -162,27 +162,17 @@ DEE_OPT_SPECS: tuple[DeeOptSpec, ...] = (
                "bool", frozenset({"parallelism"}),
                doc="Abandon the ladder when its narrowest rung fails, since no wider cap relieves "
                    "more contention than that one does."),
-    DeeOptSpec("nodefusion_materialize_ctes", "--nodefusion-materialize-ctes", "bool",
-               frozenset({"nodefusion"}),
-               doc="Emit the View CTEs NodeFusion inlines as materialized CTEs. An inlined "
-                   "Table's CTE is materialized on its own account and is not affected."),
-    DeeOptSpec("nodefusion_naive_materialize_ctes", "--nodefusion-naive-materialize-ctes", "bool",
-               frozenset({"nodefusion"}),
-               doc="Materialize an inlined View CTE that more than one Table node reads. Naive: "
-                   "it counts readers rather than pricing them, and is subsumed by "
-                   "nodefusion_materialize_ctes."),
     DeeOptSpec("nodefusion_materialize_ctes_override", "--nodefusion-materialize-ctes-override",
                "str_list", frozenset({"nodefusion"}),
-               doc="The exact set of node IDs whose CTEs NodeFusion materializes, overriding "
-                   "every default -- so it is also how an inlined Table's CTE is made plain."),
+               doc="The exact set of node IDs whose CTEs NodeFusion materializes, replacing "
+                   "the rule of two or more readers inside the rollup."),
     DeeOptSpec("nodefusion_adaptive_materialize_ctes", "--nodefusion-adaptive-materialize-ctes",
                "bool", frozenset({"nodefusion"}),
                doc="Choose the materialized CTE set by measurement rather than by rule -- the "
                    "adaptive variant. Measures a baseline fusion under the default rule, ranks "
                    "candidate sets by nodefusion_objective, and trials one per DAG run. "
-                   "Incompatible with nodefusion_naive_materialize_ctes, which is the floor it "
-                   "exists to beat, and with the global switch and the override, which would "
-                   "leave it nothing to decide. Unlike every other NodeFusion cell this one "
+                   "Incompatible with nodefusion_materialize_ctes_override, which would leave it "
+                   "nothing to decide. Unlike every other NodeFusion cell this one "
                    "spends DAG runs, so read it on payback and not on wall clock alone."),
     DeeOptSpec("nodefusion_objective", "--nodefusion-objective", "str", frozenset({"nodefusion"}),
                choices=("makespan", "query_time"),

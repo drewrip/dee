@@ -1,38 +1,25 @@
 # NodeFusion against the unoptimized DAG, on p05_hr / DuckDB / sf=1.
 #
-# Three cells, identical but for the pass and its materialization rule:
+# Two cells, identical but for the pass:
 #
 #   unopt             the DAG as dbt authored it -- six layer_7 report tables
 #                     and dept_salary_stats in layer_3, over twenty-odd views
-#   nodefusion        the same DAG collapsed into one fused node: every view a
-#                     table reads becomes a CTE, every table a branch of one
-#                     UNION ALL
+#   nodefusion        the views those tables re-execute more than once,
+#                     shared through one rollup node that each table reads
+#                     back by `kind`
 #
-# `nodefusion_naive_materialize_ctes` is swept rather than written into a
-# variant of its own, because it is a parameter of the NodeFusion pass and the
-# harness already knows that: the option is pruned to the passes that read it
-# before cells are deduplicated, so sweeping it expands the `nodefusion`
-# variant into two cells and leaves `unopt` as one. Three cells, not four.
+# The rollup materializes exactly the CTEs with two or more readers inside
+# it, so there is no materialization knob to sweep here. The adaptive search
+# over that choice has its own config, p05-nodefusion-adaptive.yaml.
 #
-# Off, only the intermediate table's CTE is materialized and every view CTE is
-# plain. On, a view CTE more than one table reaches is materialized too --
-# naive because it counts readers rather than pricing them, which is the floor
-# a cost-based rule has to beat. That second cell tests what the first leaves
-# open: a plain CTE several branches read is free to be unfolded into each of
-# them, so whether the engine is already sharing those views or quietly
-# rebuilding them is exactly what the hint settles.
-#
-# p05_hr is the interesting shape for this. `dept_salary_stats` is a table in
-# layer_3 that layers 4-6 read, so it is an *intermediate* table: NodeFusion
-# gives it a CTE as well as a `kind` of its own, and materializes that CTE by
-# default because both its own UNION ALL branch and everything downstream read
-# it. The six reports are leaves and are left plain.
+# p05_hr is an interesting shape for this. `dept_salary_stats` is a table in
+# layer_3 that layers 4-6 read, so views downstream of it read a stored table
+# and stay outside the rollup; they are pasted into the report tables that
+# read them, and read the rollup's kinds from there.
 #
 # The comparison is makespan -- `runs.engine_wall_ms`, the wall clock of the
-# DAG measured inside one warm server. NodeFusion has no objective to set: it
-# measures nothing and searches nothing, so unlike HMP there is no
-# `*_objective` knob here. Makespan is what the two cells are read on, not
-# something the pass was pointed at.
+# DAG measured inside one warm server. NodeFusion measures nothing and
+# searches nothing, so unlike HMP there is no `*_objective` knob here.
 #
 # NodeFusion spends zero DAG runs, so `payback` is immediate where it wins at
 # all, and the only cost in the table is `opt_wall_ms` -- the rewrite itself.
@@ -57,9 +44,6 @@ matrix:
 variants:
   unopt:      {passes: []}
   nodefusion: {passes: [nodefusion]}
-
-dee_opt:
-  nodefusion_naive_materialize_ctes: [false, true]
 
 backends:
   duckdb:
