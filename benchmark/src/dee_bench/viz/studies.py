@@ -8,11 +8,11 @@ returning a :class:`Study`. A study with no data returns an explicit
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from ..config import config_labels
-from .spec import ChartSpec, Series, Study
-from .theme import ordered
+from .query import median
+from .spec import ChartSpec, Kpi, Series, Study
+from .theme import STATUS, ordered
 
 
 def _tables(con) -> set[str]:
@@ -166,11 +166,24 @@ _MEASURED = """
            median(r.engine_wall_ms) / 1000.0 AS wall_s,
            median(r.cpu_seconds)              AS cpu_s,
            median(r.peak_rss_bytes) / 1048576.0 AS rss_mb,
-           count(*)                           AS n
+           count(*)                           AS n,
+           min(r.engine_wall_ms) / 1000.0     AS lo_s,
+           max(r.engine_wall_ms) / 1000.0     AS hi_s
     FROM runs r JOIN cells c USING (cell_id)
     WHERE r.phase = 'measure' AND r.status = 'ok'
     GROUP BY ALL
 """
+
+
+def _arms(rows: list[tuple]) -> list[tuple[float, float]]:
+    """Error bars as the full range of a cell's repetitions.
+
+    With a handful of repetitions the range is the honest width; a standard
+    error over five samples would draw a precision the measurement does not
+    have.
+    """
+    return [(max((r[5] or 0) - (r[9] or 0), 0.0), max((r[10] or 0) - (r[5] or 0), 0.0))
+            for r in rows]
 
 
 def study_scaling(con) -> Study:
@@ -199,14 +212,18 @@ def study_scaling(con) -> Study:
                 # A single scale factor has no trend to draw as a line -- it
                 # would just be disconnected dots on an arbitrary axis. Compare
                 # variants directly instead, which is what the data actually is.
-                by_name = {r[3]: r[5] for r in rows if r[0] == project and r[1] == backend}
+                here = [r for r in rows if r[0] == project and r[1] == backend]
+                by_name = {r[3]: r for r in here}
                 s.charts.append(ChartSpec(
                     id=f"scaling-{backend}-{project}",
                     kind="grouped_bar",
                     title=f"{project} on {backend}",
                     subtitle=f"Median measured runtime at scale factor {sfs[0]:g}",
                     x_label="", y_label="Runtime (s)",
-                    series=[Series(name=n, x=[f"sf{sfs[0]:g}"], y=[by_name.get(n)])
+                    value_labels=True, value_fmt="{:.2f}",
+                    series=[Series(name=n, x=[f"sf{sfs[0]:g}"],
+                                   y=[by_name[n][5]] if n in by_name else [None],
+                                   error=_arms([by_name[n]]) if n in by_name else None)
                             for n in names],
                     note="Only one scale factor was benchmarked, so this shows runtime by "
                          "variant rather than a trend across scale.",
@@ -219,6 +236,7 @@ def study_scaling(con) -> Study:
                     key=lambda r: r[2],
                 )
                 series.append(Series(name=name, x=[p[2] for p in pts], y=[p[5] for p in pts],
+                                     error=_arms(pts),
                                      meta={"n": [p[8] for p in pts]}))
             s.charts.append(ChartSpec(
                 id=f"scaling-{backend}-{project}",
@@ -231,8 +249,16 @@ def study_scaling(con) -> Study:
                       "proportion to data volume."),
             ))
 
-    s.table_columns = ["Project", "Backend", "SF", "Variant", "Runtime (s)", "Reps"]
-    s.table_rows = [[r[0], r[1], f"{r[2]:g}", r[3], f"{r[5]:.3f}", r[8]] for r in rows]
+    s.table_columns = ["Project", "Backend", "SF", "Variant", "Runtime (s)",
+                       "Fastest", "Slowest", "Reps"]
+    s.table_rows = [[r[0], r[1], f"{r[2]:g}", r[3], f"{r[5]:.3f}",
+                     f"{r[9]:.3f}" if r[9] is not None else "-",
+                     f"{r[10]:.3f}" if r[10] is not None else "-", r[8]] for r in rows]
+    s.kpis = [
+        Kpi("Scale factors", str(len(sfs)), ", ".join(f"{v:g}" for v in sfs)),
+        Kpi("Fastest cell", f"{min(r[5] for r in rows):.2f}s"),
+        Kpi("Slowest cell", f"{max(r[5] for r in rows):.2f}s"),
+    ]
     return s
 
 
@@ -276,8 +302,24 @@ def study_optimization(con) -> Study:
         x_label="", y_label="Speedup (x)",
         series=[Series(name=v, x=labels, y=by_variant[v]) for v in variants],
         hline=1.0, hline_label="unoptimized baseline",
-        note="Above the baseline line is faster than unoptimized; below it is a regression.",
+        value_labels=True,
+        note="Above the baseline line is faster than unoptimized; below it is a "
+             "regression. A missing bar is a cell that has not been measured yet, not "
+             "a speedup of zero.",
     ))
+    best = [v for values in by_variant.values() for v in values if v]
+    if best:
+        s.kpis = [
+            Kpi("Best speedup", f"{max(best):.2f}x",
+                "The single best cell across every optimized variant.",
+                tone="good" if max(best) > 1 else "warning"),
+            Kpi("Median speedup", f"{median(best):.2f}x",
+                tone="good" if (median(best) or 0) > 1.02 else "warning"),
+            Kpi("Cells that regressed",
+                f"{sum(1 for v in best if v < 1)}/{len(best)}",
+                "Optimized cells that ran slower than their baseline.",
+                tone="critical" if any(v < 1 for v in best) else "good"),
+        ]
 
     s.table_columns = ["Project", "Backend", "SF", "Variant", "Runtime (s)", "Speedup"]
     for r in sorted(rows):
@@ -327,10 +369,40 @@ def study_payback(con) -> Study:
         ))
 
     never = len(rows) - len(repaid)
-    if never:
-        s.charts and s.charts[0].__setattr__(
-            "note", s.charts[0].note + f" {never} of {len(rows)} cells never break even."
-        )
+    if never and s.charts:
+        s.charts[0].note += f" {never} of {len(rows)} cells never break even."
+
+    if repaid:
+        s.charts.append(ChartSpec(
+            id="payback-tradeoff", kind="points",
+            title="What the optimization cost, against what it saves per run",
+            subtitle="Each mark is a cell; the diagonals are the runs it takes to "
+                     "break even",
+            x_label="Wall seconds saved per run", y_label="Wall seconds spent optimizing",
+            x_type="linear",
+            series=([Series(name=v,
+                            x=[r[6] for r in repaid if r[3] == v],
+                            y=[r[4] for r in repaid if r[3] == v],
+                            meta={"payback": [f"{r[7]:.1f} runs"
+                                              for r in repaid if r[3] == v]})
+                     for v in ordered(list({r[3] for r in repaid}))]
+                    + _payback_guides(repaid)),
+            note="A mark below a guide line repays within that many runs. Down and to "
+                 "the right is a cheap optimization that saves a lot.",
+        ))
+
+    s.kpis = [
+        Kpi("Cells priced", str(len(rows))),
+        Kpi("Fastest payback",
+            f"{min(r[7] for r in repaid):.1f} runs" if repaid else "-",
+            "Runs of the DAG before the optimization has paid for itself.",
+            tone="good" if repaid else ""),
+        Kpi("Median payback",
+            f"{median([r[7] for r in repaid]):.1f} runs" if repaid else "-"),
+        Kpi("Never repaid", f"{never}/{len(rows)}",
+            "Cells whose variant was no faster than its baseline.",
+            tone="critical" if never else "good"),
+    ]
 
     s.table_columns = ["Project", "Backend", "SF", "Variant", "Opt cost (s)",
                        "Saved/run (s)", "Speedup", "Payback (runs)", "95% CI"]
@@ -345,6 +417,28 @@ def study_payback(con) -> Study:
             ci,
         ])
     return s
+
+
+def _payback_guides(repaid: list[tuple]) -> list[Series]:
+    """Iso-payback diagonals: cost = runs x savings, for a few round run counts.
+
+    The chart's real content is a ratio, and a ratio read off two axes is hard.
+    The guides turn it back into the number the study is about — how many runs
+    — without collapsing the two quantities that produced it.
+    """
+    savings = [r[6] for r in repaid if r[6] and r[6] > 0]
+    costs = [r[4] for r in repaid if r[4]]
+    if not savings or not costs:
+        return []
+    hi = max(savings) * 1.05
+    out = []
+    for runs in (1, 10, 100):
+        if runs * hi < min(costs) / 5:
+            continue  # a guide entirely below the data says nothing
+        out.append(Series(name=f"{runs} run{'s' if runs > 1 else ''}",
+                          x=[0.0, hi], y=[0.0, runs * hi],
+                          kind="line", dash="dot", color=STATUS["neutral"]))
+    return out
 
 
 def study_ablation(con) -> Study:
@@ -426,9 +520,10 @@ def study_pass_changes(con) -> Study:
         title="Changes applied per pass",
         subtitle="Materializations for HMP and OMP; query rewrites for Pushdown",
         x_label="", y_label="Changes applied", series=series,
-        note=("The unit differs by pass — a materialization is a much larger structural change "
-              "than a rewrite — so compare a pass against itself across DAGs, not against "
-              "another pass."),
+        note=("The unit differs by pass — a materialization is a much larger structural "
+              "change than a rewrite — so compare a pass against itself across DAGs, not "
+              "against another pass. Each pass's own page breaks its changes down into "
+              "what they actually were."),
     ))
 
     s.table_columns = ["Project", "Backend", "SF", "Variant", "Pass",
@@ -450,38 +545,119 @@ def study_system(con) -> Study:
             "Re-run with `verbosity: detailed`."
         )
         return s
-    rows = _rows(con, """
-        SELECT c.variant, c.project, c.backend, s.phase, s.source,
-               s.elapsed_ms, s.cpu_seconds_cum, s.rss_bytes
-        FROM system_samples s JOIN cells c USING (cell_id)
-        WHERE s.source <> 'engine_internal' AND s.phase = 'measure'
-        ORDER BY s.elapsed_ms
+
+    # One representative run per cell, rather than every run of every cell
+    # overlaid. Twenty repetitions of the same shape is not twenty findings,
+    # and drawing them all buries the one difference between two variants.
+    representatives = _rows(con, """
+        WITH measured AS (
+            SELECT cell_id, run_id, engine_wall_ms,
+                   row_number() OVER (PARTITION BY cell_id
+                                      ORDER BY engine_wall_ms) AS rank,
+                   count(*)    OVER (PARTITION BY cell_id)      AS total
+            FROM runs WHERE phase = 'measure' AND status = 'ok'
+                      AND engine_wall_ms IS NOT NULL
+        )
+        SELECT c.project, c.backend, c.sf, c.variant, m.run_id
+        FROM measured m JOIN cells c USING (cell_id)
+        WHERE m.rank = (m.total + 1) / 2
     """)
-    if not rows:
+    if not representatives:
+        s.empty_reason = "No measured run has system samples attached to it yet."
+        return s
+    by_run = {r[4]: r for r in representatives}
+
+    samples = _rows(con, """
+        SELECT s.run_id, s.elapsed_ms, s.cpu_seconds_cum, s.rss_bytes,
+               s.read_bytes, s.written_bytes
+        FROM system_samples s
+        WHERE s.source <> 'engine_internal' AND s.phase = 'measure'
+        ORDER BY s.run_id, s.elapsed_ms
+    """)
+    if not samples:
         s.empty_reason = "No external system samples were captured."
         return s
 
-    for metric, idx, label, scale in (
-        ("cpu", 6, "Cumulative CPU (s)", 1.0),
-        ("mem", 7, "Resident memory (MB)", 1 / 1048576.0),
-    ):
-        series = []
-        for variant in ordered(list({r[0] for r in rows})):
-            pts = [r for r in rows if r[0] == variant and r[idx] is not None]
-            if pts:
-                series.append(Series(
-                    name=variant,
-                    x=[p[5] / 1000.0 for p in pts],
-                    y=[p[idx] * scale for p in pts],
-                ))
-        if series:
-            s.charts.append(ChartSpec(
-                id=f"system-{metric}", kind="scatter",
-                title=label.split(" (")[0] + " over a run",
-                subtitle="Sampled externally from /proc and cgroup counters, by variant",
-                x_label="Elapsed (s)", y_label=label,
-                x_type="linear", series=series,
-            ))
+    traces: dict[str, list[tuple]] = {}
+    for row in samples:
+        if row[0] in by_run:
+            traces.setdefault(row[0], []).append(row)
+    if not traces:
+        s.empty_reason = (
+            "System samples exist, but none belong to a measured run — they were "
+            "captured during optimization only."
+        )
+        return s
+
+    def label(run_id: str) -> str:
+        project, backend, sf, variant, _ = by_run[run_id]
+        return f"{variant} · {project} {backend} sf{sf:g}"
+
+    names = ordered([label(run_id) for run_id in traces])
+    order = {name: i for i, name in enumerate(names)}
+
+    def build_series(value, scale=1.0, rate=False):
+        out = []
+        for run_id, points in traces.items():
+            xs, ys, previous = [], [], None
+            for point in points:
+                current = point[value]
+                if current is None:
+                    continue
+                elapsed = point[1] / 1000.0
+                if rate:
+                    if previous is not None and elapsed > previous[0]:
+                        xs.append(elapsed)
+                        ys.append((current - previous[1]) / (elapsed - previous[0]) * scale)
+                    previous = (elapsed, current)
+                else:
+                    xs.append(elapsed)
+                    ys.append(current * scale)
+            if xs:
+                out.append(Series(name=label(run_id), x=xs, y=ys))
+        return sorted(out, key=lambda ser: order.get(ser.name, 99))
+
+    panels = [
+        ("cpu", build_series(2, rate=True), "CPU in use (cores)",
+         "CPU seconds consumed per second of wall clock — how many cores were busy",
+         "Differentiated from the cumulative counter, so this is real consumption "
+         "rather than a sampled percentage. Above 1.0 means more than one core was "
+         "working."),
+        ("mem", build_series(3, scale=1 / 1048576.0), "Resident memory (MB)",
+         "Resident set size of the sampled process tree",
+         "The dee server is long-lived across a sweep, so a previous cell's buffer "
+         "pool is still resident here. Use `peak_engine_mem_bytes` for memory studies."),
+        ("io", build_series(5, scale=1 / 1048576.0), "Bytes written (MB)",
+         "Cumulative bytes written since the run started",
+         "A step is a materialization landing. A variant that writes more is paying "
+         "for the tables its optimizer chose to create."),
+    ]
+    for key, series, y_label, subtitle, note in panels:
+        if not series:
+            continue
+        s.charts.append(ChartSpec(
+            id=f"system-{key}", kind="scatter",
+            title=y_label.split(" (")[0] + " over a run",
+            subtitle=subtitle + ", for the median run of each cell",
+            x_label="Elapsed (s)", y_label=y_label,
+            x_type="linear", series=series, note=note, height=340,
+        ))
+
+    s.table_columns = ["Variant", "Project", "Backend", "SF", "Samples",
+                       "Peak CPU (cores)", "Peak RSS (MB)", "Written (MB)"]
+    for run_id, points in traces.items():
+        project, backend, sf, variant, _ = by_run[run_id]
+        rates = [ser for ser in build_series(2, rate=True) if ser.name == label(run_id)]
+        peak_cpu = max(rates[0].y) if rates and rates[0].y else None
+        rss = [p[3] for p in points if p[3] is not None]
+        written = [p[5] for p in points if p[5] is not None]
+        s.table_rows.append([
+            variant, project, backend, f"{sf:g}", len(points),
+            f"{peak_cpu:.2f}" if peak_cpu else "-",
+            f"{max(rss) / 1048576.0:.0f}" if rss else "-",
+            f"{max(written) / 1048576.0:.1f}" if written else "-",
+        ])
+    s.table_rows.sort(key=lambda row: (order.get(f"{row[0]} · {row[1]} {row[2]} sf{row[3]}", 99),))
     return s
 
 
@@ -524,7 +700,10 @@ def study_resource_response(con) -> Study:
             x_label="", y_label=f"Relative {label.lower()}",
             series=[Series(name=v, x=labels, y=by_variant[v]) for v in variants],
             hline=1.0, hline_label="unoptimized",
-            note="Below 1.0 uses less of this resource than the unoptimized DAG; above 1.0 uses more.",
+            value_labels=True,
+            note="Below 1.0 uses less of this resource than the unoptimized DAG; "
+                 "above 1.0 uses more. A pass that buys wall time with memory shows "
+                 "up as a runtime panel below the line and a memory panel above it.",
         ))
 
     s.table_columns = ["Project", "Backend", "SF", "Variant",
@@ -550,14 +729,27 @@ BUILDERS = [
 ]
 
 
-def build_all(con) -> list[Study]:
-    # Before any study runs, so every one of them sees backends and variants
-    # that already name what they were measured under.
+def label_all(con) -> None:
+    """Apply both labellings, once.
+
+    Called before any page is built — the optimization pages read `cells` too,
+    and a variant that names its swept setting on one page and not on another
+    would be two different things with one name.
+
+    Not idempotent: each labelling rewrites the view it labels, so calling it
+    twice would wrap an already-wrapped view. :func:`build_all` therefore takes
+    a flag rather than calling it again.
+    """
     for label in (label_backends, label_variants):
         try:
             label(con)
         except Exception:  # noqa: BLE001 - labelling must never lose the studies
             pass
+
+
+def build_all(con, labelled: bool = False) -> list[Study]:
+    if not labelled:
+        label_all(con)
     out = []
     for fn in BUILDERS:
         try:

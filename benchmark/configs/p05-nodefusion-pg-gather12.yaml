@@ -1,0 +1,47 @@
+# Quick check: does more intra-query parallelism let PostgreSQL turn NodeFusion's
+# ~3x cut in query work into wall time?
+#
+# Same backend as p05-nodefusion-adaptive-pg.yaml, plus
+# max_parallel_workers_per_gather: 12 (the default is 2). Note that workers are
+# still capped at max_parallel_workers (8 here) and max_worker_processes
+# (default 8) across the whole server.
+#
+# One run of each variant, no warmup: an indication, not a measurement.
+#
+#   DAGBENCH_PG_UNLOGGED=0 dee-bench run --fresh -c configs/p05-nodefusion-pg-gather12.yaml
+name: p05-nodefusion-pg-gather12
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/p05-nodefusion-pg-gather12
+verbosity: detailed
+
+matrix:
+  project: [p05_hr]
+  backend: [postgres]
+  sf: [1]
+  variant: [unopt, nf_rule]
+
+variants:
+  unopt: {passes: []}
+  nf_rule:
+    passes: [nodefusion]
+
+backends:
+  postgres:
+    provider: container
+    image: postgres:18
+    port: 55433
+    cpus: 8
+    memory: 12g
+    num_connections: 16
+    settings:
+      shared_buffers: 2GB
+      work_mem: 64MB
+      max_parallel_workers: 8
+      max_parallel_workers_per_gather: 12
+
+execution:
+  repetitions: 1
+  warmups: 0
+  sample_interval_ms: 100
+  timeout_s: 3600

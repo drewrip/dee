@@ -1,0 +1,82 @@
+# Does NodeFusion's cut in query work become wall time when PostgreSQL is
+# allowed real intra-query parallelism?
+#
+# p05_hr / PostgreSQL / sf=1, the rule-based rollup against the unoptimized
+# DAG. On the stock-parallelism backend (p05-nodefusion-adaptive-pg.yaml:
+# max_parallel_workers=8, per_gather at its default of 2) the rule came in at
+# 42.4s against 45.9s unoptimized -- 1.08x, far less than the ~3x cut in query
+# work the rewrite performs. The hypothesis is that the baseline's duplicated
+# view work is spread across workers the rollup then leaves idle, so removing
+# it buys little wall clock.
+#
+# This config permits twelve parallel workers *for real*. The earlier
+# p05-nodefusion-pg-gather12.yaml raised only max_parallel_workers_per_gather,
+# which is inert on its own: a gather is capped by max_parallel_workers (8
+# there) and by max_worker_processes (8 by default), so it still got at most
+# eight. All three are raised here:
+#
+#   max_parallel_workers_per_gather  12   a single gather may ask for twelve
+#   max_parallel_workers             12   twelve may actually be running
+#   max_worker_processes             16   with headroom, so autovacuum and the
+#                                         like do not eat into the twelve
+#
+# shm_size is why the harness grew the knob: a parallel query puts its tuple
+# queues and hash tables in /dev/shm, which a container gives 64MB of, and a
+# twelve-worker gather over these tables asks for more than that and dies with
+# "could not resize shared memory segment".
+#
+# The container keeps cpus: 8 and memory: 12g so that the only difference from
+# p05-nodefusion-adaptive-pg is the parallelism grant and the unopt cell stays
+# comparable to the 45.9s already measured. Twelve workers on eight cores is
+# therefore a permission ceiling rather than twelve cores of real parallelism,
+# which is the honest question anyway: PostgreSQL will not use workers it is
+# not allowed, and whether it can use more than it has is what the run answers.
+#
+# Five repetitions and a warmup, because 1.08x against noise on a 45s DAG is
+# not a result. `detailed` rather than `full`: at full verbosity dee builds
+# each table through EXPLAIN (ANALYZE, BUFFERS), whose instrumentation inflates
+# exactly the wall clock this run is comparing. Profiling is its own run.
+#
+# Submit with DAGBENCH_PG_UNLOGGED=0 -- the unopt cell builds up to seven
+# tables over ~60M source rows at once, and a backend crash under UNLOGGED
+# source tables truncates them and silently empties the later cells.
+#
+#   DAGBENCH_PG_UNLOGGED=0 dee-bench run -c configs/p05-nodefusion-pg-w12.yaml
+name: p05-nodefusion-pg-w12
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/p05-nodefusion-pg-w12
+verbosity: detailed
+
+matrix:
+  project: [p05_hr]
+  backend: [postgres]
+  sf: [1]
+  variant: [unopt, nf_rule]
+
+variants:
+  unopt: {passes: []}
+  nf_rule:
+    passes: [nodefusion]
+
+backends:
+  postgres:
+    provider: container
+    image: postgres:18
+    port: 55433
+    cpus: 8
+    memory: 12g
+    shm_size: 2g
+    num_connections: 16
+    settings:
+      shared_buffers: 2GB
+      work_mem: 64MB
+      max_worker_processes: 16
+      max_parallel_workers: 12
+      max_parallel_workers_per_gather: 12
+
+execution:
+  repetitions: 5
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

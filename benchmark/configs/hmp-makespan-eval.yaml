@@ -1,0 +1,58 @@
+# HMP against its own baseline on three dag-bench projects at sf=1, with the
+# search minimizing makespan and cancelling a candidate the moment it overruns
+# the incumbent.
+#
+# Six cells: {p03_ecommerce, p05_hr, p07_saas} x {unopt, hmp}. The `unopt`
+# cells are the baseline every `hmp` cell is repaid against, and share their
+# backend tuning with it so `analyze` can pair them.
+#
+# DuckDB only. A postgres arm measured the same thing but spent most of its
+# wall clock loading data rather than benchmarking -- p07_saas alone is 25.8M
+# rows at sf=1 -- so it is not worth its cost here.
+#
+#   dee-bench run -c configs/hmp-makespan-eval.yaml
+name: hmp-makespan-eval
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/hmp-makespan-eval
+verbosity: detailed
+
+matrix:
+  project: [p05_hr, p06_logistics, p07_saas]
+  backend: [duckdb]
+  sf: [2]
+  variant: [unopt, hmp]
+
+variants:
+  unopt: {passes: []}
+  hmp:
+    passes: [hmp]
+    hmp_use_pushdown: false      # HMP alone, so the effect is the pass's own
+    # `leafset`, the default, priced nothing on these DAGs -- every cell logged
+    # "no candidate combination could be costed" and fell back to trying
+    # combinations smallest-first, which is a search with no ranking at all.
+    hmp_cost_method: dup_attribution
+
+dee_opt:
+  hmp_objective: makespan        # minimize wall clock, not total query time
+  hmp_max_runs: 8                # at most eight DAG executions spent searching
+  hmp_dup_cost_model: learned_cost   # what dup_attribution prices a region with
+  # Every shared view is a candidate, not just those covering the top half of
+  # CPU time. At the 0.5 default the working set was 1-2 nodes of the 4-6 these
+  # DAGs offer, so the search ran out of candidates after 2-4 runs and the run
+  # budget below never bound.
+  hmp_top_cpu_time: 1.0
+  trial_resume: true             # cancel a candidate that overruns the incumbent
+  trial_budget_eps: 0.0          # ... the moment it reaches it
+  trial_reuse: equivalent        # and finish the run from what it already built
+
+backends:
+  duckdb:
+    threads: 8
+    max_memory: 16GB
+
+execution:
+  repetitions: 1
+  warmups: 1
+  sample_interval_ms: 100
+  timeout_s: 3600

@@ -257,7 +257,7 @@ BACKEND_KEYS: dict[str, frozenset[str]] = {
     "duckdb": frozenset({"threads", "max_memory"}),
     "postgres": frozenset({
         "provider", "image", "host", "port", "user", "password", "dbname",
-        "cpus", "memory", "volume_suffix", "num_connections", "settings",
+        "cpus", "memory", "shm_size", "volume_suffix", "num_connections", "settings",
     }),
 }
 

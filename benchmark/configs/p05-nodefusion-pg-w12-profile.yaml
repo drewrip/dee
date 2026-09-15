@@ -1,0 +1,62 @@
+# The profiling companion to p05-nodefusion-pg-w12.yaml: why the wall clock
+# moves as little as it does.
+#
+# Identical backend, identical variants, but `verbosity: full`, which makes dee
+# build every table through EXPLAIN (ANALYZE, VERBOSE, BUFFERS, FORMAT JSON)
+# and record the plan verbatim in the `plans` table. That instrumentation
+# inflates wall clock, which is exactly why it is a separate run: the timing
+# comparison lives in p05-nodefusion-pg-w12 and nothing here is a measurement
+# of speed.
+#
+# What the plans answer:
+#
+#   Workers Planned vs Workers Launched   whether a gather that asked for
+#                                         twelve actually got twelve, or was
+#                                         refused by the server-wide pool
+#   per-node Actual Total Time            where the DAG's time really goes, and
+#                                         whether the rollup concentrated the
+#                                         shared work onto one serial node
+#   Buffers / Sort Method / hash batches   whether the rollup spills what the
+#                                         duplicated views did not
+#
+# One repetition and no warmup: a plan is a description, not a sample.
+#
+#   DAGBENCH_PG_UNLOGGED=0 dee-bench run -c configs/p05-nodefusion-pg-w12-profile.yaml --no-viz
+name: p05-nodefusion-pg-w12-profile
+dag_bench: ${DAG_BENCH}
+dee_bin: /Users/aripberg/dee/target/release/dee
+output_dir: ../results/p05-nodefusion-pg-w12-profile
+verbosity: full
+
+matrix:
+  project: [p05_hr]
+  backend: [postgres]
+  sf: [1]
+  variant: [unopt, nf_rule]
+
+variants:
+  unopt: {passes: []}
+  nf_rule:
+    passes: [nodefusion]
+
+backends:
+  postgres:
+    provider: container
+    image: postgres:18
+    port: 55433
+    cpus: 8
+    memory: 12g
+    shm_size: 2g
+    num_connections: 16
+    settings:
+      shared_buffers: 2GB
+      work_mem: 64MB
+      max_worker_processes: 16
+      max_parallel_workers: 12
+      max_parallel_workers_per_gather: 12
+
+execution:
+  repetitions: 1
+  warmups: 0
+  sample_interval_ms: 100
+  timeout_s: 7200

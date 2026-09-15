@@ -152,6 +152,13 @@ class PostgresBackend(Backend):
             cmd += ["--cpus", str(self.config["cpus"])]
         if self.config.get("memory"):
             cmd += ["--memory", str(self.config["memory"]), "--memory-swap", str(self.config["memory"])]
+        if self.config.get("shm_size"):
+            # Postgres puts a parallel query's tuple queues and hash tables in
+            # /dev/shm, which a container gives 64MB of by default. A gather
+            # over a table of any size asks for more than that and the query
+            # dies with "could not resize shared memory segment", so a sweep
+            # that enables parallel workers has to raise it.
+            cmd += ["--shm-size", str(self.config["shm_size"])]
         cmd.append(image)
         # Server tuning is passed as postgres arguments so it needs no
         # config-file mount and stays visible in `docker inspect`.

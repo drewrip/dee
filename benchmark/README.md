@@ -5,7 +5,9 @@ Benchmarking harness for [`dee`](../) against
 
 It expands a declarative experiment matrix into a queue of runs, manages the
 backend infrastructure each run needs, records everything to documented
-parquet, and renders an interactive dashboard.
+parquet, and renders an interactive dashboard — which grows a page per
+optimization the run enabled, and a run-by-run page for any DAG optimized in
+place.
 
 ## Quick start
 
@@ -31,7 +33,7 @@ and cleans up stray containers with `--clean`.
 | `status <run_dir>` | Progress, current cell, ETA; `--failed` lists errors |
 | `resume <run_dir>` | Continue an interrupted or partially failed run |
 | `cancel <run_dir>` | Stop the background worker, tearing infrastructure down |
-| `viz <run_dir>` | Rebuild the dashboard and charts from results alone |
+| `viz <run_dir>` | Rebuild the dashboard, and a png and pdf of every chart, from results alone |
 | `analyze <run_dir>` | Recompute the derived `payback` table |
 | `schema` | Print the result schemas as markdown |
 | `doctor` | Check tooling; `--clean` removes leftover containers |
@@ -79,6 +81,7 @@ backends:                        # backend tuning; lists sweep here too
     port: 55433
     cpus: 16
     memory: 16g
+    shm_size: 2g                   # /dev/shm; parallel query needs > the 64MB default
     settings: {shared_buffers: 4GB, work_mem: 256MB}
 
 execution:
@@ -212,7 +215,29 @@ Each cell writes its own fragment and nothing rewrites an existing one, so a
 crash can only lose the cell in flight. A partial run stays fully queryable and
 renderable, and `resume` picks up exactly where it stopped.
 
-## The seven studies
+## Visualization
+
+`dee-bench viz` builds a dashboard from the parquet alone, so it can be re-run
+at any time, on a partial run, without re-benchmarking:
+
+```bash
+dee-bench viz results/my-eval --open
+dee-bench viz results/my-eval --only hmp        # one page
+```
+
+It writes `<run_dir>/dashboard/index.html` — one self-contained, theme-aware
+file — and `<run_dir>/dashboard/charts/`, holding **a PNG and a PDF of every
+chart**. The page links both beside each chart, so what gets downloaded is the
+chart on screen rather than a lookalike: one `ChartSpec` describes each chart,
+plotly renders it interactively and matplotlib renders the same object to
+disk. The PNG is rasterised at 300dpi for a slide; the PDF is vector, for a
+paper.
+
+The dashboard's pages are decided by what the run contains.
+
+### The seven studies
+
+Always present, because every sweep can answer them.
 
 | # | Study | Where the data is |
 |---|---|---|
@@ -224,13 +249,53 @@ renderable, and `resume` picks up exactly where it stopped.
 | 6 | System usage | `system_samples` |
 | 7 | Runtime / memory / CPU response | `runs.{engine_wall_ms, peak_rss_bytes, cpu_seconds}` |
 
-`dee-bench viz` renders all seven as an interactive dashboard, plus a static
-png and pdf per chart. It reads only the parquet, so it can be re-run at any
-time, on a partial run, without re-benchmarking:
+### A page per optimization
 
-```bash
-dee-bench viz results/my-eval --only payback --format png,pdf
-```
+The seven studies ask the same questions of every sweep. Each optimization also
+gets its own page, asking what only that pass can answer — and it appears only
+when the results show that pass ran. Detection is from the results rather than
+the config, so adding a pass to one variant grows a page on the next
+`dee-bench viz`, with no flag to remember.
+
+| Page | What it shows |
+|---|---|
+| **HMP** | the search candidate by candidate: what each iteration *cost* against what the candidate *measured* (not the same number — a cancelled candidate's runtime is the incumbent's budget), predicted makespan scored against measured runtime, what cancelling bought, and which views ended up materialized |
+| **OMP** | the centrality ranking that chose the candidates, which of them are in the plan it kept, and the plans it enumerated |
+| **NodeFusion** | what the rollup absorbed, how many times each absorbed node's SQL would run inside the fused query, which CTEs were spooled and why, and the adaptive search where one ran |
+| **Parallelism** | the ladder rung by rung with the control measured beside each, the full range of every rung's samples, and a grid of what the search decided about each rung of each cell |
+| **Pushdown** | rewrites applied, and for every node it examined, whether the filter could be pushed |
+
+### Run by run, for a continuous optimization
+
+A batch optimization happens *before* the measurements, so a single number
+describes it. A continuous one has no before: it is registered on the DAG and
+steps around the runs the DAG was performing anyway, so its cost, its search
+and its result are spread across one series of runs — and a chart of medians
+hides exactly the thing worth seeing.
+
+So a run with any `optimization_mode: continuous` cell grows a page that plots
+the runs themselves, in order, per cell:
+
+- **every run, in order** — wall time of each execution, split at the run where
+  the search promoted its result, against the unoptimized baseline;
+- **DAG version per run** — the promotion, exactly, as a step;
+- **has it paid for itself yet** — total time spent so far against never having
+  optimized at all, and the run where the two lines cross and stay crossed;
+- **runs the search cut short** — for a run whose candidate was cancelled, the
+  trial and what finishing under the incumbent then took;
+- and a table of every execution: version, runtime, delivery, status.
+
+`runs.dag_version` is what separates the two halves, the same way `analyze`
+computes payback, so the page and the payback table read the promotion
+identically.
+
+### Everything else
+
+An **Overview** page opens the dashboard: how much of the matrix has results,
+a grid of median runtime per cell with the unmeasured squares hatched, where
+the sweep's own wall clock went, and a cell inventory. Behind every page's
+charts is a table of the numbers, which is how identity never rests on colour
+alone.
 
 ## How measurements are taken
 

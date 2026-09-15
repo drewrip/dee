@@ -6,56 +6,100 @@ rebuilt at any time without re-running a benchmark:
     dee-bench viz <run_dir> [--only payback] [--format html,png,pdf]
 
 The page is a single self-contained file (plotly inlined), theme-aware, with a
-tab per study, a table view behind every chart, and a link from each chart to
-the static png/pdf of the same spec.
+page per study, a page per optimization the run enabled, a run-by-run page for
+any cell optimized continuously, a table view behind every chart, and a PNG and
+a PDF of every chart rendered beside it.
 """
 
 from __future__ import annotations
 
 import html
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..schema import render_markdown
 from ..store import connect
+from . import overview, passes
+from .assets import CSS, JS
 from .charts import render as render_static
-from .spec import ChartSpec, Study
-from .studies import build_all
-from .theme import DARK, DARK_SERIES, LIGHT, LIGHT_SERIES, series_color
+from .continuous import build as build_continuous
+from .figures import figure
+from .spec import ChartSpec, Kpi, Study, Table
+from .studies import build_all, label_all
+from .theme import DARK, FONT_STACK, LIGHT, MONO_STACK
+
+# Where each page group sits in the navigation, and what it is called there.
+GROUPS = [
+    ("overview", "Run"),
+    ("studies", "The seven studies"),
+    ("optimizations", "Optimizations"),
+    ("runs", "Run by run"),
+]
+
+
+def build_pages(run_dir: Path, con=None) -> tuple[list[Study], dict[str, Any]]:
+    """Every page this run's results support, in navigation order."""
+    con = con or connect(run_dir)
+    # Once, before anything is built: the optimization pages read `cells` too,
+    # and a variant that names its swept setting on one page but not another
+    # would be two different things under one name.
+    label_all(con)
+
+    meta = _run_meta(run_dir, con)
+    pages = [overview.build(con, meta)]
+    pages += build_all(con, labelled=True)
+    pages += passes.build(con)
+    continuous = build_continuous(con)
+    if continuous:
+        pages.append(continuous)
+    return pages, meta
 
 
 def build(run_dir: Path, only: str | None = None, formats: set[str] | None = None) -> Path | None:
     """Build the dashboard. Returns the index path, or None if there is nothing yet."""
-    formats = formats or {"html", "png", "pdf"}
+    formats = set(formats or {"html", "png", "pdf"})
     run_dir = Path(run_dir)
     if not (run_dir / "results").exists():
         return None
 
     con = connect(run_dir)
-    studies = build_all(con)
+    pages, meta = build_pages(run_dir, con)
     if only:
-        studies = [s for s in studies if s.key == only]
-        if not studies:
-            raise ValueError(f"unknown study {only!r}; expected one of "
-                             + ", ".join(s.key for s in build_all(con)))
+        keys = {p.key for p in pages}
+        chosen = [p for p in pages if p.key == only or p.key == f"pass-{only}"]
+        if not chosen:
+            raise ValueError(f"unknown page {only!r}; expected one of "
+                             + ", ".join(sorted(keys)))
+        pages = chosen
 
     out_dir = run_dir / "dashboard"
     charts_dir = out_dir / "charts"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # The page offers a PNG and a PDF of every chart, so building the page
+    # builds them: a download button pointing at a file that was not rendered
+    # is worse than no button.
+    static_formats = formats | ({"png", "pdf"} if "html" in formats else set())
     static: dict[str, dict[str, str]] = {}
-    for study in studies:
-        for chart in study.charts:
-            static[chart.id] = render_static(chart, charts_dir, formats)
+    for page in pages:
+        for chart in page.charts:
+            try:
+                static[chart.id] = render_static(chart, charts_dir, static_formats)
+            except Exception as e:  # noqa: BLE001
+                # One chart matplotlib cannot draw is a missing download
+                # button, not a lost dashboard.
+                print(f"warning: could not render {chart.id}: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+                static[chart.id] = {}
 
     if "html" not in formats:
         return charts_dir
 
-    meta = _run_meta(run_dir, con)
     index = out_dir / "index.html"
-    index.write_text(_page(studies, static, meta, run_dir))
+    index.write_text(_page(pages, static, meta, run_dir))
     (out_dir / "schemas.md").write_text(render_markdown())
     return index
 
@@ -80,383 +124,210 @@ def _run_meta(run_dir: Path, con) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# plotly figure construction
-# --------------------------------------------------------------------------
-
-
-def _figure(spec: ChartSpec) -> dict[str, Any]:
-    """A plotly figure dict for `spec`, in both light and dark colorways."""
-    traces = []
-    for i, s in enumerate(spec.series):
-        light = series_color(s.name, i, "light")
-        dark = series_color(s.name, i, "dark")
-        hover = "<b>%{fullData.name}</b><br>%{x}<br>%{y:.4g}<extra></extra>"
-        if spec.kind in ("line", "scatter"):
-            # Markers per point are noise on a dense timeseries; the hover
-            # layer still exposes every sample.
-            dense = len(s.x) > 25
-            traces.append({
-                "type": "scatter", "mode": "lines" if dense else "lines+markers",
-                "name": s.name,
-                "x": s.x, "y": s.y,
-                "line": {"width": 2, "shape": "linear", "color": light},
-                "marker": {"size": 9, "color": light,
-                           "line": {"width": 2, "color": LIGHT["surface"]}},
-                "hovertemplate": hover,
-                "customdata": [dark] * max(len(s.x), 1),
-            })
-        else:
-            # None means "not measured" -- omit the point rather than let
-            # plotly render it as a zero-height bar, which would read as a
-            # real, favorable measurement in a speedup/relative-resource chart.
-            pts = [(x, y) for x, y in zip(s.x, s.y) if y is not None]
-            xs, ys = zip(*pts) if pts else ((), ())
-            traces.append({
-                "type": "bar", "name": s.name, "x": list(xs), "y": list(ys),
-                "marker": {"color": light, "line": {"width": 0}},
-                "hovertemplate": hover,
-                "customdata": [dark] * max(len(xs), 1),
-            })
-
-    layout: dict[str, Any] = {
-        "barmode": "group",
-        "bargap": 0.35,
-        "bargroupgap": 0.12,
-        "margin": {"l": 64, "r": 24, "t": 12, "b": 72},
-        "height": 380,
-        # Crosshair on line charts, per-mark tooltip on bars.
-        "hovermode": "x unified" if spec.kind in ("line", "scatter") else "closest",
-        "showlegend": len(spec.series) > 1,
-        "legend": {"orientation": "h", "y": -0.22, "x": 0},
-        "xaxis": {"title": {"text": spec.x_label}, "type": _axis_type(spec.x_type),
-                  "showgrid": False, "zeroline": False},
-        "yaxis": {"title": {"text": spec.y_label}, "type": spec.y_type,
-                  "gridwidth": 1, "zeroline": False},
-    }
-    if spec.hline is not None:
-        layout["shapes"] = [{
-            "type": "line", "xref": "paper", "x0": 0, "x1": 1,
-            "yref": "y", "y0": spec.hline, "y1": spec.hline,
-            "line": {"dash": "dash", "width": 1},
-        }]
-        layout["annotations"] = [{
-            "xref": "paper", "x": 1, "y": spec.hline, "yref": "y",
-            "text": spec.hline_label, "showarrow": False,
-            "xanchor": "right", "yanchor": "bottom", "font": {"size": 10},
-        }]
-    return {"data": traces, "layout": layout}
-
-
-def _axis_type(x_type: str) -> str:
-    return {"category": "category", "linear": "linear", "log": "log"}[x_type]
-
-
-# --------------------------------------------------------------------------
 # HTML
 # --------------------------------------------------------------------------
 
 
-def _page(studies: list[Study], static: dict[str, dict[str, str]],
+def _esc(value: Any) -> str:
+    return html.escape(str(value))
+
+
+def _page(pages: list[Study], static: dict[str, dict[str, str]],
           meta: dict[str, Any], run_dir: Path) -> str:
     import plotly.offline
 
-    plotly_js = plotly.offline.get_plotlyjs()
+    figures: dict[str, Any] = {}
+    panels = [_panel(page, static, figures) for page in pages]
+    nav = _nav(pages)
+    first = pages[0].key if pages else "overview"
 
-    tabs, panels, figures = [], [], {}
-    for i, study in enumerate(studies):
-        active = " active" if i == 0 else ""
-        tabs.append(
-            f'<button class="tab{active}" data-panel="{study.key}" role="tab" '
-            f'aria-selected="{"true" if i == 0 else "false"}">'
-            f'<span class="tab-num">{study.number or "-"}</span>{html.escape(study.title)}</button>'
-        )
-        panels.append(_panel(study, static, figures, first=(i == 0)))
-
-    stats = [
-        ("Cells with results", meta.get("cells_done", "-")),
-        ("Measured runs", meta.get("measured_runs", "-")),
-        ("Verbosity", meta.get("verbosity", "-")),
-        ("Host", meta.get("host", "-")),
-    ]
-    stat_html = "".join(
-        f'<div class="stat"><div class="stat-label">{html.escape(str(k))}</div>'
-        f'<div class="stat-value">{html.escape(str(v))}</div></div>'
-        for k, v in stats
-    )
-
-    provenance = []
-    for label, key in (("dee", "dee_git_sha"), ("dag-bench", "dag_bench_git_sha")):
-        sha = meta.get(key)
-        if sha:
-            provenance.append(f"{label} <code>{html.escape(sha[:12])}</code>")
-    prov_html = " · ".join(provenance) or "provenance unavailable"
-
+    name = _esc(meta.get("name", run_dir.name))
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    chips = [f"Generated {generated}"]
+    for label, key in (("dee", "dee_git_sha"), ("dag-bench", "dag_bench_git_sha")):
+        if meta.get(key):
+            chips.append(f"{label} {str(meta[key])[:12]}")
+    for label, key in (("verbosity", "verbosity"), ("host", "host")):
+        if meta.get(key):
+            chips.append(f"{label} {meta[key]}")
+    chip_html = "".join(f'<span class="chip">{_esc(c)}</span>' for c in chips)
+
+    script = (JS
+              .replace("__FIGURES__", json.dumps(figures))
+              .replace("__LIGHT__", json.dumps(LIGHT))
+              .replace("__DARK__", json.dumps(DARK))
+              .replace("__FONT_JSON__", json.dumps(FONT_STACK))
+              .replace("__FIRST__", json.dumps(first)))
+    css = CSS.replace("__FONT__", FONT_STACK).replace("__MONO__", MONO_STACK)
 
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dee benchmark · {html.escape(str(meta.get("name", run_dir.name)))}</title>
-<style>{_CSS}</style>
+<title>dee benchmark · {name}</title>
+<style>{css}</style>
 </head>
 <body>
-<div class="shell">
-  <header>
-    <div class="eyebrow">dee benchmark</div>
-    <h1>{html.escape(str(meta.get("name", run_dir.name)))}</h1>
-    <p class="sub">Generated {generated} · {prov_html}</p>
-    <div class="stats">{stat_html}</div>
-  </header>
-  <nav class="tabs" role="tablist">{"".join(tabs)}</nav>
-  <main>{"".join(panels)}</main>
-  <footer>
-    <p>Results are parquet under <code>results/</code>. Query them directly:
-    <code>duckdb -c "SELECT * FROM 'results/runs/**/*.parquet'"</code>.
-    Column-by-column documentation is in <a href="schemas.md">schemas.md</a>.</p>
-  </footer>
+<div class="app">
+  <aside class="side">
+    <div class="brand">dee · bench</div>
+    <div class="run-name">{name}</div>
+    <nav role="tablist" aria-label="Dashboard pages">{nav}</nav>
+    <div class="nav-foot">
+      <button class="ghost" id="theme-toggle" type="button">Theme: system</button>
+      <p>Charts also written to <code>dashboard/charts/</code> as PNG and PDF.
+      Column documentation in <a href="schemas.md">schemas.md</a>.</p>
+    </div>
+  </aside>
+  <main>
+    <div class="page-head">
+      <div class="eyebrow">dee benchmark</div>
+      <h1>{name}</h1>
+      <div class="chips">{chip_html}</div>
+    </div>
+    {"".join(panels)}
+    <footer>
+      <p>Results are parquet under <code>results/</code>. Query them directly:
+      <code>duckdb -c "SELECT * FROM 'results/runs/**/*.parquet'"</code>.</p>
+    </footer>
+  </main>
 </div>
-<script>{plotly_js}</script>
-<script>
-const FIGURES = {json.dumps(figures)};
-const LIGHT_AXES = {json.dumps(LIGHT)};
-const DARK_AXES = {json.dumps(DARK)};
-
-function isDark() {{
-  const stamped = document.documentElement.dataset.theme;
-  if (stamped) return stamped === 'dark';
-  return window.matchMedia('(prefers-color-scheme: dark)').matches;
-}}
-
-function themed(fig, dark) {{
-  const t = dark ? DARK_AXES : LIGHT_AXES;
-  const copy = JSON.parse(JSON.stringify(fig));
-  copy.data.forEach(tr => {{
-    // customdata carries this trace's dark-mode step of the same hue.
-    const c = dark && tr.customdata ? tr.customdata[0] : null;
-    if (c) {{
-      if (tr.line) tr.line.color = c;
-      if (tr.marker) tr.marker.color = c;
-    }}
-    if (tr.marker && tr.marker.line) tr.marker.line.color = t.surface;
-  }});
-  Object.assign(copy.layout, {{
-    paper_bgcolor: 'rgba(0,0,0,0)',
-    plot_bgcolor: 'rgba(0,0,0,0)',
-    font: {{ color: t.text_secondary, size: 11,
-            family: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif' }},
-  }});
-  ['xaxis','yaxis'].forEach(a => {{
-    copy.layout[a] = Object.assign({{}}, copy.layout[a], {{
-      gridcolor: t.grid, linecolor: t.border, tickfont: {{ color: t.text_secondary }},
-    }});
-  }});
-  (copy.layout.shapes || []).forEach(s => s.line.color = t.text_muted);
-  (copy.layout.annotations || []).forEach(a => a.font.color = t.text_muted);
-  return copy;
-}}
-
-function drawAll() {{
-  const dark = isDark();
-  Object.entries(FIGURES).forEach(([id, fig]) => {{
-    const el = document.getElementById('plot-' + id);
-    if (!el) return;
-    const f = themed(fig, dark);
-    Plotly.react(el, f.data, f.layout, {{responsive: true, displaylogo: false,
-      modeBarButtonsToRemove: ['lasso2d','select2d','autoScale2d']}});
-  }});
-}}
-
-document.querySelectorAll('.tab').forEach(tab => {{
-  tab.addEventListener('click', () => {{
-    document.querySelectorAll('.tab').forEach(t => {{
-      t.classList.remove('active'); t.setAttribute('aria-selected','false');
-    }});
-    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-    tab.classList.add('active'); tab.setAttribute('aria-selected','true');
-    document.getElementById('panel-' + tab.dataset.panel).classList.add('active');
-    // Plotly cannot size a chart inside a hidden panel, so resize on reveal.
-    window.dispatchEvent(new Event('resize'));
-  }});
-}});
-
-document.querySelectorAll('.table-toggle').forEach(btn => {{
-  btn.addEventListener('click', () => {{
-    const wrap = document.getElementById(btn.dataset.table);
-    const open = wrap.classList.toggle('open');
-    btn.textContent = open ? 'Hide table' : 'Show table';
-  }});
-}});
-
-drawAll();
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', drawAll);
-</script>
+<script>{plotly.offline.get_plotlyjs()}</script>
+<script>{script}</script>
 </body>
 </html>
 """
 
 
-def _panel(study: Study, static: dict[str, dict[str, str]], figures: dict,
-           first: bool = False) -> str:
-    active = " active" if first else ""
-    body: list[str] = []
+def _nav(pages: list[Study]) -> str:
+    out: list[str] = []
+    for group, title in GROUPS:
+        members = [p for p in pages if p.group == group]
+        if not members:
+            continue
+        if len(GROUPS) > 1:
+            out.append(f'<div class="nav-group">{_esc(title)}</div>')
+        for page in members:
+            pill = (f'<span class="pill">{page.number}</span>' if page.number
+                    else f'<span class="pill">{len([c for c in page.charts if c.has_data])}</span>')
+            out.append(
+                f'<button class="nav-item" role="tab" data-panel="{_esc(page.key)}" '
+                f'aria-selected="false">{pill}<span>{_esc(page.title)}</span></button>'
+            )
+    return "".join(out)
 
-    body.append(f'<p class="question">{html.escape(study.question)}</p>')
 
-    if not study.has_content:
+def _panel(page: Study, static: dict[str, dict[str, str]], figures: dict) -> str:
+    body: list[str] = [
+        '<div class="page-head" style="border:0;padding:0;margin-bottom:14px">',
+        f'<h1 style="font-size:23px;margin:0">{_esc(page.title)}</h1>',
+    ]
+    if page.subtitle:
+        body.append(f'<p class="sub" style="font-size:13.5px">{_esc(page.subtitle)}</p>')
+    body.append("</div>")
+
+    if page.question:
+        body.append(f'<p class="question">{_esc(page.question)}</p>')
+    if page.kpis:
+        body.append(_kpis(page.kpis))
+
+    charts = [c for c in page.charts if c.has_data]
+    tables = [t for t in page.all_tables() if t.has_data]
+
+    if not charts and not tables and not page.kpis:
         body.append(
             f'<div class="empty"><strong>Nothing to show yet.</strong>'
-            f'<p>{html.escape(study.empty_reason or "No data for this study.")}</p></div>'
+            f'<p>{_esc(page.empty_reason or "No data for this page.")}</p></div>'
         )
     else:
-        if study.empty_reason:
-            body.append(f'<div class="notice">{html.escape(study.empty_reason)}</div>')
-        for chart in study.charts:
-            if not chart.has_data:
+        if page.empty_reason:
+            body.append(f'<div class="notice">{_esc(page.empty_reason)}</div>')
+        for chart in charts:
+            try:
+                figures[chart.id] = figure(chart)
+            except Exception as e:  # noqa: BLE001
+                body.append(f'<div class="notice">Could not render '
+                            f'<strong>{_esc(chart.title)}</strong>: '
+                            f'{_esc(type(e).__name__)}: {_esc(e)}</div>')
                 continue
-            figures[chart.id] = _figure(chart)
-            links = static.get(chart.id, {})
-            link_html = " ".join(
-                f'<a class="dl" href="charts/{html.escape(fname)}" download>{fmt.upper()}</a>'
-                for fmt, fname in sorted(links.items())
-            )
-            note = (f'<p class="note">{html.escape(chart.note)}</p>' if chart.note else "")
-            body.append(f"""
+            body.append(_chart(chart, static.get(chart.id, {})))
+        for i, table in enumerate(tables):
+            body.append(_table(table, open_first=(i == 0 and not charts)))
+
+    return (f'<section class="panel" id="panel-{_esc(page.key)}" role="tabpanel">'
+            f'{"".join(body)}</section>')
+
+
+def _kpis(kpis: list[Kpi]) -> str:
+    tiles = []
+    for kpi in kpis:
+        hint = f'<div class="kpi-hint">{_esc(kpi.hint)}</div>' if kpi.hint else ""
+        # A value that is a phrase rather than a figure needs a smaller size, or
+        # it wraps across three lines and the tile stops reading as a number.
+        size = " long" if len(kpi.value) > 12 else ""
+        tiles.append(
+            f'<div class="kpi {_esc(kpi.tone)}">'
+            f'<div class="kpi-label">{_esc(kpi.label)}</div>'
+            f'<div class="kpi-value{size}">{_esc(kpi.value)}</div>{hint}</div>'
+        )
+    return f'<div class="kpis">{"".join(tiles)}</div>'
+
+
+def _chart(chart: ChartSpec, links: dict[str, str]) -> str:
+    # PNG first: it is what goes on a slide, and the commoner want of the two.
+    buttons = "".join(
+        f'<a class="dl" href="charts/{_esc(links[fmt])}" download '
+        f'title="Download this chart as {fmt.upper()}">{fmt.upper()}</a>'
+        for fmt in ("png", "pdf") if fmt in links
+    )
+    downloads = (f'<div class="dls"><span class="dls-label">Download</span>{buttons}</div>'
+                 if buttons else "")
+    subtitle = f'<p class="sub">{_esc(chart.subtitle)}</p>' if chart.subtitle else ""
+    note = f'<p class="note">{_esc(chart.note)}</p>' if chart.note else ""
+    footnote = (f'<p class="note" style="font-size:11.5px">{_esc(chart.footnote)}</p>'
+                if chart.footnote else "")
+    return f"""
 <figure class="chart">
   <figcaption>
     <div>
-      <h3>{html.escape(chart.title)}</h3>
-      <p class="sub">{html.escape(chart.subtitle)}</p>
+      <p class="cap-title">{_esc(chart.title)}</p>
+      {subtitle}
     </div>
-    <div class="dls">{link_html}</div>
+    {downloads}
   </figcaption>
-  <div class="plot" id="plot-{html.escape(chart.id)}"></div>
-  {note}
-</figure>""")
+  <div class="plot" id="plot-{_esc(chart.id)}" data-chart="{_esc(chart.id)}"
+       style="min-height:{chart.height}px"></div>
+  {note}{footnote}
+</figure>"""
 
-        if study.table_rows:
-            table_id = f"table-{study.key}"
-            head = "".join(f"<th>{html.escape(str(c))}</th>" for c in study.table_columns)
-            rows = "".join(
-                "<tr>" + "".join(f"<td>{html.escape(str(v))}</td>" for v in row) + "</tr>"
-                for row in study.table_rows
-            )
-            body.append(f"""
-<div class="table-block">
-  <button class="table-toggle" data-table="{table_id}">Show table</button>
-  <div class="table-wrap" id="{table_id}">
-    <table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table>
+
+def _table(table: Table, open_first: bool = False) -> str:
+    numeric = set(table.numeric)
+    head = "".join(
+        f'<th class="{"num" if i in numeric else ""}">{_esc(c)}</th>'
+        for i, c in enumerate(table.columns)
+    )
+    rows = "".join(
+        "<tr>" + "".join(
+            f'<td class="{"num" if i in numeric else ""}">{_esc(v)}</td>'
+            for i, v in enumerate(row)
+        ) + "</tr>"
+        for row in table.rows
+    )
+    note = f'<p class="table-note">{_esc(table.note)}</p>' if table.note else ""
+    state = " open" if open_first else ""
+    return f"""
+<div class="table-block{state}">
+  <button class="table-toggle" type="button" aria-expanded="{str(bool(open_first)).lower()}">
+    <span class="caret">&#9656;</span>
+    <span>{_esc(table.title)}</span>
+    <span class="pill">{len(table.rows)}</span>
+  </button>
+  <div class="table-body">
+    {note}
+    <div class="table-wrap">
+      <table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table>
+    </div>
   </div>
-</div>""")
-
-    return (f'<section class="panel{active}" id="panel-{study.key}" role="tabpanel">'
-            f'<h2>{html.escape(study.title)}</h2>{"".join(body)}</section>')
-
-
-_CSS = """
-:root {
-  --surface: #fcfcfb; --surface-2: #f4f4f2;
-  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #78776f;
-  --grid: #e6e6e2; --border: #dcdcd6; --accent: #2a78d6;
-  color-scheme: light;
-}
-:root:not([data-theme="light"]) { }
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --surface: #1a1a19; --surface-2: #232322;
-    --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #8f8e85;
-    --grid: #333331; --border: #3a3a38; --accent: #3987e5;
-    color-scheme: dark;
-  }
-}
-:root[data-theme="dark"] {
-  --surface: #1a1a19; --surface-2: #232322;
-  --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #8f8e85;
-  --grid: #333331; --border: #3a3a38; --accent: #3987e5;
-  color-scheme: dark;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0; background: var(--surface); color: var(--text-primary);
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  font-size: 14px; line-height: 1.55;
-}
-.shell { max-width: 1180px; margin: 0 auto; padding: 32px 24px 64px; }
-header { border-bottom: 1px solid var(--border); padding-bottom: 20px; }
-.eyebrow {
-  text-transform: uppercase; letter-spacing: .09em; font-size: 11px;
-  font-weight: 600; color: var(--text-muted);
-}
-h1 { margin: 6px 0 4px; font-size: 30px; letter-spacing: -0.02em; }
-h2 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
-h3 { font-size: 14px; margin: 0; font-weight: 600; }
-.sub { color: var(--text-secondary); font-size: 12px; margin: 2px 0 0; }
-.stats { display: flex; flex-wrap: wrap; gap: 28px; margin-top: 18px; }
-.stat-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase;
-              letter-spacing: .06em; }
-.stat-value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 22px 0 26px;
-        border-bottom: 1px solid var(--border); }
-.tab {
-  background: none; border: 0; border-bottom: 2px solid transparent;
-  padding: 9px 12px; font: inherit; font-size: 13px; color: var(--text-secondary);
-  cursor: pointer; display: inline-flex; align-items: center; gap: 7px;
-}
-.tab:hover { color: var(--text-primary); }
-.tab.active { color: var(--text-primary); border-bottom-color: var(--accent); font-weight: 600; }
-.tab-num {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 18px; height: 18px; border-radius: 999px; background: var(--surface-2);
-  font-size: 10px; font-weight: 600; color: var(--text-muted);
-}
-.tab.active .tab-num { background: var(--accent); color: #fff; }
-.panel { display: none; }
-.panel.active { display: block; }
-.question { color: var(--text-secondary); font-size: 14px; margin: 0 0 22px; max-width: 74ch; }
-.chart { margin: 0 0 30px; border: 1px solid var(--border); border-radius: 10px;
-         padding: 16px 16px 8px; background: var(--surface); }
-figcaption { display: flex; justify-content: space-between; align-items: flex-start;
-             gap: 16px; margin-bottom: 8px; }
-.dls { display: flex; gap: 6px; flex-shrink: 0; }
-.dl {
-  font-size: 10px; font-weight: 600; letter-spacing: .05em; text-decoration: none;
-  color: var(--text-secondary); border: 1px solid var(--border); border-radius: 5px;
-  padding: 3px 7px;
-}
-.dl:hover { color: var(--text-primary); border-color: var(--text-muted); }
-.plot { width: 100%; min-height: 380px; }
-.note { font-size: 12px; color: var(--text-muted); margin: 4px 0 8px; max-width: 80ch; }
-.empty, .notice {
-  border: 1px dashed var(--border); border-radius: 10px; padding: 20px;
-  color: var(--text-secondary); background: var(--surface-2);
-}
-.empty p, .notice { margin: 6px 0 0; font-size: 13px; }
-.notice { margin-bottom: 20px; border-style: solid; }
-.table-block { margin-top: 8px; }
-.table-toggle {
-  background: none; border: 1px solid var(--border); border-radius: 6px;
-  padding: 5px 11px; font: inherit; font-size: 12px; color: var(--text-secondary);
-  cursor: pointer;
-}
-.table-toggle:hover { color: var(--text-primary); }
-.table-wrap { display: none; margin-top: 12px; overflow-x: auto;
-              border: 1px solid var(--border); border-radius: 8px; }
-.table-wrap.open { display: block; }
-table { border-collapse: collapse; width: 100%; font-size: 12px;
-        font-variant-numeric: tabular-nums; }
-th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--grid);
-         white-space: nowrap; }
-th { background: var(--surface-2); font-weight: 600; color: var(--text-secondary);
-     position: sticky; top: 0; }
-tbody tr:last-child td { border-bottom: 0; }
-footer { margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--border);
-         color: var(--text-muted); font-size: 12px; }
-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
-       background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
-a { color: var(--accent); }
-@media (max-width: 760px) {
-  .shell { padding: 20px 14px 48px; }
-  figcaption { flex-direction: column; }
-}
-"""
+</div>"""

@@ -54,9 +54,16 @@ def main(argv: list[str] | None = None) -> int:
 
     p_viz = sub.add_parser("viz", help="Build the dashboard and charts from results")
     p_viz.add_argument("run_dir")
-    p_viz.add_argument("--only", help="Render a single study (e.g. scaling, payback, ablation)")
+    p_viz.add_argument("--only",
+                       help="Render a single page: a study (scaling, optimization, "
+                            "payback, ablation, pass_changes, system, "
+                            "resource_response), an optimization (hmp, omp, "
+                            "nodefusion, parallelism, pushdown), `continuous` or "
+                            "`overview`")
     p_viz.add_argument("--format", default="html,png,pdf",
-                       help="Comma-separated outputs to produce (default: html,png,pdf)")
+                       help="Comma-separated outputs to produce (default: html,png,pdf). "
+                            "Asking for html always writes png and pdf too, because "
+                            "the page links a download of each chart in both")
     p_viz.add_argument("--open", action="store_true", dest="open_browser",
                        help="Open the dashboard when it is built")
 
@@ -243,11 +250,24 @@ def cmd_viz(args: argparse.Namespace) -> int:
     from .viz.dashboard import build
 
     formats = {f.strip() for f in args.format.split(",") if f.strip()}
-    out = build(Path(args.run_dir), only=args.only, formats=formats)
+    try:
+        out = build(Path(args.run_dir), only=args.only, formats=formats)
+    except ValueError as e:
+        # A mistyped `--only` is a typo, not a crash; the message already names
+        # every page this run has.
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if out is None:
         print("no results to visualize yet", file=sys.stderr)
         return 1
-    print(f"dashboard: {out}")
+    if out.name == "index.html":
+        charts = out.parent / "charts"
+        print(f"dashboard: {out}")
+        print(f"charts:    {charts} "
+              f"({len(list(charts.glob('*.png')))} chart(s), png and pdf each)")
+    else:
+        # `--format png,pdf` builds the charts without a page to hang them on.
+        print(f"charts: {out}")
     if args.open_browser:
         import webbrowser
 
